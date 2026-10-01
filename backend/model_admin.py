@@ -31,7 +31,7 @@ if ROOT not in sys.path:
 os.chdir(ROOT)  # 让 config 的 env_file=".env" 与启动目录无关（作为服务常驻时更稳）
 
 import config  # noqa: E402
-from backend import gateway  # noqa: E402
+from backend import gateway, hypit_bridge  # noqa: E402
 
 ENV_PATH = os.environ.get("MODEL_ADMIN_ENV", os.path.join(ROOT, ".env"))
 HEALTH_URL = os.environ.get("MODEL_ADMIN_HEALTH", "http://127.0.0.1:8090/api/health/models")
@@ -519,6 +519,24 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _send_file(self, data, ctype):   # 二进制：不能带 charset，否则 hypit collect 的 content-type 判定会脏
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _hypit_denied(self):
+        if hypit_bridge.authorized(self.headers.get("Authorization")):
+            return False
+        self._send(401, json.dumps({"error": {"code": "UNAUTHORIZED",
+                                              "message": "缺/错 MODEL_GATEWAY_TOKEN"}}, ensure_ascii=False))
+        return True
+
+    def _read_body(self) -> bytes:
+        n = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(n) if n else b""
+
     def do_GET(self):
         u = urlparse(self.path)
         if self.path == "/" or self.path.startswith("/index"):
@@ -551,6 +569,20 @@ class H(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             lim = int((q.get("limit") or ["30"])[0] or 30)
             self._send(200, json.dumps(credits_view(max(1, min(lim, 200))), ensure_ascii=False))
+        elif u.path.startswith("/api/hypit/assets/"):
+            data, ctype = hypit_bridge.serve_asset(u.path.rsplit("/", 1)[-1])
+            self._send_file(data, ctype) if data else self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
+        elif u.path.startswith("/api/hypit/uploads/files/"):
+            data, ctype = hypit_bridge.serve_upload(u.path.rsplit("/", 1)[-1])
+            self._send_file(data, ctype) if data else self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
+        elif u.path == "/api/hypit/rates":
+            if self._hypit_denied():
+                return
+            self._send(200, json.dumps(hypit_bridge.handle_rates(parse_qs(u.query)), ensure_ascii=False))
+        elif u.path.startswith("/api/hypit/videos/"):
+            if self._hypit_denied():
+                return
+            self._send(200, json.dumps(hypit_bridge.handle_get(u.path.rsplit("/", 1)[-1]), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -558,7 +590,23 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) if n else b"{}"
-        if u.path == "/api/model/call":
+        if u.path == "/api/hypit/uploads":
+            if self._hypit_denied():
+                return
+            media = (self.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+            out = hypit_bridge.handle_upload(raw, media)
+            self._send(200, json.dumps({"url": out["url"], "public": out["public"]}, ensure_ascii=False))
+        elif u.path == "/api/hypit/videos":
+            if self._hypit_denied():
+                return
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"error": {"code": "BAD_JSON", "message": str(e)}}, ensure_ascii=False))
+                return
+            code, payload = hypit_bridge.handle_submit(body if isinstance(body, dict) else {})
+            self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path == "/api/model/call":
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
             except Exception as e:

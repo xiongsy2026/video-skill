@@ -1,0 +1,8 @@
+# Weeksir model-gateway: 密钥与备份不入库
+.env
+config.py.bak
+config.local.py
+__pycache__/
+.gateway_jobs.sqlite
+.gateway_ledger.sqlite
+outputs/_hypit_jobs/

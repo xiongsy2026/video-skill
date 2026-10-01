@@ -150,6 +150,9 @@ class Settings(BaseSettings):
     # 文档：https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference
     # 端点：POST https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis
     # 关键 Header：X-DashScope-Async: enable
+    # 8100 的 Bearer 令牌；留空=不校验（现状，仅本机 127.0.0.1）。要给 hypit/客户机调就必须设。
+    MODEL_GATEWAY_TOKEN: str = ""
+
     DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/api/v1"
     DASHSCOPE_CHAT_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # OpenAI 兼容口（chat 用这个，不是上面那个）
     DASHSCOPE_API_KEY: str = ""
