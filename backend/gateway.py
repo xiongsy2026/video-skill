@@ -38,27 +38,29 @@ ROUTES = {
     ("video.analyze", "mimo"):      {"provider": "mimo",   "client": "mimo",               "fn": "analyze_media",       "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
     # —— 生图 ——
     ("image.generate", "default"):  {"provider": "agnes",    "client": "agnes_image_client",   "fn": "create_image",        "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_IMAGE_MODEL"}},
-    ("image.generate", "detail"):   {"provider": "ideogram", "client": "runninghub_client",    "fn": "generate_detail_image", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_IDEOGRAM4_API_KEY", "model": None}},
-    ("image.generate", "generic"):  {"provider": "image2",   "client": "image2_client",        "fn": "create_image",        "fields": {"base_url": "IMAGE2_BASE_URL",  "api_key": "IMAGE2_API_KEY",  "model": None}},
-    # zexapi nano_banana（/v1/videos 提交轮询·同 omni 形·复用 OMNI 凭证）
-    ("image.generate", "nano"):     {"provider": "zexapi",   "client": "TODO(zexapi /v1/videos,同omni形)", "fn": "submit_image", "fields": {"base_url": "OMNI_BASE_URL",  "api_key": "OMNI_API_KEY",  "model": None}},
-    # —— 图片编辑 / 换脸（真实模块 video_face_swap.py）——
-    ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "swap_face", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
+    # ⚠️ detail 是【流水线级】(detail_image_agent.run_pipeline: LLM 分场景 + 双引擎 + task_id 状态机，8090 的
+    #    /api/detail-image 正在跑它)；要接网关得先把里面的单模型原语剥出来，别把编排搬第二遍。
+    ("image.generate", "detail"):   {"provider": "ideogram", "client": "detail_image_agent",  "fn": "run_pipeline(流水线级)", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_IDEOGRAM4_API_KEY", "model": None}},
+    ("image.generate", "generic"):  {"provider": "image2",   "client": "image2_client",        "fn": "Image2Client.text_to_image_sync", "fields": {"base_url": "IMAGE2_BASE_URL",  "api_key": "IMAGE2_API_KEY",  "model": None}},
+    # zexapi nano_banana（/v1/videos 提交轮询·同 omni 形·复用 OMNI 凭证）——已实现，见 call() 的 nano 分支
+    ("image.generate", "nano"):     {"provider": "zexapi",   "client": "omni_client", "fn": "submit_omni_task(model=nano_banana_pro-2K)", "fields": {"base_url": "OMNI_BASE_URL",  "api_key": "OMNI_API_KEY",  "model": None}},
+    # —— 图片编辑 / 换脸（真实入口 video_face_swap.run_face_swap:53，分段+on_log，也是流水线级）——
+    ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "run_face_swap", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     # —— 生视频 ——
-    ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_client",        "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
+    ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_generate",      "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
     # —— Seedance（vinted.cam 直连·/v1/videos·model=seedance2.5/2.0；见 _vinted_video）——
     ("video.generate", "seedance-2.5"):  {"provider": "vinted",   "client": "vinted_video", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
     ("video.generate", "seedance-2.0"):  {"provider": "vinted",   "client": "vinted_video", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
     ("video.generate", "agnes-v"):       {"provider": "agnes",    "client": "agnes_video_client", "fn": "create_flash_task", "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_VIDEO_FLASH_MODEL"}},
     ("video.generate", "clone-r2v"):     {"provider": "wan3",     "client": "wan3_client",        "fn": "run_one_segment",   "fields": {"base_url": "RUNNINGHUB_WAN3_BASE_URL", "api_key": "RUNNINGHUB_WAN3_API_KEY", "model": None}},
-    ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无独立client,dashscope待接)", "fn": "generate",        "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
-    ("video.generate", "h3"):            {"provider": "manxue",   "client": "manxue_h3_client",   "fn": "generate",          "fields": {"base_url": "MANXUE_H3_BASE_URL", "api_key": "MANXUE_H3_API_KEY", "model": "MANXUE_H3_MODEL"}},
-    ("video.generate", "motion"):        {"provider": "runninghub","client": "TODO(runninghub_client/工作流,待核)", "fn": "transfer_motion","fields": {"base_url": "RUNNINGHUB_MOTION_WAN22_BASE_URL", "api_key": "RUNNINGHUB_MOTION_WAN22_API_KEY", "model": None}},
-    # —— 对口型（RunningHub 工作流；无独立 client，走 runninghub_client，待核）——
-    ("lipsync", "default"):         {"provider": "runninghub", "client": "TODO(runninghub_client工作流)", "fn": "lipsync",  "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_LIPSYNC_API_KEY", "model": None}},
-    ("lipsync", "vo"):              {"provider": "runninghub", "client": "TODO(runninghub_client工作流)", "fn": "vo_lipsync","fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
-    # —— 转写（本地 whisperx，免费；无独立 client，待接）——
-    ("transcribe", "whisperx"):     {"provider": "whisperx-local", "client": "TODO(本地whisperx,待接)", "fn": "transcribe", "fields": {"base_url": None, "api_key": None, "model": None}},
+    ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无现成 client·要照 dashscope 视频生成协议新写)", "fn": "-", "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
+    ("video.generate", "h3"):            {"provider": "manxue",   "client": "manxue_h3_client",   "fn": "generate_video",    "fields": {"base_url": "MANXUE_H3_BASE_URL", "api_key": "MANXUE_H3_API_KEY", "model": "MANXUE_H3_MODEL"}},
+    ("video.generate", "motion"):        {"provider": "runninghub","client": "runninghub_client", "fn": "submit_motion_transfer+poll_task_until_done","fields": {"base_url": "RUNNINGHUB_MOTION_WAN22_BASE_URL", "api_key": "RUNNINGHUB_MOTION_WAN22_API_KEY", "model": None}},
+    # —— 对口型（真实码在流水线模块里，非独立 client；run_lip_sync 吃本地路径、无 api_key 形参=流水线级）——
+    ("lipsync", "default"):         {"provider": "runninghub", "client": "video_translate_pipeline", "fn": "run_lip_sync",  "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_LIPSYNC_API_KEY", "model": None}},
+    ("lipsync", "vo"):              {"provider": "runninghub", "client": "voiceover_replace", "fn": "_run_lipsync_workflow(私有,接前先提公开入口)","fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
+    # —— 转写（本地 ASR，免费，零密钥：FunASR paraformer-zh → faster_whisper 回退；仓库里没有 whisperx）——
+    ("transcribe", "asr"):          {"provider": "local-asr", "client": "video_translate_pipeline", "fn": "run_asr", "fields": {"base_url": None, "api_key": None, "model": None}},
 }
 
 DEFAULT_PURPOSE = {
@@ -68,7 +70,7 @@ DEFAULT_PURPOSE = {
     "video.generate": "omni-t2v",
     "video.analyze": "default",
     "lipsync": "default",
-    "transcribe": "whisperx",
+    "transcribe": "asr",
 }
 
 # provider 默认模型名（route 未带 model 字段时兜底，避免把 A 家模型名发给 B 家端点）
@@ -126,7 +128,7 @@ PRICE_ROUTES = {
     ("video.generate", "seedance-2.5"): 60, ("video.generate", "seedance-2.0"): 50,
     ("video.generate", "wan3-dashscope"): 50, ("video.generate", "h3"): 60, ("video.generate", "motion"): 50,
     ("lipsync", "default"): 20, ("lipsync", "vo"): 24,
-    ("transcribe", "whisperx"): 0,   # 本地免费
+    ("transcribe", "asr"): 0,   # 本地 ASR 免费
 }
 PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
                 "video.generate": 40, "video.analyze": 6, "lipsync": 20, "transcribe": 0}
@@ -184,16 +186,24 @@ def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
             "credits_estimate": est, "ledger": "STUB", "note": "TODO 3.0: weeksir.com 预扣/回滚/流水"}
 
 
+def _openai_v1(base_url: str) -> str:
+    """OpenAI 兼容端点统一补 /v1（agnes base 自带、zexapi/OMNI 不带，之前漏补导致 405）。"""
+    b = str(base_url).rstrip("/")
+    return b if b.endswith("/v1") else b + "/v1"
+
+
 def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "ping"):
-    """最小真实 chat 调用（文本/视觉脑用）。返回 (status, detail, ms)。"""
+    """最小真实 chat 调用（文本/视觉脑用）。返回 (status, detail, ms)。
+    ⚠️ model 必须已解析出真名：发 null 会被上游当 "unknown-model" 判 400（之前 mimo 的假故障就这么来的）。"""
     import json as _json
     import time
     import urllib.error
     import urllib.request
     t = time.time()
-    payload = {"model": model or "gpt", "messages": [{"role": "user", "content": text}], "max_tokens": 8}
+    # max_tokens 给足：agnes/mimo 这类会先烧"思考"token，只给 8 会返回空内容、把坏配置探成 live-ok
+    payload = {"model": model, "messages": [{"role": "user", "content": text}], "max_tokens": 64}
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/chat/completions",
+        _openai_v1(base_url) + "/chat/completions",
         data=_json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST")
@@ -201,7 +211,9 @@ def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "pin
         with urllib.request.urlopen(req, timeout=30) as r:
             out = _json.loads(r.read().decode("utf-8"))
         c = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
-        return ("live-ok", f"返回 {len(c or '')} 字", round((time.time() - t) * 1000))
+        if not (c or "").strip():
+            return ("empty-response", "HTTP 200 但 content 空（预算太小或该模型不宜当文本脑）", round((time.time() - t) * 1000))
+        return ("live-ok", f"返回 {len(c)} 字", round((time.time() - t) * 1000))
     except urllib.error.HTTPError as e:
         return ("live-fail", f"HTTP {e.code}", round((time.time() - t) * 1000))
     except Exception as e:
@@ -209,25 +221,32 @@ def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "pin
 
 
 def _probe_reachable(base_url: str, api_key: str):
-    """生成类端点：GET /models 探活+鉴权，不提交计费任务。返回 (status, detail, ms)。"""
+    """生成类端点：探 /models 或 /v1/models 做鉴权，不提交计费任务。
+    ⚠️ 别只会拼 /v1/models：RunningHub 这类非 OpenAI 风格网关，/models=200 而 /v1/models=401
+       ——之前据此把 wan3/faceswap/motion/detail 全判成"鉴权失败"，是假故障。"""
     import time
     import urllib.error
     import urllib.request
     t = time.time()
-    base = base_url.rstrip("/")
-    if not base.endswith("/v1"):
-        base += "/v1"
-    req = urllib.request.Request(base + "/models", headers={"Authorization": f"Bearer {api_key}"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
-        return ("reachable", "端点可达/鉴权通过(未提交生成)", round((time.time() - t) * 1000))
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return ("auth-fail", f"HTTP {e.code} 鉴权失败", round((time.time() - t) * 1000))
-        return ("reachable", f"HTTP {e.code}(端点可达,非/models风格,未提交生成)", round((time.time() - t) * 1000))
-    except Exception as e:
-        return ("unreachable", type(e).__name__, round((time.time() - t) * 1000))
+    base = str(base_url).rstrip("/")
+    last = None
+    for path in ("/models", "/v1/models"):
+        ms = round((time.time() - t) * 1000)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    base + path, headers={"Authorization": f"Bearer {api_key}"}), timeout=15) as r:
+                r.read()
+            return ("reachable", f"GET {path} 鉴权通过(未提交生成)", ms)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                last = f"GET {path} 404"
+                continue
+            if e.code in (401, 403):
+                return ("auth-fail", f"GET {path} HTTP {e.code} 鉴权失败", ms)
+            return ("reachable", f"GET {path} HTTP {e.code}(可达,未提交生成)", ms)
+        except Exception as e:
+            return ("unreachable", f"GET {path} {type(e).__name__}", ms)
+    return ("no-probe", f"两种 /models 风格都 404（{last}）：非 OpenAI 风格，只能实跑才能验", round((time.time() - t) * 1000))
 
 
 # 可安全发最小真实请求验证的能力（便宜）；其余按端点可达/鉴权探测（避免计费生成）。
@@ -240,18 +259,31 @@ def test_models(health_url: str = "http://127.0.0.1:8090/api/health/models") -> 
     for (cap, pur) in ROUTES:
         r = resolve(cap, pur)
         key = f"{cap}/{pur}"
+        if r["provider"].startswith("local"):
+            results[key] = {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
+                            "detail": "本地引擎·无需密钥，不在 HTTP 探活范围（要用得实跑）", "ms": None}
+            continue
         if not r["api_key"] or not r["base_url"]:
             results[key] = {"provider": r["provider"], "model": r["model"] or "(默认)",
                             "status": "no-creds", "detail": "密钥或 base_url 未配置", "ms": None}
             continue
         if cap in _LIVE_CHAT:
-            status, detail, ms = _probe_chat(r["base_url"], r["api_key"], r["model"])
-        else:
-            status, detail, ms = _probe_reachable(r["base_url"], r["api_key"])
+            model = r["model"] or _MODEL_FALLBACK.get(r["provider"])
+            if not model:
+                results[key] = {"provider": r["provider"], "model": "(无)", "status": "no-model",
+                                "detail": "route 没配 model、也没有 provider 兜底名；不敢发 null（上游会当 unknown-model 判 400）", "ms": None}
+                continue
+            status, detail, ms = _probe_chat(r["base_url"], r["api_key"], model)
+            results[key] = {"provider": r["provider"], "model": model,
+                            "status": status, "detail": detail, "ms": ms}
+            continue
+        status, detail, ms = _probe_reachable(r["base_url"], r["api_key"])
         results[key] = {"provider": r["provider"], "model": r["model"] or "(默认)",
                         "status": status, "detail": detail, "ms": ms}
     ok = sum(1 for v in results.values() if v["status"] in ("live-ok", "reachable"))
-    return {"routes": results, "summary": f"{ok}/{len(results)} 通", "all_ok": ok == len(results)}
+    unknown = sum(1 for v in results.values() if v["status"] in ("no-probe", "no-model", "local", "empty-response"))
+    tail = f"，另有 {unknown} 条探不了(非 OpenAI 风格/无模型名/本地引擎/空返回)，只能实跑验" if unknown else ""
+    return {"routes": results, "summary": f"{ok}/{len(results)} 通{tail}", "all_ok": ok == len(results)}
 
 
 def analyze_media(path: str, question: str = "用一句话描述这个画面的关键信息。",

@@ -20,8 +20,8 @@
     "video.generate/motion": 50,
     "lipsync/default": 20,
     "lipsync/vo": 24,
-    "transcribe/whisperx": 0,
-    "text.complete/zexapi": 1
+    "text.complete/zexapi": 1,
+    "transcribe/asr": 0
   },
   "defaults": {
     "text.complete": "agnes",
@@ -30,6 +30,6 @@
     "video.generate": "omni-t2v",
     "video.analyze": "default",
     "lipsync": "default",
-    "transcribe": "whisperx"
+    "transcribe": "asr"
   }
 }
