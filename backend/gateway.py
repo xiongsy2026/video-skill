@@ -29,11 +29,10 @@ CAPABILITIES = ["text.complete", "image.generate", "image.edit", "video.generate
 # ⚠️ client/fn 必须对应 backend/services 下【真实存在】的模块；不确定的一律标 "TODO(...)"，不臆造。
 #    实时可用性/模型清单以 app.py:85 的 GET /api/health/models 为权威源（并发探各上游，返回 name/kind/model/status）。
 ROUTES = {
-    # —— 文本 / 多模态脑 ——
-    ("text.complete", "default"):   {"provider": "gpt",    "client": "gpt_client",         "fn": "complete",            "fields": {"base_url": "GPT55_BASE_URL",   "api_key": "GPT55_API_KEY",   "model": "OPENAI_MODEL"}},
-    ("text.complete", "translate"): {"provider": "openai", "client": "gpt_client",         "fn": "complete",            "fields": {"base_url": "OPENAI_BASE_URL",  "api_key": "OPENAI_API_KEY",  "model": "OPENAI_MODEL"}},
-    ("text.complete", "agnes"):     {"provider": "agnes",  "client": "agnes",              "fn": "complete",            "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
-    ("text.complete", "grok"):      {"provider": "grok",   "client": "gpt_client",         "fn": "complete",            "fields": {"base_url": "SR_GROK_BASE_URL", "api_key": "SR_GROK_API_KEY", "model": "SR_GROK_MODEL"}},
+    # —— 文本 / 多模态脑（gpt hub 503 抖动、grok degraded → 暂移出；agnes 默认、mimo 备选，二者实测稳）——
+    ("text.complete", "agnes"):     {"provider": "agnes",  "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
+    ("text.complete", "mimo"):      {"provider": "mimo",   "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
+    ("text.complete", "zexapi"):    {"provider": "zexapi", "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": None}},
     # —— 看图 / 看视频（多模态理解）——
     ("video.analyze", "default"):   {"provider": "agnes",  "client": "agnes",              "fn": "analyze_media",       "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
     ("video.analyze", "mimo"):      {"provider": "mimo",   "client": "mimo",               "fn": "analyze_media",       "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
@@ -41,10 +40,15 @@ ROUTES = {
     ("image.generate", "default"):  {"provider": "agnes",    "client": "agnes_image_client",   "fn": "create_image",        "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_IMAGE_MODEL"}},
     ("image.generate", "detail"):   {"provider": "ideogram", "client": "runninghub_client",    "fn": "generate_detail_image", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_IDEOGRAM4_API_KEY", "model": None}},
     ("image.generate", "generic"):  {"provider": "image2",   "client": "image2_client",        "fn": "create_image",        "fields": {"base_url": "IMAGE2_BASE_URL",  "api_key": "IMAGE2_API_KEY",  "model": None}},
+    # zexapi nano_banana（/v1/videos 提交轮询·同 omni 形·复用 OMNI 凭证）
+    ("image.generate", "nano"):     {"provider": "zexapi",   "client": "TODO(zexapi /v1/videos,同omni形)", "fn": "submit_image", "fields": {"base_url": "OMNI_BASE_URL",  "api_key": "OMNI_API_KEY",  "model": None}},
     # —— 图片编辑 / 换脸（真实模块 video_face_swap.py）——
     ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "swap_face", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     # —— 生视频 ——
     ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_client",        "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
+    # —— Seedance（vinted.cam 聚合，/v1/videos 提交轮询·同 zexapi 形；端点名在 config.ONESHOT_SEEDANCE_ENDPOINTS）——
+    ("video.generate", "seedance-2.5"):  {"provider": "vinted",   "client": "TODO(vinted /v1/videos,同omni形)", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
+    ("video.generate", "seedance-2.0"):  {"provider": "vinted",   "client": "TODO(vinted /v1/videos,同omni形)", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
     ("video.generate", "agnes-v"):       {"provider": "agnes",    "client": "agnes_video_client", "fn": "create_flash_task", "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_VIDEO_FLASH_MODEL"}},
     ("video.generate", "clone-r2v"):     {"provider": "wan3",     "client": "wan3_client",        "fn": "run_one_segment",   "fields": {"base_url": "RUNNINGHUB_WAN3_BASE_URL", "api_key": "RUNNINGHUB_WAN3_API_KEY", "model": None}},
     ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无独立client,dashscope待接)", "fn": "generate",        "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
@@ -58,7 +62,7 @@ ROUTES = {
 }
 
 DEFAULT_PURPOSE = {
-    "text.complete": "default",
+    "text.complete": "agnes",
     "image.generate": "default",
     "image.edit": "faceswap",
     "video.generate": "omni-t2v",
@@ -66,6 +70,9 @@ DEFAULT_PURPOSE = {
     "lipsync": "default",
     "transcribe": "whisperx",
 }
+
+# provider 默认模型名（route 未带 model 字段时兜底，避免把 A 家模型名发给 B 家端点）
+_MODEL_FALLBACK = {"agnes": "agnes-3.0-flash", "mimo": "mimo-v2.5", "gpt": "gpt-5.6-sol", "openai": "gpt-5.6-sol", "zexapi": "gemini-3.5-flash"}
 
 
 class RouteError(Exception):
@@ -111,12 +118,12 @@ def safe_summary(r: dict) -> dict:
 # ---- 积分价目：按 (capability,purpose) 逐条；视频按 10s 为单位折算 ----
 # 相对值占位（可后续调）；账本单一源在 weeksir.com，这里只是"这次调用值多少积分"的价目。
 PRICE_ROUTES = {
-    ("text.complete", "default"): 1, ("text.complete", "translate"): 1,
-    ("text.complete", "agnes"): 1, ("text.complete", "grok"): 2,
+    ("text.complete", "agnes"): 1, ("text.complete", "mimo"): 1,
     ("video.analyze", "default"): 6, ("video.analyze", "mimo"): 6,
-    ("image.generate", "default"): 4, ("image.generate", "detail"): 8, ("image.generate", "generic"): 4,
+    ("image.generate", "default"): 4, ("image.generate", "detail"): 8, ("image.generate", "generic"): 4, ("image.generate", "nano"): 4,
     ("image.edit", "faceswap"): 20,
     ("video.generate", "omni-t2v"): 40, ("video.generate", "agnes-v"): 30, ("video.generate", "clone-r2v"): 50,
+    ("video.generate", "seedance-2.5"): 60, ("video.generate", "seedance-2.0"): 50,
     ("video.generate", "wan3-dashscope"): 50, ("video.generate", "h3"): 60, ("video.generate", "motion"): 50,
     ("lipsync", "default"): 20, ("lipsync", "vo"): 24,
     ("transcribe", "whisperx"): 0,   # 本地免费
@@ -257,6 +264,33 @@ def analyze_media(path: str, question: str = "用一句话描述这个画面的�
         return {"success": False, "text": None, "error": f"{type(e).__name__}: {e}"}
 
 
+def _chat_compat(base_url: str, api_key: str, model: str, messages: list,
+                 temperature: float = 0.7, max_tokens: int = 4000):
+    """通用 OpenAI 兼容 /chat/completions 文本调用（agnes/gpt 等皆可）。返回 (text, error)。"""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    if not base_url or not api_key:
+        return None, "缺少 base_url/api_key（检查 .env 的 AGNES 配置）"
+    base = base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"   # agnes base 已带 /v1；zexapi(OMNI_BASE_URL) 不带，统一补
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    req = urllib.request.Request(
+        base + "/chat/completions",
+        data=_json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            out = _json.loads(resp.read().decode("utf-8"))
+        text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
+        return (text, None) if text else (None, "上游返回空内容")
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def call(capability: str, purpose: str | None = None, **params) -> dict:
     """能力级分发：调用方只给能力名+标准参数，本层按路由注入 model/凭证并转调现有 client。
 
@@ -280,21 +314,16 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         return analyze_media(
             path=params["path"],
             question=params.get("question") or "用一句话描述这个画面的关键信息。",
-            model=r["model"], base_url=r["base_url"], api_key=r["api_key"],
+            model=r["model"] or _MODEL_FALLBACK.get(r["provider"]), base_url=r["base_url"], api_key=r["api_key"],
             max_tokens=params.get("max_tokens", 300),
         )
     if capability == "text.complete":
-        import asyncio
-        from backend.services.gpt_client import gpt_client  # 单例，凭证自 settings 读
         messages = params.get("messages") or [{"role": "user", "content": params["prompt"]}]
-        resp = asyncio.run(gpt_client.chat_completion(
-            messages=messages,
-            model=params.get("model") or r["model"] or "gpt-5.6-sol",
-            temperature=params.get("temperature", 0.7),
-            max_tokens=params.get("max_tokens", 4000),
-        ))
-        text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
-        return {"success": bool(text), "text": text, "raw": resp}
+        text, err = _chat_compat(
+            r["base_url"], r["api_key"], params.get("model") or r["model"] or _MODEL_FALLBACK.get(r["provider"], ""), messages,
+            temperature=params.get("temperature", 0.7), max_tokens=params.get("max_tokens", 4000),
+        )
+        return {"success": bool(text), "text": text, "error": err}
     if capability == "image.generate" and r["purpose"] == "default":
         import asyncio
         from backend.services import agnes_image_client as agnes_img
@@ -425,6 +454,13 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
     hold = ledger().preauth(account, capability, r["purpose"], est)
     try:
         result = call(capability, r["purpose"], **params)
+        # 适配器返回业务失败（success:False / 带 error）也算失败 → 回滚，不扣费
+        if isinstance(result, dict) and (result.get("success") is False or result.get("error")):
+            ledger().rollback(hold["hold_id"])
+            return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": result,
+                    "credits": {"estimated": est, "charged": 0, "hold_id": hold["hold_id"],
+                                "balance_after": ledger().balance(account)},
+                    "error": result.get("error") or "生成失败"}
         charged = est  # P0 按预估扣；3.0 用实际消耗回写
         done = ledger().commit(hold["hold_id"], charged)
         return {"ok": True, "capability": capability, "purpose": r["purpose"], "result": result,
