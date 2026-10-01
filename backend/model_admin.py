@@ -149,7 +149,7 @@ def prices_view() -> dict:
 
 
 def _validate_prices(body: dict) -> tuple:
-    """返回 (prices, defaults, errors)。只认注册表里真实存在的 cap/purpose，防手滑写出幽灵路由。"""
+    """返回 (prices, defaults, disabled, errors)。只认注册表里真实存在的 cap/purpose，防手滑写出幽灵路由。"""
     errs, prices = [], {}
     for k, v in (body.get("prices") or {}).items():
         if "/" not in str(k) or tuple(str(k).split("/", 1)) not in gateway.ROUTES:
@@ -171,11 +171,18 @@ def _validate_prices(body: dict) -> tuple:
             errs.append(f"默认路由 {c}={p} 不存在（可选: {', '.join(valid_default.get(c, [])) or '未知能力'}）")
             continue
         defaults[str(c)] = str(p)
-    return prices, defaults, errs
+    disabled = {}
+    for item in (body.get("disabled") or []):
+        k, reason = (item, "") if isinstance(item, str) else (item.get("key", ""), item.get("reason", ""))
+        if "/" not in str(k) or tuple(str(k).split("/", 1)) not in gateway.ROUTES:
+            errs.append(f"要屏蔽的路由不存在: {k}")
+            continue
+        disabled[str(k)] = str(reason or "")[:80]
+    return prices, defaults, disabled, errs
 
 
 def save_prices(body: dict) -> tuple:
-    prices, defaults, errs = _validate_prices(body)
+    prices, defaults, disabled, errs = _validate_prices(body)
     if errs:
         return 400, {"errors": errs}
     path = gateway.price_path()
@@ -185,11 +192,14 @@ def save_prices(body: dict) -> tuple:
         data = {"_说明": "统一模型网关价目与默认路由：prices 键=capability/purpose，defaults 键=capability。"}
     data["prices"] = {**data.get("prices", {}), **prices}
     data["defaults"] = {**data.get("defaults", {}), **defaults}
+    if "disabled" in body:            # 面板每次提交的是"当前全部被屏蔽的"完整快照 → 覆盖语义
+        data["disabled"] = disabled
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     os.replace(tmp, path)   # 原子换；mtime 变 → gateway 下一次调用自动重载
-    return 200, {"prices_written": len(prices), "defaults_written": len(defaults), "path": path}
+    return 200, {"prices_written": len(prices), "defaults_written": len(defaults),
+                 "disabled": disabled, "path": path}
 
 
 def credits_view(limit: int = 30) -> dict:
@@ -246,6 +256,7 @@ def board_view() -> dict:
                 "base_url": ((getattr(s, bf, "") if bf else "") or "(本地)"),
                 "key_env": kf or "(无需)",
                 "key_present": bool(getattr(s, kf, "")) if kf else True,
+                "disabled": ext["disabled"].get(f"{c}/{pur}"),
                 "probe": _HEALTH["routes"].get(f"{c}/{pur}"),
             })
         cards.append({"capability": cap, "default": dft, "rows": rows})
@@ -286,6 +297,7 @@ main{padding:16px 18px}
 .lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px;padding:12px}
 .lane{border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:#111620}
 .lane.h{border-color:#33405c}
+.lane.off{opacity:.62;border-style:dashed}
 .lh{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .lh b{font-size:13px}
 .pv{font-size:11px;color:var(--mut)}
@@ -355,32 +367,39 @@ function chip(r){
 }
 function esc(t){return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function laneHTML(cap,r){
-  const dft=r.is_default;
-  return '<div class="lane'+(dft?' h':'')+'" id="lane__'+cap+'__'+r.purpose+'">'+
+  const dft=r.is_default, off=r.disabled!=null, key=cap+'/'+r.purpose;
+  const st=off?'<span class="chip warn">已屏蔽</span>':chip(r.probe);
+  return '<div class="lane'+(dft?' h':'')+(off?' off':'')+'" id="lane__'+cap+'__'+r.purpose+'">'+
    '<div class="lh"><b>'+esc(r.purpose)+'</b><span class="pv">'+esc(r.provider)+' · '+esc(r.model)+'</span>'+
-   '<span id="'+CEL+cap+'__'+r.purpose+'">'+chip(r.probe)+'</span></div>'+
+   '<span id="'+CEL+cap+'__'+r.purpose+'">'+st+'</span></div>'+
    '<div class="grid"><dt>密钥</dt><dd><span class="dot '+(r.key_present?'on">就绪':'off">缺')+'</span> '+esc(r.key_env)+
    '</dd><dt>入口</dt><dd>'+esc(r.entry)+'</dd><dt>端点</dt><dd>'+esc(r.base_url)+'</dd>'+
-   '<dt>适配器</dt><dd>'+(r.adapted?'<span class="dot on">已接·可直接调</span>':'<span class="dot" style="color:#dfa44b">待接适配器</span>')+(r.overridden?'':' <span class=pv>(价=内置兜底)</span>')+'</dd></div>'+
-   '<div class="det" id="det__'+cap+'__'+r.purpose+'">'+esc(r.probe?r.probe.detail:'点「测」探这条（不提交计费任务）')+'</div>'+
-   '<div class="foot"><label>积分/次 <input type="number" min="0" data-p="'+cap+'/'+r.purpose+'" value="'+r.price+'"></label>'+
+   '<dt>适配器</dt><dd>'+(r.adapted?'<span class="dot on">已接·可直接调</span>':'<span class="dot" style="color:#dfa44b">待接适配器</span>')+(r.overridden?'':' <span class=pv>(价=内置兜底)</span>')+'</dd>'+
+   (off?'<dt>屏蔽原因</dt><dd>'+esc(r.disabled||'(未填)')+'</dd>':'')+'</div>'+
+   '<div class="det" id="det__'+cap+'__'+r.purpose+'">'+esc(off?'屏蔽中：resolve 会直接拒绝这条路由，不会白跑也不会扣费':(r.probe?r.probe.detail:'点「测」探这条（不提交计费任务）'))+'</div>'+
+   '<div class="foot"><label>积分/次 <input type="number" min="0" data-p="'+key+'" value="'+r.price+'"></label>'+
    '<label><input type="radio" name="def_'+cap+'" data-cap="'+cap+'" data-pur="'+r.purpose+'"'+(dft?' checked':'')+'>默认</label>'+
+   '<label title="取消勾选=屏蔽这条路由（skill 指定它时网关直接拒绝并说明原因）"><input type="checkbox" data-on="'+key+'"'+(off?'':' checked')+'>启用</label>'+
    '<span class=sp></span><button class=mini onclick="testOne(\''+cap+'\',\''+r.purpose+'\',this)">测</button></div></div>';
 }
 function renderBoard(){
   document.getElementById('ptag').textContent=BOARD.prices_external?("价目外置 "+BOARD.prices_path):"⚠ 价目回落内置表";
   const host=document.getElementById('cards');
   host.innerHTML=BOARD.cards.map(c=>{
-    const n=c.rows.length, ok=c.rows.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
-    const bad=c.rows.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
+    const live=c.rows.filter(r=>r.disabled==null);
+    const n=c.rows.length, offd=n-live.length;
+    const ok=live.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
+    const bad=live.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
     return '<div class="card"><h2>'+esc(c.capability)+'<span class=n>'+n+' 条路由 · 默认 <b style="color:#c8d2e2">'+esc(c.default)+'</b>'+
-      (c.rows.some(r=>r.probe)?' · 通 '+ok+'/'+n+(bad?' · <span style="color:#e2564d">坏 '+bad+'</span>':''):'')+'</span></h2>'+
+      (live.some(r=>r.probe)?' · 通 '+ok+'/'+live.length+(bad?' · <span style="color:#e2564d">坏 '+bad+'</span>':''):'')+
+      (offd?' · <span style="color:#dfa44b">屏蔽 '+offd+'</span>':'')+'</span></h2>'+
       '<div class="lanes">'+c.rows.map(r=>laneHTML(c.capability,r)).join('')+'</div></div>';
   }).join('');
   kpis(); warnBar();
 }
 function kpis(){
-  const rs=[];BOARD.cards.forEach(c=>c.rows.forEach(r=>rs.push(r)));
+  const all=[];BOARD.cards.forEach(c=>c.rows.forEach(r=>all.push(r)));
+  const rs=all.filter(r=>r.disabled==null), off=all.length-rs.length;
   const ok=rs.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
   const bad=rs.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
   const no=rs.filter(r=>r.probe&&!OKS.includes(r.probe.status)&&!BADS.includes(r.probe.status)).length;
@@ -391,6 +410,7 @@ function kpis(){
   document.getElementById('kpis').innerHTML=
     '<div class="kpi"><b>'+(BOARD.probe&&BOARD.probe.summary||(ok+'/'+rs.length))+'</b><span>探活结果 · '+ts+'</span></div>'+
     '<div class="kpi"><b style="color:'+(bad?'#e2564d':'#3fb37f')+'">'+bad+'</b><span>需要处理</span></div>'+
+    '<div class="kpi"><b style="color:'+(off?'#dfa44b':'#8d97a8')+'">'+off+'</b><span>已屏蔽(不计故障)</span></div>'+
     '<div class="kpi"><b>'+no+'</b><span>探不了(要实跑)</span></div>'+
     '<div class="kpi"><b>'+un+'</b><span>未测</span></div>'+
     '<div class="kpi"><b>'+BOARD.routes_adapted+'/'+BOARD.routes_total+'</b><span>已接适配器</span></div>'+
@@ -398,15 +418,17 @@ function kpis(){
     '<div class="kpi"><b>'+BAL+'</b><span>账本余额合计</span></div>';
 }
 function warnBar(){
-  const bad=[],no=[];
+  const bad=[],no=[],offd=[];
   BOARD.cards.forEach(c=>c.rows.forEach(r=>{
+    if(r.disabled!=null){offd.push(c.capability+'/'+r.purpose);return;}
     if(!r.probe)return;
-    if(BADS.includes(r.probe.status))bad.push(c.capability+'/'+r.purpose+' → '+r.probe.status+' '+esc(r.probe.detail||''));
+    if(BADS.includes(r.probe.status))bad.push(c.capability+'/'+r.purpose+' → '+r.probe.status+' '+esc(r.probe.detail||'')+'（不想看到就在该条取消「启用」屏蔽掉）');
     else if(!OKS.includes(r.probe.status))no.push(c.capability+'/'+r.purpose);
   }));
   let h='';
   if(bad.length)h+='<div class="banner bad"><b>需要处理 '+bad.length+' 条</b><br>'+bad.join('<br>')+'</div>';
   if(no.length)h+='<div class="banner mut">探不了(非计费探测能判断，只能实跑验)：'+no.map(esc).join('、')+'</div>';
+  if(offd.length)h+='<div class="banner mut">已屏蔽(网关会直接拒绝这些路由)：'+offd.map(esc).join('、')+'</div>';
   if(BOARD.prices_external===false)h+='<div class="banner"><b>价目回落内置表</b>：model_prices.json 缺失或损坏，改价请先修文件</div>';
   document.getElementById('warn').innerHTML=h;
 }
@@ -424,7 +446,7 @@ async function testOne(cap,pur,btn){
   log(cap+'/'+pur+' → '+row.probe.status+(row.probe.ms!=null?(' '+row.probe.ms+'ms'):''));
 }
 async function testAll(btn){
-  btn.disabled=true;const old=btn.textContent;btn.textContent='并发探活中(约 5 秒，不烧钱)…';
+  btn.disabled=true;const old=btn.textContent;btn.textContent='并发探活中(最多 20 秒，不烧钱)…';
   try{const j=await (await fetch('/api/model/health')).json();
     BOARD.cards.forEach(c=>c.rows.forEach(r=>{const v=(j.routes||{})[c.capability+'/'+r.purpose];if(v)r.probe=v;}));
     BOARD.probe={ts:Date.now()/1000,summary:j.summary};
@@ -433,13 +455,14 @@ async function testAll(btn){
   btn.textContent=old;btn.disabled=false;
 }
 async function saveAll(){
-  const prices={},defaults={};
+  const prices={},defaults={},disabled=[];
   document.querySelectorAll('#cards input[data-p]').forEach(el=>{if(el.value!=='')prices[el.dataset.p]=Number(el.value);});
   document.querySelectorAll('#cards input[type=radio][data-cap]:checked').forEach(el=>{defaults[el.dataset.cap]=el.dataset.pur;});
-  const res=await fetch('/api/model/prices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prices,defaults})});
+  document.querySelectorAll('#cards input[type=checkbox][data-on]').forEach(el=>{if(!el.checked)disabled.push({key:el.dataset.on,reason:'管理台屏蔽(上游故障/暂不用)'});});
+  const res=await fetch('/api/model/prices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prices,defaults,disabled})});
   const j=await res.json();
   if(!res.ok)return log('保存失败：'+((j.errors&&j.errors.length)?j.errors.join(' / '):j.error));
-  log('已保存：价目 '+j.prices_written+' 条、默认路由 '+j.defaults_written+' 条 → 下一次网关调用即生效（无需重启）');
+  log('已保存：价目 '+j.prices_written+' 条、默认路由 '+j.defaults_written+' 条、屏蔽 '+Object.keys(j.disabled||{}).length+' 条 → 下一次网关调用即生效（无需重启）');
   await loadBoard();
 }
 async function loadKeys(){

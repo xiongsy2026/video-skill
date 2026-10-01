@@ -94,6 +94,11 @@ def resolve(capability: str, purpose: str | None = None) -> dict:
     if not route:
         raise RouteError(f"{capability} 无 purpose={purpose}；可选: "
                          + ", ".join(p for (c, p) in ROUTES if c == capability))
+    if is_disabled(capability, purpose):
+        why = external_config()["disabled"].get(f"{capability}/{purpose}", "")
+        raise RouteError(f"{capability}/{purpose} 已在管理台屏蔽"
+                         + (f"（{why}）" if why else "")
+                         + "；换一条 purpose，或去 8100 面板重新启用")
     f = route["fields"]
     return {
         "capability": capability,
@@ -136,7 +141,7 @@ PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
 # ---- 可外置配置：价目 + 每能力默认路由 → model_prices.json（改价/换默认供应商=改这个文件，不动代码）----
 # 文件按 mtime 懒加载（面板保存后下一次调用即生效）；缺失或损坏则回落上面两张内置表，绝不让管线跑不动。
 _PRICE_PATH = _os.environ.get("MODEL_PRICES") or _os.path.join(_d or _os.getcwd(), "model_prices.json")
-_ext = {"mtime": None, "prices": {}, "defaults": {}}
+_ext = {"mtime": None, "prices": {}, "defaults": {}, "disabled": {}}
 
 
 def price_path() -> str:
@@ -147,19 +152,29 @@ def external_config() -> dict:
     try:
         mt = _os.path.getmtime(_PRICE_PATH)
     except OSError:
-        return {"prices": {}, "defaults": {}}
+        return {"prices": {}, "defaults": {}, "disabled": {}}
     if _ext["mtime"] != mt:
         prices: dict = {}
         defaults: dict = {}
+        disabled: dict = {}
         try:
             with open(_PRICE_PATH, encoding="utf-8") as f:
                 raw = _json.loads(f.read())
             prices = {f"{k}": int(v) for k, v in (raw.get("prices") or {}).items()}
             defaults = {f"{k}": str(v) for k, v in (raw.get("defaults") or {}).items()}
+            d = raw.get("disabled") or []
+            if isinstance(d, dict):
+                disabled = {str(k): str(v or "") for k, v in d.items()}
+            else:                                    # 也接受 ["cap/pur", ...] 手写形式
+                disabled = {str(k): "" for k in d}
         except Exception as e:
             print(f"[gateway] model_prices.json 未生效（用内置价目）: {type(e).__name__}: {e}")
-        _ext.update(prices=prices, defaults=defaults, mtime=mt)
+        _ext.update(prices=prices, defaults=defaults, disabled=disabled, mtime=mt)
     return _ext
+
+
+def is_disabled(capability: str, purpose: str) -> bool:
+    return f"{capability}/{purpose}" in external_config()["disabled"]
 
 
 def default_purpose(capability: str) -> str:
@@ -265,8 +280,15 @@ def is_adapted(capability: str, purpose: str) -> bool:
 
 
 def test_route(capability: str, purpose: str) -> dict:
-    """单条路由探活（不提交计费任务）。返回 {provider, model, status, detail, ms}。"""
-    r = resolve(capability, purpose)
+    """单条路由探活（不提交计费任务）。返回 {provider, model, status, detail, ms}。
+    ⚠️ 已屏蔽/未知 purpose 会让 resolve 抛 RouteError：这里必须吃掉，否则并发探活整批炸掉。"""
+    try:
+        r = resolve(capability, purpose)
+    except RouteError as e:
+        known = (capability, purpose) in ROUTES
+        return {"provider": ROUTES.get((capability, purpose), {}).get("provider", "?"),
+                "model": "-", "status": "disabled" if known and is_disabled(capability, purpose) else "bad-route",
+                "detail": str(e), "ms": None}
     if r["provider"].startswith("local"):
         return {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
                 "detail": "本地引擎·无需密钥，不在 HTTP 探活范围（要用得实跑）", "ms": None}
@@ -284,17 +306,26 @@ def test_route(capability: str, purpose: str) -> dict:
     return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": status, "detail": detail, "ms": ms}
 
 
-def test_models(health_url: str = "http://127.0.0.1:8090/api/health/models") -> dict:
-    """真·测通（并发探 21 条，串行要 30s+，管理面板等不起）：文本/视觉脑发最小真实 chat；
-    生成类只做端点可达/鉴权探测，不提交计费任务。"""
-    from concurrent.futures import ThreadPoolExecutor
+def test_models(health_url: str = "http://127.0.0.1:8090/api/health/models", deadline: float = 20.0) -> dict:
+    """真·测通：并发探 21 条，但整批只等 deadline 秒。
+    ⚠️ mimo 这类"长思考"模型单次可跑到 50s+，而 urllib 的 timeout 只是无活动超时、管不住总时长；
+       超时的条目标 slow，由面板如实显示，不让管理台被一条慢腿拖死。"""
+    from concurrent.futures import ThreadPoolExecutor, wait
     pairs = list(ROUTES)
+    results = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
-        vals = list(ex.map(lambda cp: test_route(cp[0], cp[1]), pairs))
-    results = {f"{c}/{p}": v for (c, p), v in zip(pairs, vals)}
+        futs = {ex.submit(test_route, c, p): f"{c}/{p}" for (c, p) in pairs}
+        done, not_done = wait(futs, timeout=deadline)
+        for f in done:
+            results[futs[f]] = f.result()
+        for f in not_done:
+            results[futs[f]] = {"provider": "-", "model": "-", "status": "slow",
+                                "detail": f"{deadline:.0f}s 内没回来（上游在响应但很慢，如长思考模型），不代表坏",
+                                "ms": None}
     ok = sum(1 for v in results.values() if v["status"] in ("live-ok", "reachable"))
-    unknown = sum(1 for v in results.values() if v["status"] in ("no-probe", "no-model", "local", "empty-response"))
-    tail = f"，另有 {unknown} 条探不了(非 OpenAI 风格/无模型名/本地引擎/空返回)，只能实跑验" if unknown else ""
+    unknown = sum(1 for v in results.values()
+                  if v["status"] in ("no-probe", "no-model", "local", "empty-response", "disabled", "bad-route", "slow"))
+    tail = f"，另有 {unknown} 条未判定(探不了/太慢/已屏蔽/本地引擎等)" if unknown else ""
     return {"routes": results, "summary": f"{ok}/{len(results)} 通{tail}", "all_ok": ok == len(results)}
 
 
@@ -672,7 +703,11 @@ def _cli(argv):
     elif cmd == "resolve":
         cap = argv[1]
         pur = argv[2] if len(argv) > 2 else None
-        print(safe_summary(resolve(cap, pur)))
+        try:
+            print(safe_summary(resolve(cap, pur)))
+        except RouteError as e:
+            print(f"ERROR: {e}")
+            return 2
     elif cmd == "prices":
         cfg = external_config()
         print(f"价目源: {price_path()}  →  外置 {len(cfg['prices'])} 条 / 默认路由 {len(cfg['defaults'])} 条"
@@ -681,7 +716,12 @@ def _cli(argv):
             dft = cfg["defaults"].get(cap) or DEFAULT_PURPOSE.get(cap)
             for (c, p) in ROUTES:
                 if c == cap:
-                    print(f"  {'★' if p == dft else ' '} {cap}/{p:<14} {unit_price(cap, p):>4} 分")
+                    mark = "★" if p == dft else " "
+                    if cfg["disabled"].get(f"{c}/{p}") is not None:
+                        mark, extra = "✗", "已屏蔽 " + (cfg["disabled"].get(f"{c}/{p}") or "")
+                    else:
+                        extra = ""
+                    print(f"  {mark} {cap}/{p:<14} {unit_price(c, p):>4} 分 {extra}")
     elif cmd == "credits":
         led = ledger()
         print("余额:", _json.dumps(led.accounts(), ensure_ascii=False))
@@ -723,10 +763,15 @@ def _cli(argv):
                 params = json.loads(rest[i + 1]); i += 2
             else:
                 i += 1
-        print(json.dumps(invoke(cap, pur, account, params), ensure_ascii=False, indent=2))
+        try:
+            env = invoke(cap, pur, account, params)
+        except RouteError as e:   # 未知/已屏蔽 purpose：仍回归一 JSON（skill 只认 ok/error，不该看到 traceback）
+            env = {"ok": False, "capability": cap, "purpose": pur, "result": None,
+                   "credits": {"estimated": 0, "charged": 0, "balance_after": None}, "error": str(e)}
+        print(json.dumps(env, ensure_ascii=False, indent=2))
     else:
-        print("用法: python gateway.py [caps | resolve <cap> [purpose] | call <cap> [purpose] "
-              "[--account X] [--json '{...}'] | test | analyze <path> [问题]]")
+        print("用法: python backend/gateway.py [caps | prices | credits | resolve <cap> [purpose] | "
+              "call <cap> [purpose] [--account X] [--json '{...}'] | test | analyze <path> [问题]]")
 
 
 if __name__ == "__main__":
