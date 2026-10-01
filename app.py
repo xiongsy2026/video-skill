@@ -77,9 +77,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 from backend.services.hypit_workspace import router as hypit_router
 app.include_router(hypit_router)
 
-# WeekSir 统一模型网关 HTTP 路由（/api/model/{caps,resolve,call,health}）；重启 8090 生效
-from backend.model_router import router as model_router
-app.include_router(model_router)
+# 统一模型网关的 HTTP 入口不在这里：它由常驻的 backend/model_admin.py(:8100) 提供
+# （管理面 + 调用面同源）。8090 只做流水线任务服务器。
 
 
 # ─────────────────────────────────────
