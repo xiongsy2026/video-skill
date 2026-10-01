@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,7 @@ from backend import gateway  # noqa: E402
 
 ENV_PATH = os.environ.get("MODEL_ADMIN_ENV", os.path.join(ROOT, ".env"))
 HEALTH_URL = os.environ.get("MODEL_ADMIN_HEALTH", "http://127.0.0.1:8090/api/health/models")
+TASK_NAME = "WeeksirModelAdmin"
 SECRET = re.compile(r"_(?:API_?KEY|TOKEN|SECRET)(?:_OLD)?$")
 
 
@@ -198,82 +200,284 @@ def credits_view(limit: int = 30) -> dict:
     return out
 
 
-PAGE = """<!doctype html><html lang=zh><meta charset=utf-8>
-<title>Weeksir 模型配置</title>
-<style>
- body{font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:#0f1115;color:#e6e6e6;margin:24px}
- h1{font-size:18px} table{border-collapse:collapse;width:100%}
- th,td{border:1px solid #2a2f3a;padding:6px 8px;text-align:left;vertical-align:top}
- th{background:#171b22} .cap{color:#7aa2ff}.p{color:#f0a35e}
- input{width:100%;box-sizing:border-box;background:#0b0d11;color:#e6e6e6;border:1px solid #333;padding:4px}
- button{background:#2b6cff;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;margin:4px 6px 0 0}
- .hint{color:#8a93a6;font-size:12px;margin:8px 0}
- h3{font-size:15px;margin:24px 0 2px;color:#c9d4e6} code{color:#9fb3d1}
- button.ghost{background:#243044} td input{min-width:56px}
- #log{white-space:pre-wrap;background:#0b0d11;border:1px solid #333;padding:8px;margin-top:12px;min-height:60px}
-</style>
-<h1>Weeksir 模型配置（写 .env，密钥只写不回显；仅本机 127.0.0.1）</h1>
-<div class=hint>改完点“保存”，管线每次 job 新进程会自动读新值。要改某密钥就在该行填新值（留空=不动）。</div>
-<table id=t><thead><tr><th>能力/purpose</th><th>provider</th><th>字段</th><th>当前</th><th>填新值</th></tr></thead><tbody></tbody></table>
-<button onclick="save()">保存</button><button onclick="test()">测试连通</button>
-<div id=log></div>
-<h3>价目与默认路由（写 <code>model_prices.json</code>，改价不动代码）</h3>
-<div class=hint>源：<code id=ppath></code> <span id=psrc></span> · “默认”=调用方不指定 purpose 时走哪条路由 · 留空=不改 · 视频类每 10s 折算一个单位。</div>
-<table id=pt><thead><tr><th>能力/purpose</th><th>provider</th><th>积分/次</th><th>内置兜底</th><th>默认</th></tr></thead><tbody></tbody></table>
-<button onclick="savePrices()">保存价目</button> <button class=ghost onclick="loadPrices()">重载价目</button>
-<h3>积分余额与调用审计（本地账本桩；3.0 平替成 weeksir.com 真账本）</h3>
-<div class=hint>账本：<code id=lpath></code> · done=已扣，rolled_back=失败已退（不扣费）。</div>
-<table id=at><thead><tr><th>member</th><th>余额</th></tr></thead><tbody></tbody></table>
-<table id=bt><thead><tr><th>路由</th><th>状态</th><th>次数</th><th>积分</th></tr></thead><tbody></tbody></table>
-<table id=rt><thead><tr><th>hold</th><th>member</th><th>路由</th><th>积分</th><th>状态</th></tr></thead><tbody></tbody></table>
-<button class=ghost onclick="loadCredits()">刷新余额/流水</button>
-<script>
-let DATA=[];
-async function load(){const r=await fetch('/api/config');DATA=await r.json();render();}
-function render(){const tb=document.querySelector('#t tbody');tb.innerHTML='';
- DATA.forEach((row,i)=>{row.fields.forEach((f,j)=>{const tr=document.createElement('tr');
-  const first=(j===0);
-  tr.innerHTML=`<td>${first?`<span class=cap>${row.capability}</span>/<span class=p>${row.purpose}</span>`:''}</td>`+
-   `<td>${first?row.provider:''}</td><td>${f.kind} <code>${f.env_key}</code></td>`+
-   `<td>${f.secret?(f.set?'已设置('+ (f.shown)+')':'未设置'):(f.shown||'未设置')}</td>`+
-   `<td><input data-k="${f.env_key}" placeholder="${f.secret?'填新密钥':'填新值'}"></td>`;
-  tb.appendChild(tr);});});}
-async function save(){const body={};document.querySelectorAll('input[data-k]').forEach(el=>{if(el.value.trim())body[el.dataset.k]=el.value.trim();});
- const r=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
- const j=await r.json();log('已保存 '+j.written+' 项 → .env');load();}
-async function test(){const r=await fetch('/api/test');const j=await r.json();log(JSON.stringify(j,null,2));}
-function log(t){document.getElementById('log').textContent=t;}
+# ---- 探活缓存 + 管理台看板（页面秒开，状态随点随新；全量测通是后台动作）----
+_HEALTH = {"ts": 0.0, "routes": {}, "summary": "还没测过（点右上「全量测通」）"}
 
-let PRICES=null;
-async function loadPrices(){PRICES=await (await fetch('/api/model/prices')).json();
- document.getElementById('ppath').textContent=PRICES.path;
- document.getElementById('psrc').textContent=PRICES.external?'（外置生效）':'（⚠ 文件缺失或损坏，当前用内置兜底表）';
- const tb=document.querySelector('#pt tbody');tb.innerHTML='';
- PRICES.rows.forEach(row=>{const key=row.capability+'/'+row.purpose;const tr=document.createElement('tr');
-  tr.innerHTML=`<td><span class=cap>${row.capability}</span>/<span class=p>${row.purpose}</span></td>`+
-   `<td>${row.provider}</td><td><input data-p="${key}" value="${row.price}"></td>`+
-   `<td>${row.overridden?('内置 '+row.builtin):'—'}</td>`+
-   `<td><input type=radio name=d_${row.capability} value="${row.purpose}" ${row.is_default?'checked':''}></td>`;
-  tb.appendChild(tr);});}
-async function savePrices(){const prices={},defaults={};
- document.querySelectorAll('#pt input[data-p]').forEach(el=>{if(el.value.trim()!=='')prices[el.dataset.p]=Number(el.value);});
- PRICES.rows.forEach(r=>{const el=document.querySelector('input[name="d_'+r.capability+'"]:checked');if(el)defaults[r.capability]=el.value;});
- const res=await fetch('/api/model/prices',{method:'POST',headers:{'content-type':'application/json'},
-  body:JSON.stringify({prices,defaults})});
- const j=await res.json();
- if(!res.ok){log('保存失败：\\n'+(j.errors||(j.error?[j.error]:['未知错误'])).join('\\n'));return;}
- loadPrices();
- loadCredits().then(()=>log('已写 model_prices.json：价目 '+j.prices_written+' 条、默认路由 '+j.defaults_written+' 条 → 下一次网关调用即生效'));}
-async function loadCredits(){const j=await (await fetch('/api/model/credits?limit=30')).json();
- document.getElementById('lpath').textContent=j.ledger_path;
- fill('#at',j.accounts.map(a=>[a.member,a.balance]));
- fill('#bt',j.by_route.map(x=>[x.route,x.status,x.calls,x.credits]));
- fill('#rt',j.recent_holds.map(x=>[x.hold_id,x.member,x.route,x.amount,x.status]));}
-function fill(sel,rows){const tb=document.querySelector(sel+' tbody');tb.innerHTML='';
- rows.forEach(c=>{const tr=document.createElement('tr');c.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});tb.appendChild(tr);});
- if(!rows.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan=5 class=hint>（暂无记录）</td>';tb.appendChild(tr);}}
-load();loadPrices();loadCredits();
-</script>"""
+
+def health_all() -> dict:
+    out = gateway.test_models(health_url=HEALTH_URL)
+    _HEALTH["routes"].update(out["routes"])
+    _HEALTH["summary"] = out["summary"]
+    _HEALTH["ts"] = time.time()
+    return out
+
+
+def health_one(capability: str, purpose: str) -> tuple:
+    try:
+        v = gateway.test_route(capability, purpose)
+    except gateway.RouteError as e:
+        return 400, {"error": str(e)}
+    _HEALTH["routes"][f"{capability}/{purpose}"] = v
+    _HEALTH["ts"] = time.time()
+    return 200, v
+
+
+def board_view() -> dict:
+    """按能力聚合的管理看板：路由/入口/模型/密钥就绪/单价/默认/是否已接适配器 + 上次探活状态。"""
+    ext = gateway.external_config()
+    s = _fresh()                      # 每次新建 Settings：刚改的 .env 立刻反映在看板上
+    cards = []
+    for cap in gateway.CAPABILITIES:
+        dft = ext["defaults"].get(cap) or gateway.DEFAULT_PURPOSE.get(cap)
+        rows = []
+        for (c, pur), route in gateway.ROUTES.items():
+            if c != cap:
+                continue
+            f = route["fields"]
+            kf, bf, mf = f.get("api_key"), f.get("base_url"), f.get("model")
+            rows.append({
+                "purpose": pur, "provider": route["provider"],
+                "entry": f'{route["client"]}.{route["fn"]}',
+                "adapted": gateway.is_adapted(c, pur),
+                "price": gateway.unit_price(c, pur),
+                "overridden": f"{c}/{pur}" in ext["prices"],
+                "is_default": pur == dft,
+                "model": ((getattr(s, mf, "") if mf else "") or "(默认)"),
+                "base_url": ((getattr(s, bf, "") if bf else "") or "(本地)"),
+                "key_env": kf or "(无需)",
+                "key_present": bool(getattr(s, kf, "")) if kf else True,
+                "probe": _HEALTH["routes"].get(f"{c}/{pur}"),
+            })
+        cards.append({"capability": cap, "default": dft, "rows": rows})
+    adapted_n = sum(1 for (c, p) in gateway.ROUTES if gateway.is_adapted(c, p))
+    return {"cards": cards, "prices_path": gateway.price_path(), "prices_external": bool(ext["prices"]),
+            "routes_total": len(gateway.ROUTES), "routes_adapted": adapted_n,
+            "probe": {"ts": _HEALTH["ts"], "summary": _HEALTH["summary"], "routes": _HEALTH["routes"]},
+            "adapter": f"gateway.py 与 model_admin.py 同进程；改这两个文件要重启计划任务 {TASK_NAME}"}
+
+
+PAGE = r"""<!doctype html><html lang=zh><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Weeksir 模型网关 · 管理台</title>
+<style>
+:root{--bg:#0e1116;--panel:#151a23;--line:#252c3a;--fg:#e7ecf3;--mut:#8d97a8;--ok:#3fb37f;--bad:#e2564d;--warn:#dfa44b;--acc:#4f83ff;--mute:#3a4353}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;padding-bottom:80px}
+header{position:sticky;top:0;z-index:9;background:#0e1116ee;border-bottom:1px solid var(--line);padding:12px 18px}
+.t{font-size:16px;margin:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.tag{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:20px;padding:2px 8px;font-weight:400}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.kpis{display:flex;gap:8px;flex-wrap:wrap}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 10px;min-width:76px}
+.kpi b{display:block;font-size:15px;line-height:1.2}
+.kpi span{font-size:11px;color:var(--mut)}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px}
+button.ghost{background:#222a38;color:#c8d2e2}
+button.mini{padding:3px 9px;font-size:12px;background:#222a38;color:#c8d2e2;border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:progress}
+main{padding:16px 18px}
+#warn{margin:0 0 12px}
+.banner{border:1px solid var(--line);border-left:4px solid var(--warn);background:#1a1710;border-radius:8px;padding:8px 12px;font-size:13px;margin-bottom:8px}
+.banner.bad{border-left-color:var(--bad);background:#1c1214}
+.banner.mut{border-left-color:var(--mute);background:#12161d;color:var(--mut)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:0 0 14px;overflow:hidden}
+.card>h2{font-size:14px;margin:0;padding:10px 12px;background:#191f29;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.card>h2 .n{color:var(--mut);font-weight:400;font-size:12px}
+.lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px;padding:12px}
+.lane{border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:#111620}
+.lane.h{border-color:#33405c}
+.lh{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lh b{font-size:13px}
+.pv{font-size:11px;color:var(--mut)}
+.chip{font-size:11px;border-radius:20px;padding:2px 8px;border:1px solid var(--line);color:var(--mut);margin-left:auto;white-space:nowrap}
+.chip.ok{color:#9be3c3;border-color:#2c5f47;background:#132520}
+.chip.bad{color:#ffc3bd;border-color:#6b2f2b;background:#261415}
+.chip.warn{color:#f5d9a5;border-color:#6b5426;background:#241d10}
+.chip.mute{color:#9aa5b8}
+.det{font-size:11px;color:var(--mut);margin-top:5px;word-break:break-all}
+.grid{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;margin-top:8px;font-size:12px}
+.grid dt{color:var(--mut)}
+.grid dd{margin:0;font-family:ui-monospace,Consolas,monospace;font-size:11px;word-break:break-all}
+.foot{display:flex;align-items:center;gap:8px;margin-top:8px}
+.foot label{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mut);cursor:pointer}
+.foot input[type=number]{width:64px;background:#0c1016;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 5px}
+.foot .sp{margin-left:auto}
+.dot{font-size:11px}
+.dot.on{color:var(--ok)}.dot.off{color:var(--bad)}
+input[type=text],input[type=password]{width:100%;background:#0c1016;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 6px;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{border-bottom:1px solid var(--line);padding:5px 7px;text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:400;background:#171d26}
+details{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:0 0 14px}
+details>summary{cursor:pointer;padding:10px 12px;font-size:14px}
+details>div{padding:0 12px 12px}
+#log{position:fixed;left:0;right:0;bottom:0;background:#0b0e13;border-top:1px solid var(--line);padding:6px 18px;font-size:12px;max-height:74px;overflow:auto;color:var(--mut)}
+#log div:first-child{color:var(--fg)}
+.mut{color:var(--mut);font-size:12px}
+code{color:#9fb3d1}
+</style>
+<header>
+  <p class=t>Weeksir 统一模型网关 · 管理台 <span class=tag>127.0.0.1:8100</span><span class=tag>无鉴权 · 仅运维本机</span><span class=tag id=ptag>价目源 -</span></p>
+  <div class=row>
+    <div class=kpis id=kpis></div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button onclick="testAll(this)">全量测通</button>
+      <button class=ghost onclick="boot()">刷新</button>
+      <button class=ghost onclick="saveAll()">保存价目/默认</button>
+    </div>
+  </div>
+</header>
+<main>
+  <div id=warn></div>
+  <div id=cards></div>
+  <details id=keysBox><summary>密钥与端点（写 <code>.env</code> · 只写不回显 · 同一个 key 被多条路由共用时只列一次）</summary><div>
+    <div class=row><button onclick="saveKeys(this)">保存密钥</button><span class=mut>改完若要正在跑的 8100 也用上新值，需重启计划任务 <code>WeeksirModelAdmin</code>；skill 走 tool-jobs 每次新进程，立即生效。</span></div>
+    <table id=kt><thead><tr><th>环境变量</th><th>类型</th><th>当前</th><th>填新值</th><th>用在</th></tr></thead><tbody></tbody></table>
+  </div></details>
+  <details open><summary>积分余额与调用审计（本地账本桩 · 3.0 平替 weeksir.com 真账本）</summary><div>
+    <div class=row><button class=ghost onclick="loadCredits()">刷新</button><span class=mut>账本 <code id=lpath></code></span></div>
+    <div class=lanes>
+      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">余额</h3><table id=at><thead><tr><th>member</th><th>余额</th></tr></thead><tbody></tbody></table></div>
+      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">按路由聚合</h3><table id=bt><thead><tr><th>路由</th><th>状态</th><th>次</th><th>分</th></tr></thead><tbody></tbody></table></div>
+      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">最近调用</h3><table id=rt><thead><tr><th>member</th><th>路由</th><th>分</th><th>状态</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </div></details>
+</main>
+<div id=log></div>
+<script>
+let BOARD=null, KEYS=null, BAL=0;
+const CEL="st__", OKS=["live-ok","reachable"], BADS=["live-fail","auth-fail","unreachable"];
+function chip(r){
+  if(!r||!r.status) return '<span class="chip mute">未测</span>';
+  const s=r.status, c=BADS.includes(s)?"bad":(OKS.includes(s)?"ok":"warn");
+  const ms=r.ms==null?"":(" "+r.ms+"ms");
+  return '<span class="chip '+c+'">'+s+ms+'</span>';
+}
+function esc(t){return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function laneHTML(cap,r){
+  const dft=r.is_default;
+  return '<div class="lane'+(dft?' h':'')+'" id="lane__'+cap+'__'+r.purpose+'">'+
+   '<div class="lh"><b>'+esc(r.purpose)+'</b><span class="pv">'+esc(r.provider)+' · '+esc(r.model)+'</span>'+
+   '<span id="'+CEL+cap+'__'+r.purpose+'">'+chip(r.probe)+'</span></div>'+
+   '<div class="grid"><dt>密钥</dt><dd><span class="dot '+(r.key_present?'on">就绪':'off">缺')+'</span> '+esc(r.key_env)+
+   '</dd><dt>入口</dt><dd>'+esc(r.entry)+'</dd><dt>端点</dt><dd>'+esc(r.base_url)+'</dd>'+
+   '<dt>适配器</dt><dd>'+(r.adapted?'<span class="dot on">已接·可直接调</span>':'<span class="dot" style="color:#dfa44b">待接适配器</span>')+(r.overridden?'':' <span class=pv>(价=内置兜底)</span>')+'</dd></div>'+
+   '<div class="det" id="det__'+cap+'__'+r.purpose+'">'+esc(r.probe?r.probe.detail:'点「测」探这条（不提交计费任务）')+'</div>'+
+   '<div class="foot"><label>积分/次 <input type="number" min="0" data-p="'+cap+'/'+r.purpose+'" value="'+r.price+'"></label>'+
+   '<label><input type="radio" name="def_'+cap+'" data-cap="'+cap+'" data-pur="'+r.purpose+'"'+(dft?' checked':'')+'>默认</label>'+
+   '<span class=sp></span><button class=mini onclick="testOne(\''+cap+'\',\''+r.purpose+'\',this)">测</button></div></div>';
+}
+function renderBoard(){
+  document.getElementById('ptag').textContent=BOARD.prices_external?("价目外置 "+BOARD.prices_path):"⚠ 价目回落内置表";
+  const host=document.getElementById('cards');
+  host.innerHTML=BOARD.cards.map(c=>{
+    const n=c.rows.length, ok=c.rows.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
+    const bad=c.rows.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
+    return '<div class="card"><h2>'+esc(c.capability)+'<span class=n>'+n+' 条路由 · 默认 <b style="color:#c8d2e2">'+esc(c.default)+'</b>'+
+      (c.rows.some(r=>r.probe)?' · 通 '+ok+'/'+n+(bad?' · <span style="color:#e2564d">坏 '+bad+'</span>':''):'')+'</span></h2>'+
+      '<div class="lanes">'+c.rows.map(r=>laneHTML(c.capability,r)).join('')+'</div></div>';
+  }).join('');
+  kpis(); warnBar();
+}
+function kpis(){
+  const rs=[];BOARD.cards.forEach(c=>c.rows.forEach(r=>rs.push(r)));
+  const ok=rs.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
+  const bad=rs.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
+  const no=rs.filter(r=>r.probe&&!OKS.includes(r.probe.status)&&!BADS.includes(r.probe.status)).length;
+  const un=rs.filter(r=>!r.probe).length;
+  const slow=rs.filter(r=>r.probe&&r.probe.ms!=null);
+  const avg=slow.length?Math.round(slow.reduce((a,b)=>a+b.probe.ms,0)/slow.length)+'ms':'-';
+  const ts=BOARD.probe&&BOARD.probe.ts?new Date(BOARD.probe.ts*1000).toLocaleTimeString():'-';
+  document.getElementById('kpis').innerHTML=
+    '<div class="kpi"><b>'+(BOARD.probe&&BOARD.probe.summary||(ok+'/'+rs.length))+'</b><span>探活结果 · '+ts+'</span></div>'+
+    '<div class="kpi"><b style="color:'+(bad?'#e2564d':'#3fb37f')+'">'+bad+'</b><span>需要处理</span></div>'+
+    '<div class="kpi"><b>'+no+'</b><span>探不了(要实跑)</span></div>'+
+    '<div class="kpi"><b>'+un+'</b><span>未测</span></div>'+
+    '<div class="kpi"><b>'+BOARD.routes_adapted+'/'+BOARD.routes_total+'</b><span>已接适配器</span></div>'+
+    '<div class="kpi"><b>'+avg+'</b><span>平均延迟</span></div>'+
+    '<div class="kpi"><b>'+BAL+'</b><span>账本余额合计</span></div>';
+}
+function warnBar(){
+  const bad=[],no=[];
+  BOARD.cards.forEach(c=>c.rows.forEach(r=>{
+    if(!r.probe)return;
+    if(BADS.includes(r.probe.status))bad.push(c.capability+'/'+r.purpose+' → '+r.probe.status+' '+esc(r.probe.detail||''));
+    else if(!OKS.includes(r.probe.status))no.push(c.capability+'/'+r.purpose);
+  }));
+  let h='';
+  if(bad.length)h+='<div class="banner bad"><b>需要处理 '+bad.length+' 条</b><br>'+bad.join('<br>')+'</div>';
+  if(no.length)h+='<div class="banner mut">探不了(非计费探测能判断，只能实跑验)：'+no.map(esc).join('、')+'</div>';
+  if(BOARD.prices_external===false)h+='<div class="banner"><b>价目回落内置表</b>：model_prices.json 缺失或损坏，改价请先修文件</div>';
+  document.getElementById('warn').innerHTML=h;
+}
+async function loadBoard(){BOARD=await (await fetch('/api/model/board')).json();renderBoard();}
+async function testOne(cap,pur,btn){
+  btn.disabled=true;btn.textContent='探…';
+  const j=await (await fetch('/api/model/test?capability='+encodeURIComponent(cap)+'&purpose='+encodeURIComponent(pur))).json();
+  btn.disabled=false;btn.textContent='测';
+  const card=BOARD.cards.find(c=>c.capability===cap), row=card&&card.rows.find(r=>r.purpose===pur);
+  if(!row)return log('探活失败：'+JSON.stringify(j));
+  row.probe=j.error?{status:'error',detail:j.error,ms:null}:j;
+  document.getElementById(CEL+cap+'__'+pur).innerHTML=chip(row.probe);
+  document.getElementById('det__'+cap+'__'+pur).textContent=row.probe.detail||'';
+  kpis();warnBar();
+  log(cap+'/'+pur+' → '+row.probe.status+(row.probe.ms!=null?(' '+row.probe.ms+'ms'):''));
+}
+async function testAll(btn){
+  btn.disabled=true;const old=btn.textContent;btn.textContent='并发探活中(约 5 秒，不烧钱)…';
+  try{const j=await (await fetch('/api/model/health')).json();
+    BOARD.cards.forEach(c=>c.rows.forEach(r=>{const v=(j.routes||{})[c.capability+'/'+r.purpose];if(v)r.probe=v;}));
+    BOARD.probe={ts:Date.now()/1000,summary:j.summary};
+    renderBoard();log('全量测通：'+j.summary);
+  }catch(e){log('全量测通失败：'+e);}
+  btn.textContent=old;btn.disabled=false;
+}
+async function saveAll(){
+  const prices={},defaults={};
+  document.querySelectorAll('#cards input[data-p]').forEach(el=>{if(el.value!=='')prices[el.dataset.p]=Number(el.value);});
+  document.querySelectorAll('#cards input[type=radio][data-cap]:checked').forEach(el=>{defaults[el.dataset.cap]=el.dataset.pur;});
+  const res=await fetch('/api/model/prices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prices,defaults})});
+  const j=await res.json();
+  if(!res.ok)return log('保存失败：'+((j.errors&&j.errors.length)?j.errors.join(' / '):j.error));
+  log('已保存：价目 '+j.prices_written+' 条、默认路由 '+j.defaults_written+' 条 → 下一次网关调用即生效（无需重启）');
+  await loadBoard();
+}
+async function loadKeys(){
+  const rows=await (await fetch('/api/config')).json();const map={};
+  rows.forEach(r=>r.fields.forEach(f=>{const m=map[f.env_key]||(map[f.env_key]={env:f.env_key,kind:f.kind,secret:f.secret,set:f.set,shown:f.shown,uses:[]});
+    if(f.kind==='api_key'||f.secret){m.secret=true;m.set=m.set||f.set;m.shown=f.shown||m.shown;} else if(!m.shown&&f.shown){m.shown=f.shown;}
+    m.uses.push(r.capability+'/'+r.purpose);}));
+  KEYS=Object.values(map);
+  document.querySelector('#kt tbody').innerHTML=KEYS.map(k=>'<tr><td><code>'+esc(k.env)+'</code></td><td>'+esc(k.kind)+'</td>'+
+    '<td>'+(k.secret?(k.set?'<span class="dot on">已设置</span>':'<span class="dot off">未设置</span>'):'<span class=mut>'+esc(k.shown||'未设置')+'</span>')+'</td>'+
+    '<td><input type=text data-k="'+esc(k.env)+'" placeholder="'+(k.secret?'留空=不改；填新值即覆盖':'留空=不改')+'"></td>'+
+    '<td class="mut">'+k.uses.length+' 条路由</td></tr>').join('');
+}
+async function saveKeys(btn){
+  const body={};document.querySelectorAll('#kt input[data-k]').forEach(el=>{if(el.value.trim())body[el.dataset.k]=el.value.trim();});
+  if(!Object.keys(body).length)return log('没有要写的字段（全部留空=不改）');
+  btn.disabled=true;
+  const j=await (await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).json();
+  btn.disabled=false;
+  log('已写 '+j.written+' 项 → .env（skill 侧新进程立即生效；本 8100 进程要重启才用新值）');
+  await loadKeys();
+}
+function fill(sel,rows,cols){const tb=document.querySelector(sel+' tbody');tb.innerHTML=rows.map(r=>'<tr>'+r.map(c=>'<td>'+esc(c)+'</td>').join('')+'</tr>').join('')||'<tr><td colspan='+cols+' class=mut>（暂无记录）</td></tr>';}
+async function loadCredits(){
+  const j=await (await fetch('/api/model/credits?limit=20')).json();
+  document.getElementById('lpath').textContent=j.ledger_path;
+  fill('#at',j.accounts.map(a=>[a.member,a.balance]),2);
+  fill('#bt',j.by_route.map(x=>[x.route,x.status,x.calls,x.credits]),4);
+  fill('#rt',j.recent_holds.map(x=>[x.member,x.route,x.amount,x.status]),4);
+  BAL=j.accounts.reduce((a,b)=>a+b.balance,0)||0;
+  if(BOARD)kpis();
+}
+function log(t){const d=document.createElement('div');d.textContent=new Date().toLocaleTimeString()+'  '+t;
+  const l=document.getElementById('log');l.insertBefore(d,l.firstChild);while(l.children.length>30)l.removeChild(l.lastChild);}
+async function boot(){await loadBoard();await loadCredits();await loadKeys();log('管理台就绪 · 点任意「测」单条探活，或右上「全量测通」');}
+boot();
+</script>
+"""
 
 
 class H(BaseHTTPRequestHandler):
@@ -292,16 +496,25 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/config"):
             self._send(200, json.dumps(config_view(), ensure_ascii=False))
         elif self.path.startswith("/api/test"):
-            out = gateway.test_models(health_url=HEALTH_URL)
-            self._send(200, json.dumps(out, ensure_ascii=False))
+            self._send(200, json.dumps(health_all(), ensure_ascii=False))
         elif u.path == "/api/model/caps":
             self._send(200, json.dumps(model_caps(), ensure_ascii=False))
         elif u.path == "/api/model/resolve":
             code, payload = model_resolve(parse_qs(u.query))
             self._send(code, json.dumps(payload, ensure_ascii=False))
         elif u.path == "/api/model/health":
-            out = gateway.test_models(health_url=HEALTH_URL)
-            self._send(200, json.dumps(out, ensure_ascii=False))
+            self._send(200, json.dumps(health_all(), ensure_ascii=False))
+        elif u.path == "/api/model/board":
+            self._send(200, json.dumps(board_view(), ensure_ascii=False))
+        elif u.path == "/api/model/test":
+            q = parse_qs(u.query)
+            cap = (q.get("capability") or [""])[0]
+            pur = (q.get("purpose") or [""])[0] or None
+            if not cap:
+                self._send(400, json.dumps({"error": "缺 ?capability="}, ensure_ascii=False))
+                return
+            code, payload = health_one(cap, pur)
+            self._send(code, json.dumps(payload, ensure_ascii=False))
         elif u.path == "/api/model/prices":
             self._send(200, json.dumps(prices_view(), ensure_ascii=False))
         elif u.path == "/api/model/credits":

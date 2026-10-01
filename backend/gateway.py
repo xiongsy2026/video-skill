@@ -252,34 +252,46 @@ def _probe_reachable(base_url: str, api_key: str):
 # 可安全发最小真实请求验证的能力（便宜）；其余按端点可达/鉴权探测（避免计费生成）。
 _LIVE_CHAT = {"text.complete", "video.analyze"}
 
+# call() 里已接出适配器的路由（purpose="*" 表示该能力下所有 purpose 都走同一分支）。
+# ⚠️ 改 call() 的分支时同步这张表；管理面板用它回答"这条能不能直接调"。
+_ADAPTED = {("text.complete", "*"), ("video.analyze", "*"),
+            ("image.generate", "default"), ("image.generate", "nano"),
+            ("video.generate", "omni-t2v"), ("video.generate", "seedance-2.5"),
+            ("video.generate", "seedance-2.0")}
+
+
+def is_adapted(capability: str, purpose: str) -> bool:
+    return (capability, "*") in _ADAPTED or (capability, purpose) in _ADAPTED
+
+
+def test_route(capability: str, purpose: str) -> dict:
+    """单条路由探活（不提交计费任务）。返回 {provider, model, status, detail, ms}。"""
+    r = resolve(capability, purpose)
+    if r["provider"].startswith("local"):
+        return {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
+                "detail": "本地引擎·无需密钥，不在 HTTP 探活范围（要用得实跑）", "ms": None}
+    if not r["api_key"] or not r["base_url"]:
+        return {"provider": r["provider"], "model": r["model"] or "(默认)",
+                "status": "no-creds", "detail": "密钥或 base_url 未配置", "ms": None}
+    if capability in _LIVE_CHAT:
+        model = r["model"] or _MODEL_FALLBACK.get(r["provider"])
+        if not model:
+            return {"provider": r["provider"], "model": "(无)", "status": "no-model",
+                    "detail": "route 没配 model、也没有 provider 兜底名；不敢发 null（上游会当 unknown-model 判 400）", "ms": None}
+        status, detail, ms = _probe_chat(r["base_url"], r["api_key"], model)
+        return {"provider": r["provider"], "model": model, "status": status, "detail": detail, "ms": ms}
+    status, detail, ms = _probe_reachable(r["base_url"], r["api_key"])
+    return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": status, "detail": detail, "ms": ms}
+
 
 def test_models(health_url: str = "http://127.0.0.1:8090/api/health/models") -> dict:
-    """真·测通：文本/视觉脑发最小真实 chat 请求；生成类做端点可达+鉴权探测（不提交计费任务）。"""
-    results = {}
-    for (cap, pur) in ROUTES:
-        r = resolve(cap, pur)
-        key = f"{cap}/{pur}"
-        if r["provider"].startswith("local"):
-            results[key] = {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
-                            "detail": "本地引擎·无需密钥，不在 HTTP 探活范围（要用得实跑）", "ms": None}
-            continue
-        if not r["api_key"] or not r["base_url"]:
-            results[key] = {"provider": r["provider"], "model": r["model"] or "(默认)",
-                            "status": "no-creds", "detail": "密钥或 base_url 未配置", "ms": None}
-            continue
-        if cap in _LIVE_CHAT:
-            model = r["model"] or _MODEL_FALLBACK.get(r["provider"])
-            if not model:
-                results[key] = {"provider": r["provider"], "model": "(无)", "status": "no-model",
-                                "detail": "route 没配 model、也没有 provider 兜底名；不敢发 null（上游会当 unknown-model 判 400）", "ms": None}
-                continue
-            status, detail, ms = _probe_chat(r["base_url"], r["api_key"], model)
-            results[key] = {"provider": r["provider"], "model": model,
-                            "status": status, "detail": detail, "ms": ms}
-            continue
-        status, detail, ms = _probe_reachable(r["base_url"], r["api_key"])
-        results[key] = {"provider": r["provider"], "model": r["model"] or "(默认)",
-                        "status": status, "detail": detail, "ms": ms}
+    """真·测通（并发探 21 条，串行要 30s+，管理面板等不起）：文本/视觉脑发最小真实 chat；
+    生成类只做端点可达/鉴权探测，不提交计费任务。"""
+    from concurrent.futures import ThreadPoolExecutor
+    pairs = list(ROUTES)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        vals = list(ex.map(lambda cp: test_route(cp[0], cp[1]), pairs))
+    results = {f"{c}/{p}": v for (c, p), v in zip(pairs, vals)}
     ok = sum(1 for v in results.values() if v["status"] in ("live-ok", "reachable"))
     unknown = sum(1 for v in results.values() if v["status"] in ("no-probe", "no-model", "local", "empty-response"))
     tail = f"，另有 {unknown} 条探不了(非 OpenAI 风格/无模型名/本地引擎/空返回)，只能实跑验" if unknown else ""
