@@ -21,7 +21,13 @@
     "lipsync/default": 20,
     "lipsync/vo": 24,
     "text.complete/zexapi": 1,
-    "transcribe/asr": 0
+    "transcribe/asr": 0,
+    "text.complete/gpt61": 1,
+    "text.complete/qwen38max": 2,
+    "text.complete/claude48": 2,
+    "text.complete/mimo_pro": 3,
+    "text.complete/gemini38": 6,
+    "text.complete/deepseekv4": 7
   },
   "defaults": {
     "text.complete": "agnes",

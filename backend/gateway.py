@@ -33,6 +33,13 @@ ROUTES = {
     ("text.complete", "agnes"):     {"provider": "agnes",  "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
     ("text.complete", "mimo"):      {"provider": "mimo",   "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
     ("text.complete", "zexapi"):    {"provider": "zexapi", "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": None}},
+    # —— 2026-10-01 全中转实测后补的推理脑（模型名集中在 config，.env 可覆盖）——
+    ("text.complete", "gemini38"):  {"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_GEMINI38"}},
+    ("text.complete", "claude48"):  {"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_CLAUDE48"}},
+    ("text.complete", "deepseekv4"):{"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_DEEPSEEKV4"}},
+    ("text.complete", "gpt61"):     {"provider": "nocannobb",  "client": "openai_compat", "fn": "chat", "fields": {"base_url": "GPT55_BASE_URL",          "api_key": "GPT55_API_KEY",   "model": "TEXT_MODEL_GPT61"}},
+    ("text.complete", "qwen38max"): {"provider": "dashscope",  "client": "openai_compat", "fn": "chat", "fields": {"base_url": "DASHSCOPE_CHAT_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "TEXT_MODEL_QWEN38MAX"}},
+    ("text.complete", "mimo_pro"):  {"provider": "mimo",       "client": "openai_compat", "fn": "chat", "fields": {"base_url": "MIMO_BASE_URL",           "api_key": "MIMO_API_KEY",    "model": "TEXT_MODEL_MIMO_PRO"}},
     # —— 看图 / 看视频（多模态理解）——
     ("video.analyze", "default"):   {"provider": "agnes",  "client": "agnes",              "fn": "analyze_media",       "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
     ("video.analyze", "mimo"):      {"provider": "mimo",   "client": "mimo",               "fn": "analyze_media",       "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
@@ -74,7 +81,12 @@ DEFAULT_PURPOSE = {
 }
 
 # provider 默认模型名（route 未带 model 字段时兜底，避免把 A 家模型名发给 B 家端点）
-_MODEL_FALLBACK = {"agnes": "agnes-3.0-flash", "mimo": "mimo-v2.5", "gpt": "gpt-5.6-sol", "openai": "gpt-5.6-sol", "zexapi": "gemini-3.5-flash"}
+_MODEL_FALLBACK = {"agnes": "agnes-3.0-flash", "mimo": "mimo-v2.5", "gpt": "gpt-5.6-sol", "openai": "gpt-5.6-sol", "zexapi": "gemini-3.5-flash",
+                   "nocannobb": "gpt-6.1-sol", "dashscope": "qwen3.8-max", "manxue": "deepseek-v4-pro"}
+
+# ⚠️ 必须带浏览器 User-Agent：hub.nocannobb.com 这类 Cloudflare 前置的中转对无 UA 的脚本请求回
+#    403 error code: 1010（带 UA 即 200）。之前我把这个当成"key 坏了"，是误判（见 ADR）。
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
 class RouteError(Exception):
@@ -126,6 +138,9 @@ def safe_summary(r: dict) -> dict:
 # 相对值占位（可后续调）；账本单一源在 weeksir.com，这里只是"这次调用值多少积分"的价目。
 PRICE_ROUTES = {
     ("text.complete", "agnes"): 1, ("text.complete", "mimo"): 1,
+    # 推理脑按 2026-10-01 实测 token 量分档（约 100 tok ≈ 1 分；思考型模型预算要留足）
+    ("text.complete", "gpt61"): 1, ("text.complete", "qwen38max"): 2, ("text.complete", "claude48"): 2,
+    ("text.complete", "mimo_pro"): 3, ("text.complete", "gemini38"): 6, ("text.complete", "deepseekv4"): 7,
     ("video.analyze", "default"): 6, ("video.analyze", "mimo"): 6,
     ("image.generate", "default"): 4, ("image.generate", "detail"): 8, ("image.generate", "generic"): 4, ("image.generate", "nano"): 4,
     ("image.edit", "faceswap"): 20,
@@ -220,7 +235,7 @@ def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "pin
     req = urllib.request.Request(
         _openai_v1(base_url) + "/chat/completions",
         data=_json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": BROWSER_UA},
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -249,7 +264,7 @@ def _probe_reachable(base_url: str, api_key: str):
         ms = round((time.time() - t) * 1000)
         try:
             with urllib.request.urlopen(urllib.request.Request(
-                    base + path, headers={"Authorization": f"Bearer {api_key}"}), timeout=15) as r:
+                    base + path, headers={"Authorization": f"Bearer {api_key}", "User-Agent": BROWSER_UA}), timeout=15) as r:
                 r.read()
             return ("reachable", f"GET {path} 鉴权通过(未提交生成)", ms)
         except urllib.error.HTTPError as e:
@@ -363,7 +378,7 @@ def analyze_media(path: str, question: str = "用一句话描述这个画面的�
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=_json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": BROWSER_UA},
         method="POST",
     )
     try:
@@ -392,7 +407,7 @@ def _chat_compat(base_url: str, api_key: str, model: str, messages: list,
     req = urllib.request.Request(
         base + "/chat/completions",
         data=_json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": BROWSER_UA}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             out = _json.loads(resp.read().decode("utf-8"))
@@ -420,7 +435,7 @@ def _vinted_video(base_url, api_key, prompt, model="seedance2.0fast", duration=5
     def _req(url, method="GET", payload=None, timeout=60):
         data = _json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method,
-                                     headers={"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json"})
+                                     headers={"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json", "User-Agent": BROWSER_UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return _json.loads(r.read().decode("utf-8"))
 
