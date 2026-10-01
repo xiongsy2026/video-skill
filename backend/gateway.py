@@ -222,6 +222,12 @@ def _openai_v1(base_url: str) -> str:
     return b if b.endswith("/v1") else b + "/v1"
 
 
+# 上游 5xx（502/503/504）= 中转自己抖动或无渠道，不是我们 key/配置坏：单独归一档，别混进"需要处理"。
+# 4xx（401/403/400/404）才是"只有你能修的事"（欠费/未开通/模型名错/路径错）→ 保留 live-fail 让面板报警。
+def _fail_status(code: int) -> str:
+    return "upstream-5xx" if code and code >= 500 else "live-fail"
+
+
 def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "ping"):
     """最小真实 chat 调用（文本/视觉脑用）。返回 (status, detail, ms)。
     ⚠️ model 必须已解析出真名：发 null 会被上游当 "unknown-model" 判 400（之前 mimo 的假故障就这么来的）。"""
@@ -245,7 +251,7 @@ def _probe_chat(base_url: str, api_key: str, model: str | None, text: str = "pin
             return ("empty-response", "HTTP 200 但 content 空（预算太小或该模型不宜当文本脑）", round((time.time() - t) * 1000))
         return ("live-ok", f"返回 {len(c)} 字", round((time.time() - t) * 1000))
     except urllib.error.HTTPError as e:
-        return ("live-fail", f"HTTP {e.code}", round((time.time() - t) * 1000))
+        return (_fail_status(e.code), f"HTTP {e.code}", round((time.time() - t) * 1000))
     except Exception as e:
         return ("unreachable", type(e).__name__, round((time.time() - t) * 1000))
 
@@ -273,6 +279,8 @@ def _probe_reachable(base_url: str, api_key: str):
                 continue
             if e.code in (401, 403):
                 return ("auth-fail", f"GET {path} HTTP {e.code} 鉴权失败", ms)
+            if e.code and e.code >= 500:
+                return ("upstream-5xx", f"GET {path} HTTP {e.code} 上游抖动(非我方配置)", ms)
             return ("reachable", f"GET {path} HTTP {e.code}(可达,未提交生成)", ms)
         except Exception as e:
             return ("unreachable", f"GET {path} {type(e).__name__}", ms)
@@ -301,8 +309,9 @@ def test_route(capability: str, purpose: str) -> dict:
         r = resolve(capability, purpose)
     except RouteError as e:
         known = (capability, purpose) in ROUTES
-        return {"provider": ROUTES.get((capability, purpose), {}).get("provider", "?"),
-                "model": "-", "status": "disabled" if known and is_disabled(capability, purpose) else "bad-route",
+        provider = ROUTES.get((capability, purpose), {}).get("provider", "?")
+        return {"provider": provider, "model": "-",
+                "status": "disabled" if known and is_disabled(capability, purpose) else "config-error",
                 "detail": str(e), "ms": None}
     if r["provider"].startswith("local"):
         return {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
@@ -339,7 +348,7 @@ def test_models(health_url: str = "http://127.0.0.1:8090/api/health/models", dea
                                 "ms": None}
     ok = sum(1 for v in results.values() if v["status"] in ("live-ok", "reachable"))
     unknown = sum(1 for v in results.values()
-                  if v["status"] in ("no-probe", "no-model", "local", "empty-response", "disabled", "bad-route", "slow"))
+                  if v["status"] in ("no-probe", "no-model", "local", "empty-response", "disabled", "config-error", "slow", "upstream-5xx"))
     tail = f"，另有 {unknown} 条未判定(探不了/太慢/已屏蔽/本地引擎等)" if unknown else ""
     return {"routes": results, "summary": f"{ok}/{len(results)} 通{tail}", "all_ok": ok == len(results)}
 

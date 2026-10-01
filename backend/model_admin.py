@@ -304,6 +304,7 @@ main{padding:16px 18px}
 .chip{font-size:11px;border-radius:20px;padding:2px 8px;border:1px solid var(--line);color:var(--mut);margin-left:auto;white-space:nowrap}
 .chip.ok{color:#9be3c3;border-color:#2c5f47;background:#132520}
 .chip.bad{color:#ffc3bd;border-color:#6b2f2b;background:#261415}
+.chip.flaky{color:#f3d08a;border-color:#6b5426;background:#241d10}
 .chip.warn{color:#f5d9a5;border-color:#6b5426;background:#241d10}
 .chip.mute{color:#9aa5b8}
 .det{font-size:11px;color:var(--mut);margin-top:5px;word-break:break-all}
@@ -358,7 +359,7 @@ code{color:#9fb3d1}
 <div id=log></div>
 <script>
 let BOARD=null, KEYS=null, BAL=0;
-const CEL="st__", OKS=["live-ok","reachable"], BADS=["live-fail","auth-fail","unreachable"];
+const CEL="st__", OKS=["live-ok","reachable"], BADS=["live-fail","auth-fail","unreachable","config-error"];
 function chip(r){
   if(!r||!r.status) return '<span class="chip mute">未测</span>';
   const s=r.status, c=BADS.includes(s)?"bad":(OKS.includes(s)?"ok":"warn");
@@ -402,15 +403,17 @@ function kpis(){
   const rs=all.filter(r=>r.disabled==null), off=all.length-rs.length;
   const ok=rs.filter(r=>r.probe&&OKS.includes(r.probe.status)).length;
   const bad=rs.filter(r=>r.probe&&BADS.includes(r.probe.status)).length;
-  const no=rs.filter(r=>r.probe&&!OKS.includes(r.probe.status)&&!BADS.includes(r.probe.status)).length;
+  const flaky=rs.filter(r=>r.probe&&["upstream-5xx","slow"].includes(r.probe.status)).length;
+  const no=rs.filter(r=>r.probe&&!OKS.includes(r.probe.status)&&!BADS.includes(r.probe.status)&&!["upstream-5xx","slow"].includes(r.probe.status)).length;
   const un=rs.filter(r=>!r.probe).length;
   const slow=rs.filter(r=>r.probe&&r.probe.ms!=null);
   const avg=slow.length?Math.round(slow.reduce((a,b)=>a+b.probe.ms,0)/slow.length)+'ms':'-';
   const ts=BOARD.probe&&BOARD.probe.ts?new Date(BOARD.probe.ts*1000).toLocaleTimeString():'-';
   document.getElementById('kpis').innerHTML=
     '<div class="kpi"><b>'+(BOARD.probe&&BOARD.probe.summary||(ok+'/'+rs.length))+'</b><span>探活结果 · '+ts+'</span></div>'+
-    '<div class="kpi"><b style="color:'+(bad?'#e2564d':'#3fb37f')+'">'+bad+'</b><span>需要处理</span></div>'+
+    '<div class="kpi"><b style="color:'+(bad?'#e2564d':'#3fb37f')+'">'+bad+'</b><span>要你处理(欠费/未开通/配错)</span></div>'+
     '<div class="kpi"><b style="color:'+(off?'#dfa44b':'#8d97a8')+'">'+off+'</b><span>已屏蔽(不计故障)</span></div>'+
+    '<div class="kpi"><b style="color:'+(flaky?'#f3d08a':'#8d97a8')+'">'+flaky+'</b><span>上游抖动(非我方)</span></div>'+
     '<div class="kpi"><b>'+no+'</b><span>探不了(要实跑)</span></div>'+
     '<div class="kpi"><b>'+un+'</b><span>未测</span></div>'+
     '<div class="kpi"><b>'+BOARD.routes_adapted+'/'+BOARD.routes_total+'</b><span>已接适配器</span></div>'+
@@ -418,15 +421,18 @@ function kpis(){
     '<div class="kpi"><b>'+BAL+'</b><span>账本余额合计</span></div>';
 }
 function warnBar(){
-  const bad=[],no=[],offd=[];
+  const bad=[],no=[],offd=[],flaky=[];
   BOARD.cards.forEach(c=>c.rows.forEach(r=>{
     if(r.disabled!=null){offd.push(c.capability+'/'+r.purpose);return;}
     if(!r.probe)return;
-    if(BADS.includes(r.probe.status))bad.push(c.capability+'/'+r.purpose+' → '+r.probe.status+' '+esc(r.probe.detail||'')+'（不想看到就在该条取消「启用」屏蔽掉）');
-    else if(!OKS.includes(r.probe.status))no.push(c.capability+'/'+r.purpose);
+    const k=c.capability+'/'+r.purpose;
+    if(r.probe.status==="upstream-5xx"||r.probe.status==="slow")flaky.push(k+' → '+esc(r.probe.detail||r.probe.status)+(r.probe.ms!=null?(' · 上次 '+r.probe.ms+'ms'):''));
+    else if(BADS.includes(r.probe.status))bad.push(k+' → '+r.probe.status+' '+esc(r.probe.detail||''));
+    else if(!OKS.includes(r.probe.status))no.push(k);
   }));
   let h='';
-  if(bad.length)h+='<div class="banner bad"><b>需要处理 '+bad.length+' 条</b><br>'+bad.join('<br>')+'</div>';
+  if(bad.length)h+='<div class="banner bad"><b>要你处理 '+bad.length+' 条（欠费 / 未开通 / 模型名或端点错——只有你能修）</b><br>'+bad.join('<br>')+'</div>';
+  if(flaky.length)h+='<div class="banner"><b>上游抖动 '+flaky.length+' 条：中转自己回 5xx 或超时，<b>不是我们的 key 或配置坏</b>，先别屏蔽</b><br>'+flaky.join('<br>')+'</div>';
   if(no.length)h+='<div class="banner mut">探不了(非计费探测能判断，只能实跑验)：'+no.map(esc).join('、')+'</div>';
   if(offd.length)h+='<div class="banner mut">已屏蔽(网关会直接拒绝这些路由)：'+offd.map(esc).join('、')+'</div>';
   if(BOARD.prices_external===false)h+='<div class="banner"><b>价目回落内置表</b>：model_prices.json 缺失或损坏，改价请先修文件</div>';
@@ -439,7 +445,7 @@ async function testOne(cap,pur,btn){
   btn.disabled=false;btn.textContent='测';
   const card=BOARD.cards.find(c=>c.capability===cap), row=card&&card.rows.find(r=>r.purpose===pur);
   if(!row)return log('探活失败：'+JSON.stringify(j));
-  row.probe=j.error?{status:'error',detail:j.error,ms:null}:j;
+  row.probe=j.error?{status:"config-error",detail:j.error,ms:null}:j;
   document.getElementById(CEL+cap+'__'+pur).innerHTML=chip(row.probe);
   document.getElementById('det__'+cap+'__'+pur).textContent=row.probe.detail||'';
   kpis();warnBar();

@@ -39,6 +39,7 @@
     "transcribe": "asr"
   },
   "disabled": {
-    "text.complete/zexapi": "zexapi 聊天分组无可用上游通道：gemini-3.5-flash/2.5-flash/gpt-4o-mini 全 HTTP 503（2026-10-01 实测）；/v1/videos 生图与视频不受影响"
+    "text.complete/zexapi": "gemini-3.5-flash / claude-opus-4-6 在 zexapi 无可用渠道(503)；同 key 的 gemini-3.8-flash、",
+    "text.complete/qwen38max": "阿里百炼账户欠费 Arrearage：qwen3.8-max/3.7-max/3.6-plus 与 MiniMax 全系同错(400 Arrearage)；之前"
   }
 }
