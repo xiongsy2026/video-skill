@@ -47,6 +47,11 @@ STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
 # 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
 # 不登记主人就会在每个会话里都弹右栏（2026-10-01 实际踩过：omni 会话被弹出 Hypit 工作台）。
 STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
+STUDIO_CACHE_TTL = 4.0
+_STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "not-probed"}}
+# 代探结果短缓存：presence 每 4 秒被每个右栏窗口打一次，没缓存就是每个窗口每次都去撞一次死端口。
+STUDIO_CACHE_TTL = 5.0
+_STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "cold"}}
 
 
 def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
@@ -72,29 +77,41 @@ def _studio_owner() -> dict:
         return {}
 
 
+def _probe_studio(port: int) -> dict:
+    """探一次 studio 的只读口；结果缓存 5 秒——多个右栏窗口共用一份，免得各自每 4 秒去撞死端口。"""
+    import urllib.error
+    import urllib.request
+    now = time.time()
+    if _STUDIO_CACHE["port"] == port and now - _STUDIO_CACHE["ts"] < STUDIO_CACHE_TTL:
+        return _STUDIO_CACHE["res"]
+    url = "http://localhost:%d/__studio/library?section=tasks" % port
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+        tasks = data.get("tasks") or []
+        running = [t for t in tasks
+                   if str(t.get("status", "")).lower() not in ("", "finished", "failed", "cancelled", "saved")]
+        res = {"up": True, "tasks": len(tasks), "running": len(running),
+               "artifacts": len(data.get("artifacts") or [])}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        res = {"up": False, "error": type(e).__name__}
+    _STUDIO_CACHE.update(port=port, ts=now, res=res)
+    return res
+
+
 def studio_status(session: str | None = None) -> dict:
     """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
     浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
 
     带 session 时按主人过滤：只有起 studio 的那个会话看得到（没登记主人就谁都不弹）。
     """
-    import urllib.error
-    import urllib.request
     owner = _studio_owner()
     port = int(owner.get("port") or STUDIO_PORT)
-    if session is not None:
-        if str(owner.get("session") or "") != str(session):
-            return {"up": False, "port": port, "reason": "not-owner"}
-    url = "http://localhost:%d/__studio/library?section=tasks" % port
-    try:
-        with urllib.request.urlopen(url, timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"up": False, "port": port, "error": type(e).__name__}
-    tasks = data.get("tasks") or []
-    running = [t for t in tasks if str(t.get("status", "")).lower() not in ("", "finished", "failed", "cancelled", "saved")]
-    return {"up": True, "port": port, "run": owner.get("run") or "", "session": owner.get("session") or "",
-            "tasks": len(tasks), "running": len(running), "artifacts": len(data.get("artifacts") or [])}
+    if session is not None and str(owner.get("session") or "") != str(session):
+        return {"up": False, "port": port, "reason": "not-owner"}
+    res = dict(_probe_studio(port))
+    res.update(port=port, run=owner.get("run") or "", session=owner.get("session") or "")
+    return res
 
 
 def token_required():
