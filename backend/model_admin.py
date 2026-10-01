@@ -127,6 +127,77 @@ def model_call(body: dict) -> tuple:
     return 200, env
 
 
+# ---- 价目 / 默认路由 / 积分流水（model_prices.json + 本地账本，改价不用动代码）----
+
+def prices_view() -> dict:
+    ext = gateway.external_config()
+    rows = []
+    for (cap, purpose), route in gateway.ROUTES.items():
+        rows.append({
+            "capability": cap, "purpose": purpose, "provider": route["provider"],
+            "price": gateway.unit_price(cap, purpose),
+            "builtin": gateway.PRICE_ROUTES.get((cap, purpose)),
+            "overridden": f"{cap}/{purpose}" in ext["prices"],
+            "is_default": purpose == (ext["defaults"].get(cap) or gateway.DEFAULT_PURPOSE.get(cap)),
+        })
+    return {"path": gateway.price_path(), "external": bool(ext["prices"]),
+            "rows": rows, "defaults": {c: (ext["defaults"].get(c) or gateway.DEFAULT_PURPOSE.get(c))
+                                       for c in gateway.CAPABILITIES},
+            "purposes": {c: [p for (cc, p) in gateway.ROUTES if cc == c] for c in gateway.CAPABILITIES}}
+
+
+def _validate_prices(body: dict) -> tuple:
+    """返回 (prices, defaults, errors)。只认注册表里真实存在的 cap/purpose，防手滑写出幽灵路由。"""
+    errs, prices = [], {}
+    for k, v in (body.get("prices") or {}).items():
+        if "/" not in str(k) or tuple(str(k).split("/", 1)) not in gateway.ROUTES:
+            errs.append(f"未知路由: {k}")
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            errs.append(f"{k} 的价格不是整数: {v!r}")
+            continue
+        if not 0 <= n <= 100000:
+            errs.append(f"{k} 价格超范围(0~100000): {n}")
+            continue
+        prices[str(k)] = n
+    defaults = {}
+    valid_default = {c: [p for (cc, p) in gateway.ROUTES if cc == c] for c in gateway.CAPABILITIES}
+    for c, p in (body.get("defaults") or {}).items():
+        if c not in valid_default or p not in valid_default[c]:
+            errs.append(f"默认路由 {c}={p} 不存在（可选: {', '.join(valid_default.get(c, [])) or '未知能力'}）")
+            continue
+        defaults[str(c)] = str(p)
+    return prices, defaults, errs
+
+
+def save_prices(body: dict) -> tuple:
+    prices, defaults, errs = _validate_prices(body)
+    if errs:
+        return 400, {"errors": errs}
+    path = gateway.price_path()
+    try:
+        data = json.loads(open(path, encoding="utf-8").read())
+    except Exception:
+        data = {"_说明": "统一模型网关价目与默认路由：prices 键=capability/purpose，defaults 键=capability。"}
+    data["prices"] = {**data.get("prices", {}), **prices}
+    data["defaults"] = {**data.get("defaults", {}), **defaults}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)   # 原子换；mtime 变 → gateway 下一次调用自动重载
+    return 200, {"prices_written": len(prices), "defaults_written": len(defaults), "path": path}
+
+
+def credits_view(limit: int = 30) -> dict:
+    led = gateway.ledger()
+    out = led.audit(limit)
+    out["accounts"] = led.accounts()
+    out["ledger_path"] = led.path
+    return out
+
+
 PAGE = """<!doctype html><html lang=zh><meta charset=utf-8>
 <title>Weeksir 模型配置</title>
 <style>
@@ -137,6 +208,8 @@ PAGE = """<!doctype html><html lang=zh><meta charset=utf-8>
  input{width:100%;box-sizing:border-box;background:#0b0d11;color:#e6e6e6;border:1px solid #333;padding:4px}
  button{background:#2b6cff;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;margin:4px 6px 0 0}
  .hint{color:#8a93a6;font-size:12px;margin:8px 0}
+ h3{font-size:15px;margin:24px 0 2px;color:#c9d4e6} code{color:#9fb3d1}
+ button.ghost{background:#243044} td input{min-width:56px}
  #log{white-space:pre-wrap;background:#0b0d11;border:1px solid #333;padding:8px;margin-top:12px;min-height:60px}
 </style>
 <h1>Weeksir 模型配置（写 .env，密钥只写不回显；仅本机 127.0.0.1）</h1>
@@ -144,6 +217,16 @@ PAGE = """<!doctype html><html lang=zh><meta charset=utf-8>
 <table id=t><thead><tr><th>能力/purpose</th><th>provider</th><th>字段</th><th>当前</th><th>填新值</th></tr></thead><tbody></tbody></table>
 <button onclick="save()">保存</button><button onclick="test()">测试连通</button>
 <div id=log></div>
+<h3>价目与默认路由（写 <code>model_prices.json</code>，改价不动代码）</h3>
+<div class=hint>源：<code id=ppath></code> <span id=psrc></span> · “默认”=调用方不指定 purpose 时走哪条路由 · 留空=不改 · 视频类每 10s 折算一个单位。</div>
+<table id=pt><thead><tr><th>能力/purpose</th><th>provider</th><th>积分/次</th><th>内置兜底</th><th>默认</th></tr></thead><tbody></tbody></table>
+<button onclick="savePrices()">保存价目</button> <button class=ghost onclick="loadPrices()">重载价目</button>
+<h3>积分余额与调用审计（本地账本桩；3.0 平替成 weeksir.com 真账本）</h3>
+<div class=hint>账本：<code id=lpath></code> · done=已扣，rolled_back=失败已退（不扣费）。</div>
+<table id=at><thead><tr><th>member</th><th>余额</th></tr></thead><tbody></tbody></table>
+<table id=bt><thead><tr><th>路由</th><th>状态</th><th>次数</th><th>积分</th></tr></thead><tbody></tbody></table>
+<table id=rt><thead><tr><th>hold</th><th>member</th><th>路由</th><th>积分</th><th>状态</th></tr></thead><tbody></tbody></table>
+<button class=ghost onclick="loadCredits()">刷新余额/流水</button>
 <script>
 let DATA=[];
 async function load(){const r=await fetch('/api/config');DATA=await r.json();render();}
@@ -160,7 +243,36 @@ async function save(){const body={};document.querySelectorAll('input[data-k]').f
  const j=await r.json();log('已保存 '+j.written+' 项 → .env');load();}
 async function test(){const r=await fetch('/api/test');const j=await r.json();log(JSON.stringify(j,null,2));}
 function log(t){document.getElementById('log').textContent=t;}
-load();
+
+let PRICES=null;
+async function loadPrices(){PRICES=await (await fetch('/api/model/prices')).json();
+ document.getElementById('ppath').textContent=PRICES.path;
+ document.getElementById('psrc').textContent=PRICES.external?'（外置生效）':'（⚠ 文件缺失或损坏，当前用内置兜底表）';
+ const tb=document.querySelector('#pt tbody');tb.innerHTML='';
+ PRICES.rows.forEach(row=>{const key=row.capability+'/'+row.purpose;const tr=document.createElement('tr');
+  tr.innerHTML=`<td><span class=cap>${row.capability}</span>/<span class=p>${row.purpose}</span></td>`+
+   `<td>${row.provider}</td><td><input data-p="${key}" value="${row.price}"></td>`+
+   `<td>${row.overridden?('内置 '+row.builtin):'—'}</td>`+
+   `<td><input type=radio name=d_${row.capability} value="${row.purpose}" ${row.is_default?'checked':''}></td>`;
+  tb.appendChild(tr);});}
+async function savePrices(){const prices={},defaults={};
+ document.querySelectorAll('#pt input[data-p]').forEach(el=>{if(el.value.trim()!=='')prices[el.dataset.p]=Number(el.value);});
+ PRICES.rows.forEach(r=>{const el=document.querySelector('input[name="d_'+r.capability+'"]:checked');if(el)defaults[r.capability]=el.value;});
+ const res=await fetch('/api/model/prices',{method:'POST',headers:{'content-type':'application/json'},
+  body:JSON.stringify({prices,defaults})});
+ const j=await res.json();
+ if(!res.ok){log('保存失败：\\n'+(j.errors||(j.error?[j.error]:['未知错误'])).join('\\n'));return;}
+ loadPrices();
+ loadCredits().then(()=>log('已写 model_prices.json：价目 '+j.prices_written+' 条、默认路由 '+j.defaults_written+' 条 → 下一次网关调用即生效'));}
+async function loadCredits(){const j=await (await fetch('/api/model/credits?limit=30')).json();
+ document.getElementById('lpath').textContent=j.ledger_path;
+ fill('#at',j.accounts.map(a=>[a.member,a.balance]));
+ fill('#bt',j.by_route.map(x=>[x.route,x.status,x.calls,x.credits]));
+ fill('#rt',j.recent_holds.map(x=>[x.hold_id,x.member,x.route,x.amount,x.status]));}
+function fill(sel,rows){const tb=document.querySelector(sel+' tbody');tb.innerHTML='';
+ rows.forEach(c=>{const tr=document.createElement('tr');c.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});tb.appendChild(tr);});
+ if(!rows.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan=5 class=hint>（暂无记录）</td>';tb.appendChild(tr);}}
+load();loadPrices();loadCredits();
 </script>"""
 
 
@@ -190,6 +302,12 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/model/health":
             out = gateway.test_models(health_url=HEALTH_URL)
             self._send(200, json.dumps(out, ensure_ascii=False))
+        elif u.path == "/api/model/prices":
+            self._send(200, json.dumps(prices_view(), ensure_ascii=False))
+        elif u.path == "/api/model/credits":
+            q = parse_qs(u.query)
+            lim = int((q.get("limit") or ["30"])[0] or 30)
+            self._send(200, json.dumps(credits_view(max(1, min(lim, 200))), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -204,6 +322,14 @@ class H(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"error": f"bad json: {e}"}))
                 return
             code, payload = model_call(body if isinstance(body, dict) else {})
+            self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path == "/api/model/prices":
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"error": f"bad json: {e}"}, ensure_ascii=False))
+                return
+            code, payload = save_prices(body if isinstance(body, dict) else {})
             self._send(code, json.dumps(payload, ensure_ascii=False))
         elif self.path.startswith("/api/config"):
             try:

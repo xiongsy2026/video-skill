@@ -1,0 +1,35 @@
+{
+  "_说明": "统一模型网关的价目与默认路由。改这里=改配置，不用动代码；gateway 按 mtime 自动重载（面板保存后下一次调用即生效）。prices 键=capability/purpose，值=每次调用积分（视频按每 10s 一个单位折算，见 meter）。defaults 键=capability，值=不指定 purpose 时走哪条。文件缺失或损坏则回落 gateway.py 内置表。",
+  "prices": {
+    "text.complete/agnes": 1,
+    "text.complete/mimo": 1,
+    "video.analyze/default": 6,
+    "video.analyze/mimo": 6,
+    "image.generate/default": 4,
+    "image.generate/detail": 8,
+    "image.generate/generic": 4,
+    "image.generate/nano": 4,
+    "image.edit/faceswap": 20,
+    "video.generate/omni-t2v": 40,
+    "video.generate/agnes-v": 30,
+    "video.generate/clone-r2v": 50,
+    "video.generate/seedance-2.5": 60,
+    "video.generate/seedance-2.0": 50,
+    "video.generate/wan3-dashscope": 50,
+    "video.generate/h3": 60,
+    "video.generate/motion": 50,
+    "lipsync/default": 20,
+    "lipsync/vo": 24,
+    "transcribe/whisperx": 0,
+    "text.complete/zexapi": 1
+  },
+  "defaults": {
+    "text.complete": "agnes",
+    "image.generate": "default",
+    "image.edit": "faceswap",
+    "video.generate": "omni-t2v",
+    "video.analyze": "default",
+    "lipsync": "default",
+    "transcribe": "whisperx"
+  }
+}

@@ -87,7 +87,7 @@ def resolve(capability: str, purpose: str | None = None) -> dict:
     """解析能力(+purpose) → 路由与凭证（凭证从 settings/.env 取，源码无明文）。"""
     if capability not in CAPABILITIES:
         raise RouteError(f"未知能力: {capability}")
-    purpose = purpose or DEFAULT_PURPOSE[capability]
+    purpose = purpose or default_purpose(capability)
     route = ROUTES.get((capability, purpose))
     if not route:
         raise RouteError(f"{capability} 无 purpose={purpose}；可选: "
@@ -131,9 +131,47 @@ PRICE_ROUTES = {
 PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
                 "video.generate": 40, "video.analyze": 6, "lipsync": 20, "transcribe": 0}
 
+# ---- 可外置配置：价目 + 每能力默认路由 → model_prices.json（改价/换默认供应商=改这个文件，不动代码）----
+# 文件按 mtime 懒加载（面板保存后下一次调用即生效）；缺失或损坏则回落上面两张内置表，绝不让管线跑不动。
+_PRICE_PATH = _os.environ.get("MODEL_PRICES") or _os.path.join(_d or _os.getcwd(), "model_prices.json")
+_ext = {"mtime": None, "prices": {}, "defaults": {}}
+
+
+def price_path() -> str:
+    return _PRICE_PATH
+
+
+def external_config() -> dict:
+    try:
+        mt = _os.path.getmtime(_PRICE_PATH)
+    except OSError:
+        return {"prices": {}, "defaults": {}}
+    if _ext["mtime"] != mt:
+        prices: dict = {}
+        defaults: dict = {}
+        try:
+            with open(_PRICE_PATH, encoding="utf-8") as f:
+                raw = _json.loads(f.read())
+            prices = {f"{k}": int(v) for k, v in (raw.get("prices") or {}).items()}
+            defaults = {f"{k}": str(v) for k, v in (raw.get("defaults") or {}).items()}
+        except Exception as e:
+            print(f"[gateway] model_prices.json 未生效（用内置价目）: {type(e).__name__}: {e}")
+        _ext.update(prices=prices, defaults=defaults, mtime=mt)
+    return _ext
+
+
+def default_purpose(capability: str) -> str:
+    return external_config()["defaults"].get(capability) or DEFAULT_PURPOSE[capability]
+
 
 def unit_price(capability: str, purpose: str) -> int:
-    return PRICE_ROUTES.get((capability, purpose), PRICE_BY_CAP.get(capability, 1))
+    ext = external_config()["prices"]
+    key = f"{capability}/{purpose}"
+    if key in ext:
+        return ext[key]
+    if (capability, purpose) in PRICE_ROUTES:
+        return PRICE_ROUTES[(capability, purpose)]
+    return PRICE_BY_CAP.get(capability, 1)
 
 
 def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
@@ -450,6 +488,8 @@ class Ledger:
             "CREATE TABLE IF NOT EXISTS holds(hold_id TEXT PRIMARY KEY, member TEXT, amount INTEGER, status TEXT);"
             "CREATE TABLE IF NOT EXISTS ledger(member TEXT, delta INTEGER, note TEXT, ts REAL);"
         )
+        if "route" not in [r[1] for r in con.execute("PRAGMA table_info(holds)")]:
+            con.execute("ALTER TABLE holds ADD COLUMN route TEXT")  # 逐路由审计用；旧行留 NULL
         con.commit(); con.close()
 
     def _con(self):
@@ -475,7 +515,8 @@ class Ledger:
         con = self._con()
         self.balance(member)  # 确保有行
         con.execute("UPDATE accounts SET balance=balance-? WHERE member=?", (cost, member))
-        con.execute("INSERT INTO holds(hold_id,member,amount,status) VALUES(?,?,?,'pending')", (hold_id, member, cost))
+        con.execute("INSERT INTO holds(hold_id,member,amount,status,route) VALUES(?,?,?,'pending',?)",
+                    (hold_id, member, cost, f"{capability}/{purpose}"))
         con.execute("INSERT INTO ledger(member,delta,note,ts) VALUES(?,?,?,?)",
                     (member, -cost, f"preauth {capability}/{purpose}", _time.time()))
         con.commit(); con.close()
@@ -508,6 +549,28 @@ class Ledger:
         con.execute("UPDATE holds SET status='rolled_back' WHERE hold_id=?", (hold_id,))
         con.commit(); con.close()
         return {"ok": True, "refunded": held, "balance_after": self.balance(member)}
+
+    # ---- 只读视图（给管理面板做"余额/流水/调用审计"）----
+    def accounts(self) -> list:
+        con = self._con()
+        rows = con.execute("SELECT member,balance FROM accounts ORDER BY member").fetchall()
+        con.close()
+        return [{"member": m, "balance": b} for m, b in rows]
+
+    def audit(self, limit: int = 30) -> dict:
+        """按 路由×状态 聚合（done=真扣了这些分、rolled_back=已退），加最近流水。"""
+        con = self._con()
+        by_route = [{"route": r or "(旧记录未记路由)", "status": s, "calls": n, "credits": c}
+                    for r, s, n, c in con.execute(
+                        "SELECT route,status,COUNT(*),SUM(amount) FROM holds GROUP BY route,status"
+                        " ORDER BY route,status")]
+        recent = [{"hold_id": h, "member": m, "route": r or "(旧)", "amount": a, "status": s}
+                  for h, m, r, a, s in con.execute(
+                      "SELECT hold_id,member,route,amount,status FROM holds ORDER BY rowid DESC LIMIT ?", (limit,))]
+        flow = [{"member": m, "delta": d, "note": n, "ts": t} for m, d, n, t in con.execute(
+            "SELECT member,delta,note,ts FROM ledger ORDER BY ts DESC LIMIT ?", (limit,))]
+        con.close()
+        return {"by_route": by_route, "recent_holds": recent, "flow": flow}
 
 
 _ledger = None
@@ -566,6 +629,20 @@ def _cli(argv):
         cap = argv[1]
         pur = argv[2] if len(argv) > 2 else None
         print(safe_summary(resolve(cap, pur)))
+    elif cmd == "prices":
+        cfg = external_config()
+        print(f"价目源: {price_path()}  →  外置 {len(cfg['prices'])} 条 / 默认路由 {len(cfg['defaults'])} 条"
+              + ("" if cfg["prices"] else "（文件缺失或损坏，当前用内置兜底表）"))
+        for cap in CAPABILITIES:
+            dft = cfg["defaults"].get(cap) or DEFAULT_PURPOSE.get(cap)
+            for (c, p) in ROUTES:
+                if c == cap:
+                    print(f"  {'★' if p == dft else ' '} {cap}/{p:<14} {unit_price(cap, p):>4} 分")
+    elif cmd == "credits":
+        led = ledger()
+        print("余额:", _json.dumps(led.accounts(), ensure_ascii=False))
+        for r in led.audit()["by_route"]:
+            print(f"  {r['route']:<30} {r['status']:<12} {r['calls']:>3} 次 {r['credits']:>6} 分")
     elif cmd == "test":
         res = test_models()
         print(f"真·测通结果  {res['summary']}")
