@@ -648,6 +648,12 @@ class H(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("MODEL_ADMIN_PORT", "8100"))
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    try:
+        n = hypit_bridge.reconcile_orphans()   # 别让上个进程留下的 job 永远挂着 running（hypit 会一直等）
+        if n:
+            print(f"reconciled {n} orphaned hypit job(s) from the previous process")
+    except Exception as e:
+        print(f"hypit job reconcile skipped: {e}")
     print(f"Weeksir model admin on http://127.0.0.1:{port}  (ENV={ENV_PATH})")
     try:
         srv.serve_forever()

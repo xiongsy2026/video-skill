@@ -47,6 +47,8 @@ STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
 # 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
 # 不登记主人就会在每个会话里都弹右栏（2026-10-01 实际踩过：omni 会话被弹出 Hypit 工作台）。
 STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
+# 诊断用：记下右栏探测实际带来的会话 id（运维据此知道该给哪个会话 claim；上限 30 条）
+_SEEN_SESSIONS = {}
 STUDIO_CACHE_TTL = 4.0
 _STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "not-probed"}}
 # 代探结果短缓存：presence 每 4 秒被每个右栏窗口打一次，没缓存就是每个窗口每次都去撞一次死端口。
@@ -107,10 +109,18 @@ def studio_status(session: str | None = None) -> dict:
     """
     owner = _studio_owner()
     port = int(owner.get("port") or STUDIO_PORT)
-    if session is not None and str(owner.get("session") or "") != str(session):
-        return {"up": False, "port": port, "reason": "not-owner"}
+    if session is not None:
+        _SEEN_SESSIONS[str(session)] = time.time()
+        if len(_SEEN_SESSIONS) > 30:
+            for old in sorted(_SEEN_SESSIONS, key=_SEEN_SESSIONS.get)[:len(_SEEN_SESSIONS) - 30]:
+                _SEEN_SESSIONS.pop(old, None)
+        if str(owner.get("session") or "") != str(session):
+            return {"up": False, "port": port, "reason": "not-owner"}
     res = dict(_probe_studio(port))
     res.update(port=port, run=owner.get("run") or "", session=owner.get("session") or "")
+    if session is None:   # 不带 session = 运维视角：顺便给出右栏实际用过的会话 id
+        res["seen"] = [{"session": k, "age": round(time.time() - v)}
+                       for k, v in sorted(_SEEN_SESSIONS.items(), key=lambda kv: -kv[1])]
     return res
 
 
@@ -226,6 +236,33 @@ def check_support(body: dict) -> tuple:
     return True, ""
 
 
+def reconcile_orphans() -> int:
+    """服务启动时调用：本服务单进程，队列里还挂着 queued/running 的行必然是上个进程留下的孤儿
+    （线程已随进程消失，hypit 会一直 waiting 等不到结果）。2026-10-01 重启 8100 时真的打断了一条在跑的 build。"""
+    con = _db()
+    cur = con.execute(
+        "UPDATE jobs SET state='failed', updated=?, error=? WHERE state IN ('queued','running')",
+        (time.time(), json.dumps({"code": "GATEWAY_RESTARTED",
+                                  "message": "网关重启时这条还在生成，执行线程已丢失、无法续查上游任务；请重跑这次 build"},
+                                 ensure_ascii=False)))
+    con.commit()
+    n = cur.rowcount
+    con.close()
+    return n
+
+
+def _normalize(body: dict) -> dict:
+    """hypit 的 POST /videos 见过两种形状：字段平铺，以及 {"model":..,"input":{字段},"account":..}。
+    只认平铺过一种 ⇒ 另一种 prompt 为空、上游回 422「请填写提示词」（2026-10-01 实跑踩过）。这里统一摊平。"""
+    out = dict(body or {})
+    for key in ("input", "params"):
+        inner = out.pop(key, None)
+        if isinstance(inner, dict):
+            for k, v in inner.items():
+                out.setdefault(str(k), v)
+    return out
+
+
 def _run(jid: str, body: dict):
     cap, purpose = HYPIT_MODELS[str(body.get("model"))]
     params = {"prompt": str(body.get("prompt") or ""),
@@ -251,10 +288,11 @@ def _run(jid: str, body: dict):
     res = env.get("result") or {}
     credits = (env.get("credits") or {}).get("charged") or 0
     if not env.get("ok"):
+        msg = str(env.get("error") or res.get("error") or "生成失败")[:360]
+        if res.get("job_id"):
+            msg += "（上游任务 %s，可据此查它到底出没出片）" % res["job_id"]
         _touch(jid, state="failed", credits=credits,
-               error=json.dumps({"code": "GATEWAY_FAILED",
-                                 "message": str(env.get("error") or res.get("error") or "生成失败")[:400]},
-                                ensure_ascii=False))
+               error=json.dumps({"code": "GATEWAY_FAILED", "message": msg}, ensure_ascii=False))
         return
     path = res.get("path") or ""
     name = ""
@@ -273,6 +311,7 @@ def _run(jid: str, body: dict):
 
 
 def handle_submit(body: dict) -> tuple:
+    body = _normalize(body if isinstance(body, dict) else {})   # 两种形状都接（见 _normalize）
     ok, reason = check_support(body)
     if not ok:
         return 400, {"error": {"code": "UNSUPPORTED_INPUT", "message": reason}}
