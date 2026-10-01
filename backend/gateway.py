@@ -46,9 +46,9 @@ ROUTES = {
     ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "swap_face", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     # —— 生视频 ——
     ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_client",        "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
-    # —— Seedance（vinted.cam 聚合，/v1/videos 提交轮询·同 zexapi 形；端点名在 config.ONESHOT_SEEDANCE_ENDPOINTS）——
-    ("video.generate", "seedance-2.5"):  {"provider": "vinted",   "client": "TODO(vinted /v1/videos,同omni形)", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
-    ("video.generate", "seedance-2.0"):  {"provider": "vinted",   "client": "TODO(vinted /v1/videos,同omni形)", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
+    # —— Seedance（vinted.cam 直连·/v1/videos·model=seedance2.5/2.0；见 _vinted_video）——
+    ("video.generate", "seedance-2.5"):  {"provider": "vinted",   "client": "vinted_video", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
+    ("video.generate", "seedance-2.0"):  {"provider": "vinted",   "client": "vinted_video", "fn": "generate", "fields": {"base_url": "VINTED_VIDEO_API_BASE", "api_key": "VINTED_VIDEO_API_KEY", "model": None}},
     ("video.generate", "agnes-v"):       {"provider": "agnes",    "client": "agnes_video_client", "fn": "create_flash_task", "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_VIDEO_FLASH_MODEL"}},
     ("video.generate", "clone-r2v"):     {"provider": "wan3",     "client": "wan3_client",        "fn": "run_one_segment",   "fields": {"base_url": "RUNNINGHUB_WAN3_BASE_URL", "api_key": "RUNNINGHUB_WAN3_API_KEY", "model": None}},
     ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无独立client,dashscope待接)", "fn": "generate",        "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
@@ -291,6 +291,60 @@ def _chat_compat(base_url: str, api_key: str, model: str, messages: list,
         return None, f"{type(e).__name__}: {e}"
 
 
+def _vinted_video(base_url, api_key, prompt, model="seedance2.0fast", duration=5, ratio="9:16",
+                  resolution="720p", image_urls=None, out_path=None, poll_timeout=900, poll_interval=10):
+    """vinted.cam 视频生成（Seedance）。契约见 https://vinted.cam/developers：
+    POST /v1/videos→id；GET /v1/videos/{id} status(succeeded/failed)；GET .../signed_url?download=1→url。
+    返回 {success, url, path, job_id, error}，不抛。"""
+    import json as _json
+    import time as _t
+    import urllib.error
+    import urllib.request
+    if not base_url or not api_key:
+        return {"success": False, "error": "缺 VINTED_VIDEO_API_BASE/KEY"}
+    base = base_url.rstrip("/")
+
+    def _req(url, method="GET", payload=None, timeout=60):
+        data = _json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers={"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode("utf-8"))
+
+    try:
+        body = {"prompt": prompt, "model": model, "duration": int(duration), "ratio": ratio, "resolution": resolution}
+        if image_urls:
+            body["image_urls"] = image_urls
+        sub = _req(base + "/v1/videos", "POST", body)
+        job_id = sub.get("id") or sub.get("job_id") or sub.get("task_id")
+        if not job_id:
+            return {"success": False, "error": "提交未返回 id: %s" % str(sub)[:200]}
+        start = _t.time()
+        status = None
+        while _t.time() - start < poll_timeout:
+            st = _req("%s/v1/videos/%s" % (base, job_id))
+            status = str(st.get("status", "")).lower()
+            if status == "succeeded":
+                break
+            if status == "failed":
+                return {"success": False, "job_id": job_id, "error": "生成失败: %s" % str(st)[:200]}
+            _t.sleep(poll_interval)
+        else:
+            return {"success": False, "job_id": job_id, "error": "轮询超时 %ds" % poll_timeout}
+        signed = _req("%s/v1/videos/%s/signed_url?download=1" % (base, job_id))
+        url = signed.get("url")
+        path = None
+        if url and out_path:
+            with urllib.request.urlopen(url, timeout=300) as resp, open(out_path, "wb") as f:
+                f.write(resp.read())
+            path = out_path
+        return {"success": bool(url), "url": url, "path": path, "job_id": job_id, "error": None}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "error": "HTTP %d: %s" % (e.code, e.read().decode("utf-8", "replace")[:200])}
+    except Exception as e:
+        return {"success": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
 def call(capability: str, purpose: str | None = None, **params) -> dict:
     """能力级分发：调用方只给能力名+标准参数，本层按路由注入 model/凭证并转调现有 client。
 
@@ -342,6 +396,33 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         if url and params.get("output_path") and url.startswith("http"):
             path = asyncio.run(agnes_img.download_file(url, params["output_path"]))
         return {"success": bool(url), "url": url, "path": path, "raw": data}
+    if capability == "image.generate" and r["purpose"] == "nano":
+        # zexapi /v1/videos（同 omni 形），model=nano_banana_pro-2K；复用 omni_client 真码
+        from backend.services import omni_client as oc
+        sub = oc.submit_omni_task(
+            prompt=params["prompt"],
+            image_urls=params.get("image_urls") or params.get("images"),
+            model=params.get("model") or "nano_banana_pro-2K",
+            api_key=r["api_key"],
+        )
+        final = oc.wait_for_completion(sub["task_id"], timeout=params.get("poll_timeout", 600), api_key=r["api_key"])
+        url = final.get("video_url")  # fetch_omni_task 多字段兼容，图 url 落这里
+        if final.get("status") != "completed" or not url:
+            return {"success": False, "url": url, "task_id": sub["task_id"],
+                    "error": final.get("error") or f"status={final.get('status')}"}
+        path = None
+        if params.get("output_path"):
+            path = oc.download_video(url, params["output_path"], api_key=r["api_key"])
+        return {"success": True, "url": url, "path": path, "task_id": sub["task_id"]}
+    if capability == "video.generate" and r["purpose"].startswith("seedance"):
+        model = "seedance2.5" if r["purpose"] == "seedance-2.5" else "seedance2.0"
+        return _vinted_video(
+            r["base_url"], r["api_key"], params["prompt"], model=model,
+            duration=params.get("duration", 5), ratio=params.get("ratio", "9:16"),
+            resolution=params.get("resolution", "720p"),
+            image_urls=params.get("image_urls") or params.get("images"),
+            out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 900),
+        )
     raise NotImplementedError(
         f"{capability}/{r['purpose']} 适配器待 ③ 后续切片接入（client={r['client']}.{r['fn']}）"
     )
