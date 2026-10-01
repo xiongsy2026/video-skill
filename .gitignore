@@ -6,3 +6,4 @@ __pycache__/
 .gateway_jobs.sqlite
 .gateway_ledger.sqlite
 outputs/_hypit_jobs/
+.gateway_studio.json

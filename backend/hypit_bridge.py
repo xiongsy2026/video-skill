@@ -44,6 +44,57 @@ RESOLUTIONS = ("720p",)
 # hypit studio 的工作台端口（agent 起 `hypit studio --run X --port 5179`）。端口不给 HTTP 参数控制：
 # 这个探测口是 ACAO:* 的，能指定端口就等于给本机任意网页做端口扫描。
 STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
+# 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
+# 不登记主人就会在每个会话里都弹右栏（2026-10-01 实际踩过：omni 会话被弹出 Hypit 工作台）。
+STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
+
+
+def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
+    rec = {"session": str(session or ""), "run": str(run or ""), "port": int(port), "ts": time.time()}
+    with open(STUDIO_MARK, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    return rec
+
+
+def studio_release() -> None:
+    try:
+        os.remove(STUDIO_MARK)
+    except OSError:
+        pass
+
+
+def _studio_owner() -> dict:
+    try:
+        with open(STUDIO_MARK, encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def studio_status(session: str | None = None) -> dict:
+    """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
+    浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
+
+    带 session 时按主人过滤：只有起 studio 的那个会话看得到（没登记主人就谁都不弹）。
+    """
+    import urllib.error
+    import urllib.request
+    owner = _studio_owner()
+    port = int(owner.get("port") or STUDIO_PORT)
+    if session is not None:
+        if str(owner.get("session") or "") != str(session):
+            return {"up": False, "port": port, "reason": "not-owner"}
+    url = "http://localhost:%d/__studio/library?section=tasks" % port
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"up": False, "port": port, "error": type(e).__name__}
+    tasks = data.get("tasks") or []
+    running = [t for t in tasks if str(t.get("status", "")).lower() not in ("", "finished", "failed", "cancelled", "saved")]
+    return {"up": True, "port": port, "run": owner.get("run") or "", "session": owner.get("session") or "",
+            "tasks": len(tasks), "running": len(running), "artifacts": len(data.get("artifacts") or [])}
 
 
 def token_required():
@@ -220,23 +271,6 @@ def handle_submit(body: dict) -> tuple:
     return 200, {"id": jid}
 
 
-def studio_status() -> dict:
-    """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
-    浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。"""
-    import urllib.error
-    import urllib.request
-    url = "http://localhost:%d/__studio/library?section=tasks" % STUDIO_PORT
-    try:
-        with urllib.request.urlopen(url, timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"up": False, "port": STUDIO_PORT, "error": type(e).__name__}
-    tasks = data.get("tasks") or []
-    running = [t for t in tasks if str(t.get("status", "")).lower() not in ("", "finished", "failed", "cancelled", "saved")]
-    return {"up": True, "port": STUDIO_PORT, "tasks": len(tasks), "running": len(running),
-            "artifacts": len(data.get("artifacts") or [])}
-
-
 def handle_get(jid: str) -> dict:
     j = _job(jid)
     if not j:
@@ -271,3 +305,24 @@ def serve_asset(name: str):
     return open(path, "rb").read(), {".mp4": "video/mp4", ".mov": "video/quicktime",
                                      ".webm": "video/webm", ".jpg": "image/jpeg", ".png": "image/png"}.get(ext,
                                                                                                             "application/octet-stream")
+
+
+if __name__ == "__main__":
+    # studio 主人登记（skill 契约）：起 studio 前 claim、停掉后 release。
+    #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run名> [端口]
+    #   python backend/hypit_bridge.py studio-release
+    #   python backend/hypit_bridge.py studio-status [会话id]
+    import sys
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd == "studio-claim" and len(args) >= 2:
+        print(json.dumps(studio_claim(args[1], args[2] if len(args) > 2 else "",
+                                      int(args[3]) if len(args) > 3 else STUDIO_PORT), ensure_ascii=False))
+    elif cmd == "studio-release":
+        studio_release()
+        print(json.dumps({"released": True}, ensure_ascii=False))
+    elif cmd == "studio-status":
+        print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
+    else:
+        print(__doc__ or "", "用法见 studio-claim / studio-release / studio-status", file=sys.stderr)
+        sys.exit(2)

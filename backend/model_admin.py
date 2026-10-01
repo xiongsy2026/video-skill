@@ -579,7 +579,10 @@ class H(BaseHTTPRequestHandler):
             self._send_file(data, ctype) if data else self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
         elif u.path == "/api/hypit/studio":
             # DSH 右栏 presence：代探 hypit studio(:5179) 是否活着。只读、不要 Bearer、带 ACAO:*。
-            self._send(200, json.dumps(hypit_bridge.studio_status(), ensure_ascii=False), cors=True)
+            # 带 ?session= 时按"谁起的 studio"过滤——studio 没有会话概念，不过滤就会在每个会话都弹页签。
+            q = parse_qs(u.query)
+            sid = (q.get("session") or [None])[0]
+            self._send(200, json.dumps(hypit_bridge.studio_status(sid), ensure_ascii=False), cors=True)
         elif u.path == "/api/hypit/rates":
             if self._hypit_denied():
                 return
