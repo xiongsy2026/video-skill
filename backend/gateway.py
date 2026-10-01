@@ -587,8 +587,10 @@ class Ledger:
             "CREATE TABLE IF NOT EXISTS holds(hold_id TEXT PRIMARY KEY, member TEXT, amount INTEGER, status TEXT);"
             "CREATE TABLE IF NOT EXISTS ledger(member TEXT, delta INTEGER, note TEXT, ts REAL);"
         )
-        if "route" not in [r[1] for r in con.execute("PRAGMA table_info(holds)")]:
-            con.execute("ALTER TABLE holds ADD COLUMN route TEXT")  # 逐路由审计用；旧行留 NULL
+        has = {r[1] for r in con.execute("PRAGMA table_info(holds)")}
+        for col, typ in (("route", "TEXT"), ("est", "INTEGER"), ("tokens", "INTEGER")):
+            if col not in has:
+                con.execute(f"ALTER TABLE holds ADD COLUMN {col} {typ}")   # 逐路由审计 + 预估vs实扣；旧行留 NULL
         con.commit(); con.close()
 
     def _con(self):
@@ -614,8 +616,8 @@ class Ledger:
         con = self._con()
         self.balance(member)  # 确保有行
         con.execute("UPDATE accounts SET balance=balance-? WHERE member=?", (cost, member))
-        con.execute("INSERT INTO holds(hold_id,member,amount,status,route) VALUES(?,?,?,'pending',?)",
-                    (hold_id, member, cost, f"{capability}/{purpose}"))
+        con.execute("INSERT INTO holds(hold_id,member,amount,status,route,est) VALUES(?,?,?,'pending',?,?)",
+                    (hold_id, member, cost, f"{capability}/{purpose}", cost))
         con.execute("INSERT INTO ledger(member,delta,note,ts) VALUES(?,?,?,?)",
                     (member, -cost, f"preauth {capability}/{purpose}", _time.time()))
         con.commit(); con.close()
