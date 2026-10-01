@@ -156,7 +156,7 @@ PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
 # ---- 可外置配置：价目 + 每能力默认路由 → model_prices.json（改价/换默认供应商=改这个文件，不动代码）----
 # 文件按 mtime 懒加载（面板保存后下一次调用即生效）；缺失或损坏则回落上面两张内置表，绝不让管线跑不动。
 _PRICE_PATH = _os.environ.get("MODEL_PRICES") or _os.path.join(_d or _os.getcwd(), "model_prices.json")
-_ext = {"mtime": None, "prices": {}, "defaults": {}, "disabled": {}}
+_ext = {"mtime": None, "prices": {}, "defaults": {}, "disabled": {}, "token_rate": {}}
 
 
 def price_path() -> str:
@@ -167,11 +167,12 @@ def external_config() -> dict:
     try:
         mt = _os.path.getmtime(_PRICE_PATH)
     except OSError:
-        return {"prices": {}, "defaults": {}, "disabled": {}}
+        return {"prices": {}, "defaults": {}, "disabled": {}, "token_rate": {}}
     if _ext["mtime"] != mt:
         prices: dict = {}
         defaults: dict = {}
         disabled: dict = {}
+        rates: dict = {}
         try:
             with open(_PRICE_PATH, encoding="utf-8") as f:
                 raw = _json.loads(f.read())
@@ -182,9 +183,10 @@ def external_config() -> dict:
                 disabled = {str(k): str(v or "") for k, v in d.items()}
             else:                                    # 也接受 ["cap/pur", ...] 手写形式
                 disabled = {str(k): "" for k in d}
+            rates = {str(k): float(v) for k, v in (raw.get("token_rate") or {}).items()}
         except Exception as e:
             print(f"[gateway] model_prices.json 未生效（用内置价目）: {type(e).__name__}: {e}")
-        _ext.update(prices=prices, defaults=defaults, disabled=disabled, mtime=mt)
+        _ext.update(prices=prices, defaults=defaults, disabled=disabled, token_rate=rates, mtime=mt)
     return _ext
 
 
@@ -204,6 +206,35 @@ def unit_price(capability: str, purpose: str) -> int:
     if (capability, purpose) in PRICE_ROUTES:
         return PRICE_ROUTES[(capability, purpose)]
     return PRICE_BY_CAP.get(capability, 1)
+
+# 分 / 1k token（口径 = 1 分约 100 token）。思考型模型同一问题的消耗实测波动 100 倍以上
+# （28 → 4396，gpt-5.6-sol 22366，见 ADR），所以整条单价只能当"粗略预估/报价"，真实扣费按上游 usage 结算；
+# 没有费率的能力（生图/生视频，本来就按条计费）继续按条计。
+TOKEN_RATE_DEFAULT = {"text.complete": 10.0, "video.analyze": 10.0}
+
+
+def token_rate(capability: str):
+    return external_config()["token_rate"].get(capability) or TOKEN_RATE_DEFAULT.get(capability)
+
+
+def settle_credits(capability: str, purpose: str, result, estimated: int) -> tuple:
+    """按上游 usage 算实扣。返回 (charged, tokens, basis)。
+    basis= usage 按 token 结算 / usage-capped 超护栏被截 / flat 无 usage 或不按 token 计。"""
+    tokens = 0
+    if isinstance(result, dict):
+        usage = result.get("usage") or {}
+        try:
+            tokens = int(usage.get("total_tokens") or result.get("tokens") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+    rate = token_rate(capability)
+    if not rate or tokens <= 0:
+        return estimated, tokens, "flat"
+    charged = max(1, int(round(tokens / 1000.0 * rate)))
+    guard = max(estimated * 8, 200)  # 护栏：单条封顶（≈20k token），防上游跑飞把客户积分一次掏空
+    if charged > guard:
+        return guard, tokens, "usage-capped"
+    return charged, tokens, "usage"
 
 
 def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
@@ -394,7 +425,8 @@ def analyze_media(path: str, question: str = "用一句话描述这个画面的�
         with urllib.request.urlopen(req, timeout=240) as resp:
             out = _json.loads(resp.read().decode("utf-8"))
         text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
-        return {"success": bool(text), "text": text, "error": None if text else "上游返回空内容"}
+        return {"success": bool(text), "text": text, "error": None if text else "上游返回空内容",
+                "usage": out.get("usage") or {}}
     except urllib.error.HTTPError as e:
         return {"success": False, "text": None, "error": f"HTTP {e.code}: {e.read().decode('utf-8','replace')[:300]}"}
     except Exception as e:  # 连接/超时
@@ -403,12 +435,15 @@ def analyze_media(path: str, question: str = "用一句话描述这个画面的�
 
 def _chat_compat(base_url: str, api_key: str, model: str, messages: list,
                  temperature: float = 0.7, max_tokens: int = 4000):
-    """通用 OpenAI 兼容 /chat/completions 文本调用（agnes/gpt 等皆可）。返回 (text, error)。"""
+    """通用 OpenAI 兼容 /chat/completions 文本调用（agnes/gpt 等皆可）。
+
+    返回 (text, error, usage)：usage 用上游返回值，按它结算真实积分（见 settle_credits）。
+    """
     import json as _json
     import urllib.error
     import urllib.request
     if not base_url or not api_key:
-        return None, "缺少 base_url/api_key（检查 .env 的 AGNES 配置）"
+        return None, "缺少 base_url/api_key（检查 .env 的 AGNES 配置）", {}
     base = base_url.rstrip("/")
     if not base.endswith("/v1"):
         base += "/v1"   # agnes base 已带 /v1；zexapi(OMNI_BASE_URL) 不带，统一补
@@ -421,11 +456,12 @@ def _chat_compat(base_url: str, api_key: str, model: str, messages: list,
         with urllib.request.urlopen(req, timeout=180) as resp:
             out = _json.loads(resp.read().decode("utf-8"))
         text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content")
-        return (text, None) if text else (None, "上游返回空内容")
+        usage = out.get("usage") or {}
+        return (text, None, usage) if text else (None, "上游返回空内容", usage)
     except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}"
+        return None, f"HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}", {}
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        return None, f"{type(e).__name__}: {e}", {}
 
 
 def _vinted_video(base_url, api_key, prompt, model="seedance2.0fast", duration=5, ratio="9:16",
@@ -510,11 +546,11 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         )
     if capability == "text.complete":
         messages = params.get("messages") or [{"role": "user", "content": params["prompt"]}]
-        text, err = _chat_compat(
+        text, err, usage = _chat_compat(
             r["base_url"], r["api_key"], params.get("model") or r["model"] or _MODEL_FALLBACK.get(r["provider"], ""), messages,
             temperature=params.get("temperature", 0.7), max_tokens=params.get("max_tokens", 4000),
         )
-        return {"success": bool(text), "text": text, "error": err}
+        return {"success": bool(text), "text": text, "error": err, "usage": usage}
     if capability == "image.generate" and r["purpose"] == "default":
         import asyncio
         from backend.services import agnes_image_client as agnes_img
@@ -623,7 +659,7 @@ class Ledger:
         con.commit(); con.close()
         return {"hold_id": hold_id, "amount": cost, "balance_after": self.balance(member)}
 
-    def commit(self, hold_id: str, actual: int) -> dict:
+    def commit(self, hold_id: str, actual: int, tokens: int | None = None) -> dict:
         con = self._con()
         row = con.execute("SELECT member,amount,status FROM holds WHERE hold_id=?", (hold_id,)).fetchone()
         if not row or row[2] != "pending":
@@ -633,8 +669,9 @@ class Ledger:
         if diff:
             con.execute("UPDATE accounts SET balance=balance+? WHERE member=?", (diff, member))
             con.execute("INSERT INTO ledger(member,delta,note,ts) VALUES(?,?,?,?)",
-                        (member, diff, f"settle {hold_id}", _time.time()))
-        con.execute("UPDATE holds SET status='done', amount=? WHERE hold_id=?", (actual, hold_id))
+                        (member, diff, f"settle {hold_id} 实扣{actual}/预估{held}"
+                         + (f" tok={tokens}" if tokens else ""), _time.time()))
+        con.execute("UPDATE holds SET status='done', amount=?, tokens=? WHERE hold_id=?", (actual, tokens, hold_id))
         con.commit(); con.close()
         return {"ok": True, "charged": actual, "balance_after": self.balance(member)}
 
@@ -661,13 +698,16 @@ class Ledger:
     def audit(self, limit: int = 30) -> dict:
         """按 路由×状态 聚合（done=真扣了这些分、rolled_back=已退），加最近流水。"""
         con = self._con()
-        by_route = [{"route": r or "(旧记录未记路由)", "status": s, "calls": n, "credits": c}
-                    for r, s, n, c in con.execute(
-                        "SELECT route,status,COUNT(*),SUM(amount) FROM holds GROUP BY route,status"
-                        " ORDER BY route,status")]
-        recent = [{"hold_id": h, "member": m, "route": r or "(旧)", "amount": a, "status": s}
-                  for h, m, r, a, s in con.execute(
-                      "SELECT hold_id,member,route,amount,status FROM holds ORDER BY rowid DESC LIMIT ?", (limit,))]
+        by_route = [{"route": r or "(旧记录未记路由)", "status": s, "calls": n, "credits": c,
+                     "est": e, "tokens": tk or 0}
+                    for r, s, n, c, e, tk in con.execute(
+                        "SELECT route,status,COUNT(*),SUM(amount),SUM(COALESCE(est,amount)),SUM(COALESCE(tokens,0))"
+                        " FROM holds GROUP BY route,status ORDER BY route,status")]
+        recent = [{"hold_id": h, "member": m, "route": r or "(旧)", "amount": a, "status": s,
+                   "est": e if e is not None else a, "tokens": t or 0}
+                  for h, m, r, a, s, e, t in con.execute(
+                      "SELECT hold_id,member,route,amount,status,est,tokens FROM holds ORDER BY rowid DESC LIMIT ?",
+                      (limit,))]
         flow = [{"member": m, "delta": d, "note": n, "ts": t} for m, d, n, t in con.execute(
             "SELECT member,delta,note,ts FROM ledger ORDER BY ts DESC LIMIT ?", (limit,))]
         con.close()
@@ -706,10 +746,11 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
                     "credits": {"estimated": est, "charged": 0, "hold_id": hold["hold_id"],
                                 "balance_after": ledger().balance(account)},
                     "error": result.get("error") or "生成失败"}
-        charged = est  # P0 按预估扣；3.0 用实际消耗回写
-        done = ledger().commit(hold["hold_id"], charged)
+        charged, tokens, basis = settle_credits(capability, r["purpose"], result, est)
+        done = ledger().commit(hold["hold_id"], charged, tokens)
         return {"ok": True, "capability": capability, "purpose": r["purpose"], "result": result,
-                "credits": {"estimated": est, "charged": charged, "hold_id": hold["hold_id"],
+                "credits": {"estimated": est, "charged": charged, "tokens": tokens, "basis": basis,
+                            "hold_id": hold["hold_id"],
                             "balance_after": done.get("balance_after", ledger().balance(account))},
                 "error": None}
     except Exception as e:

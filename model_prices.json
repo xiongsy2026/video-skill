@@ -1,5 +1,5 @@
 {
-  "_说明": "统一模型网关的价目与默认路由。改这里=改配置，不用动代码；gateway 按 mtime 自动重载（面板保存后下一次调用即生效）。prices 键=capability/purpose，值=每次调用积分（视频按每 10s 一个单位折算，见 meter）。defaults 键=capability，值=不指定 purpose 时走哪条。文件缺失或损坏则回落 gateway.py 内置表。",
+  "_说明": "统一模型网关配置。prices=每条路由的预估分(capability/purpose)；token_rate=按实际 token 结算的能力费率(分/1k token)，只对文本/看图生效，生图生视频仍按条计；defaults=不指定 purpose 时走哪条；disabled=已屏蔽路由(键=cap/pur，值=原因)。改这里=改配置，gateway 按 mtime 懒加载、不用重启；文件缺失或损坏则回落 gateway.py 内置表。",
   "prices": {
     "text.complete/agnes": 1,
     "text.complete/mimo": 1,
@@ -28,6 +28,10 @@
     "text.complete/mimo_pro": 3,
     "text.complete/gemini38": 6,
     "text.complete/deepseekv4": 7
+  },
+  "token_rate": {
+    "text.complete": 10.0,
+    "video.analyze": 10.0
   },
   "defaults": {
     "text.complete": "agnes",

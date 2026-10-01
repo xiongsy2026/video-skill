@@ -261,7 +261,8 @@ def board_view() -> dict:
             })
         cards.append({"capability": cap, "default": dft, "rows": rows})
     adapted_n = sum(1 for (c, p) in gateway.ROUTES if gateway.is_adapted(c, p))
-    return {"cards": cards, "prices_path": gateway.price_path(), "prices_external": bool(ext["prices"]),
+    rates = "; ".join(f"{c} {gateway.token_rate(c)}分/1k" for c in gateway.CAPABILITIES if gateway.token_rate(c))
+    return {"cards": cards, "prices_path": gateway.price_path(), "prices_external": bool(ext["prices"]), "token_rates": rates,
             "routes_total": len(gateway.ROUTES), "routes_adapted": adapted_n,
             "probe": {"ts": _HEALTH["ts"], "summary": _HEALTH["summary"], "routes": _HEALTH["routes"]},
             "adapter": f"gateway.py 与 model_admin.py 同进程；改这两个文件要重启计划任务 {TASK_NAME}"}
@@ -351,8 +352,8 @@ code{color:#9fb3d1}
     <div class=row><button class=ghost onclick="loadCredits()">刷新</button><span class=mut>账本 <code id=lpath></code></span></div>
     <div class=lanes>
       <div class=lane><h3 style="font-size:13px;margin:0 0 6px">余额</h3><table id=at><thead><tr><th>member</th><th>余额</th></tr></thead><tbody></tbody></table></div>
-      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">按路由聚合</h3><table id=bt><thead><tr><th>路由</th><th>状态</th><th>次</th><th>分</th></tr></thead><tbody></tbody></table></div>
-      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">最近调用</h3><table id=rt><thead><tr><th>member</th><th>路由</th><th>分</th><th>状态</th></tr></thead><tbody></tbody></table></div>
+      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">按路由聚合</h3><table id=bt><thead><tr><th>路由</th><th>状态</th><th>次</th><th>实扣</th><th>预估</th><th>token</th></tr></thead><tbody></tbody></table></div>
+      <div class=lane><h3 style="font-size:13px;margin:0 0 6px">最近调用</h3><table id=rt><thead><tr><th>member</th><th>路由</th><th>预估</th><th>实扣</th><th>token</th><th>状态</th></tr></thead><tbody></tbody></table></div>
     </div>
   </div></details>
 </main>
@@ -384,7 +385,7 @@ function laneHTML(cap,r){
    '<span class=sp></span><button class=mini onclick="testOne(\''+cap+'\',\''+r.purpose+'\',this)">测</button></div></div>';
 }
 function renderBoard(){
-  document.getElementById('ptag').textContent=BOARD.prices_external?("价目外置 "+BOARD.prices_path):"⚠ 价目回落内置表";
+  document.getElementById('ptag').textContent=(BOARD.prices_external?"价目外置 ":"⚠ 价目回落内置表 ")+String(BOARD.prices_path).split("\\").pop()+(BOARD.token_rates?(" · 按token结算 "+BOARD.token_rates):"");
   const host=document.getElementById('cards');
   host.innerHTML=BOARD.cards.map(c=>{
     const live=c.rows.filter(r=>r.disabled==null);
@@ -496,8 +497,8 @@ async function loadCredits(){
   const j=await (await fetch('/api/model/credits?limit=20')).json();
   document.getElementById('lpath').textContent=j.ledger_path;
   fill('#at',j.accounts.map(a=>[a.member,a.balance]),2);
-  fill('#bt',j.by_route.map(x=>[x.route,x.status,x.calls,x.credits]),4);
-  fill('#rt',j.recent_holds.map(x=>[x.member,x.route,x.amount,x.status]),4);
+  fill('#bt',j.by_route.map(x=>[x.route,x.status,x.calls,x.credits,x.est,x.tokens||0]),6);
+  fill('#rt',j.recent_holds.map(x=>[x.member,x.route,x.est==null?x.amount:x.est,x.amount,x.tokens||0,x.status]),6);
   BAL=j.accounts.reduce((a,b)=>a+b.balance,0)||0;
   if(BOARD)kpis();
 }
