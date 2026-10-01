@@ -41,6 +41,9 @@ HYPIT_MODELS = {
 # 视频/音频参考带不过去 ⇒ 按 hypit 的规矩在 supports 里拒绝，绝不静默丢弃。
 MAX_SECONDS = 10
 RESOLUTIONS = ("720p",)
+# hypit studio 的工作台端口（agent 起 `hypit studio --run X --port 5179`）。端口不给 HTTP 参数控制：
+# 这个探测口是 ACAO:* 的，能指定端口就等于给本机任意网页做端口扫描。
+STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
 
 
 def token_required():
@@ -215,6 +218,23 @@ def handle_submit(body: dict) -> tuple:
     con.close()
     threading.Thread(target=_run, args=(jid, body), daemon=True).start()
     return 200, {"id": jid}
+
+
+def studio_status() -> dict:
+    """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
+    浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。"""
+    import urllib.error
+    import urllib.request
+    url = "http://localhost:%d/__studio/library?section=tasks" % STUDIO_PORT
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"up": False, "port": STUDIO_PORT, "error": type(e).__name__}
+    tasks = data.get("tasks") or []
+    running = [t for t in tasks if str(t.get("status", "")).lower() not in ("", "finished", "failed", "cancelled", "saved")]
+    return {"up": True, "port": STUDIO_PORT, "tasks": len(tasks), "running": len(running),
+            "artifacts": len(data.get("artifacts") or [])}
 
 
 def handle_get(jid: str) -> dict:

@@ -511,11 +511,13 @@ boot();
 
 
 class H(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", cors=False):
         b = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
+        if cors:   # 只给"本机状态只读口"开：DSH 右栏插件在 dsh-app:// 源里轮询，不带 CORS 就 fetch 不到
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(b)
 
@@ -575,6 +577,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path.startswith("/api/hypit/uploads/files/"):
             data, ctype = hypit_bridge.serve_upload(u.path.rsplit("/", 1)[-1])
             self._send_file(data, ctype) if data else self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
+        elif u.path == "/api/hypit/studio":
+            # DSH 右栏 presence：代探 hypit studio(:5179) 是否活着。只读、不要 Bearer、带 ACAO:*。
+            self._send(200, json.dumps(hypit_bridge.studio_status(), ensure_ascii=False), cors=True)
         elif u.path == "/api/hypit/rates":
             if self._hypit_denied():
                 return
