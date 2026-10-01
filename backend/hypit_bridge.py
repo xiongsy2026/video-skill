@@ -44,6 +44,11 @@ RESOLUTIONS = ("720p",)
 # hypit studio 的工作台端口（agent 起 `hypit studio --run X --port 5179`）。端口不给 HTTP 参数控制：
 # 这个探测口是 ACAO:* 的，能指定端口就等于给本机任意网页做端口扫描。
 STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
+# 上游 vinted 的瞬时错误（实测：503 参考图下载繁忙、400 参考图解析失败、生成超时且明确退积分）⇒ 原话让重试。
+# ⚠️ 不含"轮询超时"：那是我们自己等够了，上游可能还在出片，盲目重试会重复花费。
+RETRYABLE = ("503", "service_unavailable", "参考图", "生成超时")
+MAX_ATTEMPTS = 3
+RETRY_WAITS = (30, 60)
 # 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
 # 不登记主人就会在每个会话里都弹右栏（2026-10-01 实际踩过：omni 会话被弹出 Hypit 工作台）。
 STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
@@ -279,20 +284,31 @@ def _run(jid: str, body: dict):
     params["output_dir"] = params["output_path"] = os.path.join(OUT_DIR, f"{jid}")
     _touch(jid, state="running")
     from backend import gateway
-    try:
-        env = gateway.invoke(cap, purpose, str(body.get("account") or "hypit"), params)
-    except Exception as e:      # invoke 内部已兜异常；这里只防 resolve 段抛 RouteError
-        _touch(jid, state="failed", error=json.dumps({"code": "GATEWAY_ERROR", "message": str(e)[:400]},
-                                                     ensure_ascii=False))
-        return
+    env, attempts = None, 0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempts = attempt
+        try:
+            env = gateway.invoke(cap, purpose, str(body.get("account") or "hypit"), params)
+        except Exception as e:      # invoke 内部已兜异常；这里只防 resolve 段抛 RouteError
+            env = {"ok": False, "result": None, "error": "%s: %s" % (type(e).__name__, e), "_exc": True}
+        if env.get("ok"):
+            break
+        # 上游 503 原文就是"请稍后使用同样的请求重试"（参考图下载繁忙）；生成超时它会退积分 ⇒ 重试不重复收钱
+        why = str(env.get("error") or "")
+        if attempt == MAX_ATTEMPTS or not any(k in why for k in RETRYABLE):
+            break
+        time.sleep(RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)])
     res = env.get("result") or {}
     credits = (env.get("credits") or {}).get("charged") or 0
     if not env.get("ok"):
-        msg = str(env.get("error") or res.get("error") or "生成失败")[:360]
-        if res.get("job_id"):
+        msg = str(env.get("error") or res.get("error") or "生成失败")[:340]
+        if isinstance(res, dict) and res.get("job_id"):
             msg += "（上游任务 %s，可据此查它到底出没出片）" % res["job_id"]
+        if attempts > 1:
+            msg += "（已重试 %d 次）" % (attempts - 1)
         _touch(jid, state="failed", credits=credits,
-               error=json.dumps({"code": "GATEWAY_FAILED", "message": msg}, ensure_ascii=False))
+               error=json.dumps({"code": "GATEWAY_ERROR" if env.get("_exc") else "GATEWAY_FAILED",
+                                 "message": msg}, ensure_ascii=False))
         return
     path = res.get("path") or ""
     name = ""
