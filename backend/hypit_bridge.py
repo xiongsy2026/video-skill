@@ -69,13 +69,35 @@ _STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "cold"}}
 
 
 def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
-    rec = {"session": str(session or ""), "run": str(run or ""), "port": int(port), "ts": time.time()}
+    """登记主人，可多次调用累积（一台 studio 常被多个 DSH 会话同时看，只留一个主人会让其他会话永远不弹）。"""
+    rec = _studio_owner()
+    owners = [str(s) for s in (rec.get("sessions") or []) if s]
+    if rec.get("session") and rec["session"] not in owners:
+        owners.append(str(rec["session"]))
+    if session and session not in owners:
+        owners.append(str(session))
+    out = {"sessions": owners, "session": owners[-1] if owners else "", "run": str(run or rec.get("run") or ""),
+           "port": int(port), "ts": time.time()}
     with open(STUDIO_MARK, "w", encoding="utf-8") as f:
-        json.dump(rec, f, ensure_ascii=False)
-    return rec
+        json.dump(out, f, ensure_ascii=False)
+    return out
 
 
-def studio_release() -> None:
+def studio_release(session: str = "") -> dict:
+    """不带参数=整条登记作废；带 session=只摘掉那个主人（别人还在看就别清）。"""
+    rec = _studio_owner()
+    owners = [str(s) for s in (rec.get("sessions") or []) if s]
+    if session:
+        owners = [o for o in owners if o != str(session)]
+        if owners:
+            with open(STUDIO_MARK, "w", encoding="utf-8") as f:
+                json.dump({**rec, "sessions": owners, "session": owners[-1]}, f, ensure_ascii=False)
+            return {"remaining": owners}
+    studio_mark_clear_all()
+    return {"released": True}
+
+
+def studio_mark_clear_all() -> None:
     try:
         os.remove(STUDIO_MARK)
     except OSError:
@@ -89,6 +111,10 @@ def _studio_owner() -> dict:
         return rec if isinstance(rec, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _owners_of(rec: dict) -> list:
+    return [str(s) for s in (rec.get("sessions") or []) if s] or ([str(rec["session"])] if rec.get("session") else [])
 
 
 def _probe_studio(port: int) -> dict:
@@ -126,10 +152,11 @@ def studio_status(session: str | None = None) -> dict:
         if len(_SEEN_SESSIONS) > 30:
             for old in sorted(_SEEN_SESSIONS, key=_SEEN_SESSIONS.get)[:len(_SEEN_SESSIONS) - 30]:
                 _SEEN_SESSIONS.pop(old, None)
-        if str(owner.get("session") or "") != str(session):
-            return {"up": False, "port": port, "reason": "not-owner"}
+        if str(session) not in _owners_of(owner):
+            return {"up": False, "port": port, "reason": "not-owner", "owners": _owners_of(owner)}
     res = dict(_probe_studio(port))
-    res.update(port=port, run=owner.get("run") or "", session=owner.get("session") or "")
+    res.update(port=port, run=owner.get("run") or "", session=owner.get("session") or "",
+               owners=_owners_of(owner))
     if session is None:   # 不带 session = 运维视角：顺便给出右栏实际用过的会话 id
         res["seen"] = [{"session": k, "age": round(time.time() - v)}
                        for k, v in sorted(_SEEN_SESSIONS.items(), key=lambda kv: -kv[1])]
@@ -391,7 +418,7 @@ def serve_asset(name: str):
 if __name__ == "__main__":
     # studio 主人登记（skill 契约）：起 studio 前 claim、停掉后 release。
     #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run名> [端口]
-    #   python backend/hypit_bridge.py studio-release
+    #   python backend/hypit_bridge.py studio-release [会话id]      带 id 只摘掉自己，不带=整条作废
     #   python backend/hypit_bridge.py studio-status [会话id]
     import sys
     args = sys.argv[1:]
@@ -400,8 +427,7 @@ if __name__ == "__main__":
         print(json.dumps(studio_claim(args[1], args[2] if len(args) > 2 else "",
                                       int(args[3]) if len(args) > 3 else STUDIO_PORT), ensure_ascii=False))
     elif cmd == "studio-release":
-        studio_release()
-        print(json.dumps({"released": True}, ensure_ascii=False))
+        print(json.dumps(studio_release(args[1] if len(args) > 1 else ""), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
     else:
