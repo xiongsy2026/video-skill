@@ -681,6 +681,10 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     try:
         n = hypit_bridge.reconcile_orphans()   # 别让上个进程留下的 job 永远挂着 running（hypit 会一直等）
+        held = hypit_bridge.holds_pending()
+        if held:                        # 只报不自动退：自动退可能把别的进程正在花的分退掉
+            print("[startup] 遗留未结算预扣 %d 笔 / 共 %d 分（holds-rollback <id> 逐笔回收）"
+                  % (len(held), sum(h["amount"] or 0 for h in held)))
         if n:
             print(f"reconciled {n} orphaned hypit job(s) from the previous process")
     except Exception as e:

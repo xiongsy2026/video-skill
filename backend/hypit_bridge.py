@@ -754,6 +754,35 @@ def reconcile_orphans() -> int:
     return n
 
 
+def holds_pending(member: str = "") -> list:
+    """列出还没结算的预扣（重启打断的腿会留这种行：线程死了没人 commit/rollback ⇒ 那笔分永久冻结）。
+
+    🔴 故意**不在启动时自动回滚**：8100 的重启杀不掉 8765/别的进程在途的调用，
+    按启发式回滚会把别人正在花的分退回去、账上却已经生成成功。所以这里只列，回收要指名道姓。
+    """
+    try:
+        from backend import gateway
+    except ImportError:                                    # pragma: no cover - 脚本式运行
+        import gateway
+    led = gateway.ledger()
+    con = led._con()
+    try:
+        sql = "SELECT hold_id,member,amount,route,est FROM holds WHERE status='pending'"
+        rows = con.execute(sql + (" AND member=?" if member else ""), ((member,) if member else ())).fetchall()
+    finally:
+        con.close()
+    return [{"hold_id": r[0], "member": r[1], "amount": r[2], "route": r[3], "est": r[4]} for r in rows]
+
+
+def holds_rollback(hold_id: str) -> dict:
+    """显式回滚一笔孤儿预扣（走 Ledger.rollback，退款流水一起写，不裸改库）。"""
+    try:
+        from backend import gateway
+    except ImportError:                                    # pragma: no cover
+        import gateway
+    return gateway.ledger().rollback(str(hold_id or "").strip())
+
+
 def _normalize(body: dict) -> dict:
     """hypit 的 POST /videos 见过两种形状：字段平铺，以及 {"model":..,"input":{字段},"account":..}。
     只认平铺过一种 ⇒ 另一种 prompt 为空、上游回 422「请填写提示词」（2026-10-01 实跑踩过）。这里统一摊平。"""
@@ -1120,6 +1149,23 @@ if __name__ == "__main__":
         rest = [a for a in args[1:] if not a.startswith("--")]      # --all 不算位置参数
         print(json.dumps(studio_release(rest[0] if rest else "", rest[1] if len(rest) > 1 else "",
                                         "--all" in args), ensure_ascii=False))
+    elif cmd == "preflight":     # 重启 8100 前必查：在途腿/在途导出/未结算预扣，任一非零都别重启
+        con = _db()
+        act = [r[0] for r in con.execute("select state from jobs where state in ('queued','running')")]
+        try:
+            exp = [r[0] for r in con.execute("select state from exp where state in ('queued','planning','building','fetching')")]
+        except sqlite3.OperationalError:
+            exp = []
+        con.close()
+        held = holds_pending()
+        print(json.dumps({"active_jobs": len(act), "active_exports": len(exp),
+                          "pending_holds": len(held), "pending_credit": sum(h["amount"] or 0 for h in held),
+                          "safe_to_restart": not act and not exp}, ensure_ascii=False))
+    elif cmd == "holds-pending":
+        rows = holds_pending(args[1] if len(args) > 1 else "")
+        print(json.dumps({"pending": rows, "total": sum(r["amount"] or 0 for r in rows)}, ensure_ascii=False))
+    elif cmd == "holds-rollback" and len(args) >= 2:
+        print(json.dumps(holds_rollback(args[1]), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
     elif cmd == "intent" and len(args) >= 3:
