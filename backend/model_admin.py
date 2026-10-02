@@ -599,6 +599,11 @@ class H(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             self._send(200, json.dumps(hypit_bridge.export_status((q.get("id") or [""])[0]), ensure_ascii=False),
                        cors=True)
+        elif u.path == "/api/workbench/presence":
+            # 右栏唯一的判定口：这条会话该挂哪个台、台活着没。只读、带 ACAO:*。
+            q = parse_qs(u.query)
+            sid = (q.get("session") or [None])[0]
+            self._send(200, json.dumps(hypit_bridge.workbench_presence(sid), ensure_ascii=False), cors=True)
         elif u.path == "/api/hypit/rates":
             if self._hypit_denied():
                 return

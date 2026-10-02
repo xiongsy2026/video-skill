@@ -62,7 +62,16 @@ RETRY_WAITS = (30, 60)
 #    拿"谁起过服务"当归属就会永久产权（2026-10-01/10-02 三次复发的真根因）。
 # 旧格式 {sessions:[…], session, run, port} 一律判无主：不猜，宁可少弹一次不可错弹一次。
 STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
-STUDIO_CLAIM_TTL = 30 * 60.0    # 无心跳 30 分钟自动失效；右栏每 4 秒的探测就是心跳
+STUDIO_CLAIM_TTL = 30 * 60.0    # 只用于"心跳多久没来"的展示/运维判断，不再用来撤销意图
+STUDIO_INTENT_KEEP = 20         # 意图记录是持久的（一条会话属于哪条流水线不该 30 分钟就忘），只保留最近 20 个 run
+# omni 那侧的意图判定也收进 8100（video-ui 没有 CORS 头，插件直连读不到响应）
+OMNI_UI = os.environ.get("VIDEO_UI_URL") or "http://127.0.0.1:8765/"
+VIDEO_RUNS = os.environ.get("VIDEO_UI_RUNS") or r"C:\dsh\video_runs"
+OMNI_RUNS_TTL = 5.0
+_OMNI_CACHE = {"ts": 0.0, "alive": False}
+_RUNS_CACHE = {"ts": 0.0, "rows": []}
+# 谁起的 studio 登记在这。归属 = (run, 会话) 对的集合：
+#   修的是"会话级全局只增不减 ⇒ 跑过一次就永久拥有页签"；不是"多人共看同一台 studio"。
 # 诊断用：记下右栏探测实际带来的会话 id（运维据此知道该给哪个会话 claim；上限 30 条）
 _SEEN_SESSIONS = {}
 STUDIO_CACHE_TTL = 5.0
@@ -104,10 +113,13 @@ def _run_matches(claimed: str, served: str) -> bool:
 
 
 def _studio_record(refresh_session: str = "") -> dict:
-    """读登记并顺手回收过期项。旧格式/坏文件 → 空表（=无主）。
+    """读归属登记。旧格式/坏文件 → 空表（=无意图）。
 
-    带 refresh_session 时把该会话名下的 run 的 ts 顶到现在（右栏每 4 秒的探测就是心跳）——
-    否则一条 30 分钟的 build 会因为"没人重新 claim"而被误判过期、页签半路自己关掉。
+    ⚠️ 语义（2026-10-02 定）：**归属 = 意图，是持久的**——"这条会话属于哪条流水线"不该
+    30 分钟就忘；台弹不弹只看意图，引擎活没活只决定台里显示什么。所以这里**不再按 TTL 撤销**，
+    只保留最近 STUDIO_INTENT_KEEP 个 run（防文件无限长）。
+    带 refresh_session 时把该会话名下的 run 的 ts 顶到现在（右栏每 4 秒的探测就是心跳），
+    ts 只用于运维看"多久没人看了"。
     """
     rec = _studio_owner()
     runs = rec.get("runs")
@@ -119,18 +131,20 @@ def _studio_record(refresh_session: str = "") -> dict:
         if not isinstance(item, dict) or not _owners_of(item):
             continue
         try:
-            if now - float(item.get("ts") or 0) > STUDIO_CLAIM_TTL:
-                continue                        # TTL 到期自动摘，不再需要谁去 release
+            ts = float(item.get("ts") or 0)
         except (TypeError, ValueError):
-            continue
-        live[str(key)] = {**item, "ts": float(item["ts"]), "run_key": str(key)}
+            ts = 0.0
+        live[str(key)] = {**item, "ts": ts, "run_key": str(key)}
     bumped = False
     if refresh_session:
         for item in live.values():
             if str(refresh_session) in _owners_of(item) and now - item["ts"] > 30.0:
                 item["ts"] = now                # 顶心跳（30 秒内不重复落盘）
                 bumped = True
-    if bumped or len(live) != len(runs):
+    if len(live) > STUDIO_INTENT_KEEP:          # 只裁最旧的，不裁"过期的"
+        live = _trim_runs(live)
+        bumped = True
+    if bumped:
         try:
             with open(STUDIO_MARK, "w", encoding="utf-8") as f:
                 json.dump({"runs": live, "ts": now}, f, ensure_ascii=False)
@@ -147,6 +161,16 @@ def _owners_of(item: dict) -> list:
     return out
 
 
+def _trim_runs(runs: dict) -> dict:
+    """登记封顶：只丢最旧的（意图本身不会"过期"，所以不能按 TTL 丢）。读写两侧都裁，
+    否则 claim 写回时又能多出一个，不变量守不住。"""
+    if len(runs) <= STUDIO_INTENT_KEEP:
+        return runs
+    for old in sorted(runs, key=lambda k: runs[k].get("ts") or 0)[:len(runs) - STUDIO_INTENT_KEEP]:
+        runs.pop(old, None)
+    return runs
+
+
 def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
     """登记"这个 run 属于这些会话"。同一个 run 再 claim = 加一个观看者；
     换 run claim 只影响那个 run 的名单（不会像旧版那样全局只增不减）。"""
@@ -161,6 +185,7 @@ def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
         owners.append(session)
     rec["runs"][key] = {"sessions": owners, "session": owners[-1], "run": run,
                         "port": int(port), "ts": time.time()}
+    rec["runs"] = _trim_runs(rec["runs"])
     with open(STUDIO_MARK, "w", encoding="utf-8") as f:
         json.dump({"runs": rec["runs"], "ts": time.time()}, f, ensure_ascii=False)
     return {"runs": rec["runs"], "session": session, "run": run, "port": int(port), "owners": owners}
@@ -255,8 +280,11 @@ def studio_status(session: str | None = None) -> dict:
     """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
     浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
 
-    归属谓词（ADR-workbench-presence）：show = 归属 ∧ 存活 ∧ 交叉核对，缺一即 false。
-    **不带 session 的请求不再回 up**（只给运维视图）——防止"端口活着"又被当成跨会话信号。
+    ⚠️ 两层语义分开（2026-10-02 定，之前混成一层是"什么都不弹"的根因）：
+      intent = 这条会话属不属于 hypit 流水线（有 claim 记录就算，**持久、不过期**）⇒ 决定**页签弹不弹**
+      up     = 引擎现在活着且服务的就是你那个 run                    ⇒ 决定**台里显示什么**
+    所以 studio 没起时回的是 `{intent:true, up:false, reason:"studio-down"}`：页签照样在，
+    里面告诉你引擎没跑、怎么起。不带 session 的请求只给运维视图，永不回 up。
     """
     rec = _studio_record(refresh_session=str(session) if session else "")
     runs = rec["runs"]
@@ -273,26 +301,100 @@ def studio_status(session: str | None = None) -> dict:
             _SEEN_SESSIONS.pop(old, None)
 
     item = _mine(runs, str(session))
-    if not item:                       # 你名下没有 run：这就是"omni 会话不该弹 hypit 页签"的那道闸
-        return {"up": False, "reason": "not-owner",
+    if not item:                       # 这条会话没表过意图：新会话 / 别的流水线 ⇒ 不弹台
+        return {"intent": False, "up": False, "reason": "no-intent",
                 "owners": sorted({o for v in runs.values() for o in _owners_of(v)})}
 
     port = int(item["port"])
+    base = {"intent": True, "port": port, "run": item["run"], "session": item["session"],
+            "idle_age": round(time.time() - item["ts"])}
     probe = dict(_probe_studio(port))
     if not probe.get("up"):
-        probe.update(port=port, run=item["run"], session=item["session"], reason="studio-down")
-        return probe
+        base.update(up=False, alive=False, reason="studio-down",
+                    how_to_start="hypit studio --run %s --port %d" % (item["run"], port))
+        return base
 
-    # 交叉核对：studio 自报它在服务哪个 run。拿到但不匹配 ⇒ 判死；拿不到（生成工程 session 会 500）⇒ 只认登记。
+    # 交叉核对：studio 自报它在服务哪个 run。拿到但不匹配 ⇒ 台里提示；拿不到（生成工程 session 会 500）⇒ 只认登记。
     served = _studio_served_path(port)
     if served and not _run_matches(item["run"], served):
-        return {"up": False, "port": port, "reason": "run-mismatch",
-                "claimed": item["run"], "served": served}
+        base.update(up=False, alive=True, reason="run-mismatch", served=served)
+        return base
 
-    probe.update(port=port, run=item["run"], session=item["session"],
-                 ttl_left=round(max(0.0, STUDIO_CLAIM_TTL - (time.time() - item["ts"]))),
-                 run_verified=bool(served))
+    probe.update(base)
+    probe.update(up=True, alive=True, run_verified=bool(served))
     return probe
+
+
+def workbench_presence(session: str | None = None) -> dict:
+    """右栏唯一的判定口：这条会话该挂哪个台、那个台活着没。
+
+    规则（2026-10-02 定，取代之前"归属∧存活∧关口"三条合取）：
+      intent（意图，持久）决定**页签弹不弹**；up（引擎活着）决定**台里显示什么**。
+      新会话两条意图都没有 ⇒ 什么都不弹。
+    omni 的意图也走这里，不再让插件直连 8765：video-ui 没有 CORS 头，跨源 fetch 读不到响应。
+    """
+    return {"omni": omni_status(session), "hypit": studio_status(session)}
+
+
+def omni_status(session: str | None = None) -> dict:
+    """omni 流水线台（video-ui :8765）的意图与存活。意图=盘上有属于这条会话的 run。"""
+    alive = _probe_omni()
+    if session is None:
+        return {"intent": False, "up": False, "alive": alive, "reason": "ops-view"}
+    sid = str(session)
+    found = _runs_of_session(sid)
+    if not found:
+        return {"intent": False, "up": False, "alive": alive, "reason": "no-intent"}
+    newest = max(found, key=lambda r: r["ts"])
+    return {"intent": True, "up": alive, "alive": alive,
+            "url": OMNI_UI + "?session=" + sid, "run": newest["run"],
+            "ready": newest["script_approved"], "idle_age": round(time.time() - newest["ts"])}
+
+
+def _probe_omni() -> bool:
+    """video-ui 活没活（缓存 5 秒，别每个窗口每 4 秒撞一次）。"""
+    now = time.time()
+    if now - _OMNI_CACHE["ts"] < STUDIO_CACHE_TTL:
+        return _OMNI_CACHE["alive"]
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(OMNI_UI + "api/runs", timeout=2) as r:
+            r.read(64)
+            alive = r.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        alive = False
+    _OMNI_CACHE.update(ts=now, alive=alive)
+    return alive
+
+
+def _runs_of_session(sid: str) -> list:
+    """扫 video_runs 找属于这条会话的 run（意图来自盘上的资源，不靠谁登记）。"""
+    import glob
+    now = time.time()
+    if now - _RUNS_CACHE["ts"] < OMNI_RUNS_TTL:
+        return [r for r in _RUNS_CACHE["rows"] if r["session"] == sid]
+    rows = []
+    try:
+        files = glob.glob(os.path.join(VIDEO_RUNS, "*", "run.json"))
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                st = json.load(fh)
+            sess = str(st.get("session") or "")
+            if not sess:
+                continue
+            review = st.get("review") or {}
+            rows.append({"session": sess,
+                         "run": os.path.basename(os.path.dirname(f)),
+                         "ts": os.path.getmtime(f),
+                         "script_approved": bool(review.get("script_approved"))})
+        except (OSError, ValueError):
+            continue
+    _RUNS_CACHE.update(ts=now, rows=rows)
+    return [r for r in rows if r["session"] == sid]
 
 
 def token_required():
