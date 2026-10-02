@@ -192,12 +192,20 @@ def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
     return {"runs": rec["runs"], "session": session, "run": run, "port": int(port), "owners": owners}
 
 
-def studio_release(session: str = "", run: str = "") -> dict:
-    """带 session=把这些会话从各 run 名单里摘掉（名单空了才删那个 run）；带 run=只动那个 run；都不带=整条作废。"""
+def studio_release(session: str = "", run: str = "", all_sessions: bool = False) -> dict:
+    """带 session=把这些会话从各 run 名单里摘掉（名单空了才删那个 run）；带 run=只动那个 run。
+
+    🔴 整条作废必须显式 `all_sessions=True`（CLI 上写 `--all`）。之前"都不带=整条作废"是脚枪：
+    漏传会话 id 裸跑一次 studio-release，就把所有会话的归属登记一次抹光（2026-10-02 实际发生过，
+    .gateway_studio.json 整份消失）。释放是窄操作，默认不许扩到全局。
+    """
     rec = _studio_record()
     if not session and not run:
+        if not all_sessions:
+            return {"error": "要说释放谁：studio-release <会话id> [run]；确实要清空全部才加 --all",
+                    "owners": {k: _owners_of(v) for k, v in rec["runs"].items()}}
         studio_mark_clear_all()
-        return {"released": True}
+        return {"released": True, "scope": "all"}
     only = _norm_run(run) if run else ""
     left = {}
     for key, item in rec["runs"].items():
@@ -367,6 +375,21 @@ def _intent_map() -> dict:
     return _intent_cache["data"]
 
 
+def _replace_retry(src: str, dst: str, tries: int = 4) -> bool:
+    """`os.replace` 在 Windows 上会被杀软/索引器临时占用目标文件撞到 WinError 5（实测偶发）。
+    这份登记决定右栏台弹不弹 ⇒ 撞锁不能静默丢登记，重试几次；最终失败让调用方看见 error。
+    """
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return True
+        except OSError:
+            if i == tries - 1:
+                return False
+            time.sleep(0.05 * (i + 1))
+    return False
+
+
 def set_intent(session: str, skill: str, task: str = "") -> dict:
     """登记"这条会话现在做哪条流水线"。同一会话再登记 = 覆盖（换产品线就靠它）。"""
     session, skill = str(session or "").strip(), str(skill or "").strip()
@@ -377,7 +400,13 @@ def set_intent(session: str, skill: str, task: str = "") -> dict:
     tmp = INTENT_MARK + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, INTENT_MARK)
+    if not _replace_retry(tmp, INTENT_MARK):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"error": "意图登记写入失败（目标文件被占用，已重试）：右栏台可能不弹，重试一次即可",
+                "session": session, "skill": skill}
     _intent_cache.update(sig=None, data=data)
     return {"session": session, "skill": skill, "task": task, "known": skill in KNOWN_SKILLS}
 
@@ -972,7 +1001,7 @@ def serve_asset(name: str):
 if __name__ == "__main__":
     # studio 归属登记（契约见 C:\dsh\docs\ADR-workbench-presence.md）：起 studio 前 claim 这个 run。
     #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run源路径或工程名> [端口]
-    #   python backend/hypit_bridge.py studio-release [会话id] [run]   都不带=整条作废
+    #   python backend/hypit_bridge.py studio-release <会话id> [run]   清空全部要显式加 --all
     #   python backend/hypit_bridge.py studio-status [会话id]          不带=运维视图（不会回 up）
     # 过期项不用手动清：claim TTL 30 分钟，读的时候自动回收。
     import sys
@@ -982,8 +1011,9 @@ if __name__ == "__main__":
         print(json.dumps(studio_claim(args[1], args[2],
                                       int(args[3]) if len(args) > 3 else STUDIO_PORT), ensure_ascii=False))
     elif cmd == "studio-release":
-        print(json.dumps(studio_release(args[1] if len(args) > 1 else "",
-                                        args[2] if len(args) > 2 else ""), ensure_ascii=False))
+        rest = [a for a in args[1:] if not a.startswith("--")]      # --all 不算位置参数
+        print(json.dumps(studio_release(rest[0] if rest else "", rest[1] if len(rest) > 1 else "",
+                                        "--all" in args), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
     elif cmd == "intent" and len(args) >= 3:
