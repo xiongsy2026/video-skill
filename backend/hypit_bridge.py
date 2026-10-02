@@ -281,10 +281,12 @@ def studio_status(session: str | None = None) -> dict:
     """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
     浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
 
-    ⚠️ 两层语义分开（2026-10-02 定，之前混成一层是"什么都不弹"的根因）：
-      intent = 这条会话属不属于 hypit 流水线（有 claim 记录就算，**持久、不过期**）⇒ 决定**页签弹不弹**
-      up     = 引擎现在活着且服务的就是你那个 run                    ⇒ 决定**台里显示什么**
-    所以 studio 没起时回的是 `{intent:true, up:false, reason:"studio-down"}`：页签照样在，
+    🔴 触发器只有一个 = 显式意图登记（intent），2026-10-02 三次定稿：
+      intent = 这条会话【显式登记过】hypit（`intent` 动词，或 studio-claim 自登记）⇒ 决定页签弹不弹
+      up     = 引擎现在活着且服务的就是你那个 run                ⇒ 决定台里显示什么
+    盘上的旧 claim 只是【显示用的痕迹】，不再当触发器——否则"跑过一次"就永久拥有页签，
+    而且等于替用户猜意图（用户定：路由肯定会理解错，所以不猜）。
+    所以 studio 没起时回 `{intent:true, up:false, reason:"studio-down"}`：页签照样在，
     里面告诉你引擎没跑、怎么起。不带 session 的请求只给运维视图，永不回 up。
     """
     rec = _studio_record(refresh_session=str(session) if session else "")
@@ -305,10 +307,13 @@ def studio_status(session: str | None = None) -> dict:
     ex = explicit_only(str(session), "hypit")
     if ex is False:                      # 明确登记了别的流水线 ⇒ 这个台不挂（哪怕以前 claim 过）
         return {"intent": False, "up": False, "reason": "intent-is-" + intent_of(str(session))}
-    if ex is None and not item:          # 没登记、也没有 run 归属 ⇒ 新会话 ⇒ 零 UI
-        return {"intent": False, "up": False, "reason": "no-intent",
-                "owners": sorted({o for v in runs.values() for o in _owners_of(v)})}
-    if ex is True and not item:          # 说了做 hypit 但还没 claim ⇒ 挂台，里面提示怎么起
+    if ex is None:                       # 没显式登记 ⇒ 零 UI。旧 claim 只回给人看，不再弹台
+        out = {"intent": False, "up": False, "reason": "no-intent",
+               "owners": sorted({o for v in runs.values() for o in _owners_of(v)})}
+        if item:
+            out["stale_claim"] = item["run"]      # 历史遗留：想恢复就重新 intent 一次
+        return out
+    if not item:                         # 登记了 hypit 但还没 claim ⇒ 挂台，里面提示怎么起
         return {"intent": True, "up": False, "alive": False, "reason": "not-claimed",
                 "port": STUDIO_PORT,
                 "how_to_start": "hypit studio --run <工程>.svrun --port %d" % STUDIO_PORT}
@@ -337,10 +342,11 @@ def studio_status(session: str | None = None) -> dict:
 # 之前只靠"碰巧有 claim / 碰巧有带标的 run"来推断意图 ⇒ 该弹的不弹（agent 忘了 claim）、
 # 不该弹的乱弹（一条会话同时挂着两条流水线的痕迹）。现在把意图变成一个【显式动作】：
 #   确认走哪条流水线之后，第一件事就是 set_intent(session, skill)。
-# 规则（排他）：
+# 规则（排他·intent-only，2026-10-02 三次定稿）：
 #   有显式登记 ⇒ 只挂 skill 匹配的那个台，其余一律不挂
-#   无显式登记 ⇒ 退到佐证（hypit=run 归属登记；omni=盘上有属于本会话的 run）
-#   两者都没有 ⇒ 新会话，零 UI
+#   无显式登记 ⇒ 零 UI。盘上的旧 claim / 带标的 run 只是显示用的历史，永不触发页签
+#                （它们不过期 ⇒ 会把一次旧任务变成这条会话的永久页签，那就是替用户猜意图）
+# 纯提示词、知识库类 skill（seedance-* prompt 库、film-* 写作类）【不登记意图】：没有引擎，挂了也是空壳。
 INTENT_MARK = os.environ.get("HYPIT_INTENT_MARK") or os.path.join(ROOT, ".gateway_intent.json")
 KNOWN_SKILLS = ("omni", "hypit", "super-clone", "product-video", "film")
 _intent_cache = {"sig": None, "data": {}}
@@ -400,7 +406,7 @@ def intent_view() -> list:
 
 
 def explicit_only(session: str, skill: str) -> bool | None:
-    """True/False = 有显式登记、按它判；None = 没有登记，交给佐证路径。"""
+    """True/False = 有显式登记、按它判；None = 没有登记 ⇒ 一律不挂台（不再退到佐证）。"""
     cur = intent_of(session)
     return None if not cur else (cur == skill)
 
@@ -408,16 +414,21 @@ def explicit_only(session: str, skill: str) -> bool | None:
 def workbench_presence(session: str | None = None) -> dict:
     """右栏唯一的判定口：这条会话该挂哪个台、那个台活着没。
 
-    规则（2026-10-02 定，取代之前"归属∧存活∧关口"三条合取）：
-      intent（意图，持久）决定**页签弹不弹**；up（引擎活着）决定**台里显示什么**。
-      新会话两条意图都没有 ⇒ 什么都不弹。
+    规则（2026-10-02 定稿·intent-only）：
+      intent（显式登记）决定**页签弹不弹**；up（引擎活着）决定**台里显示什么**。
+      没登记 ⇒ 什么都不弹，不看盘上痕迹。
     omni 的意图也走这里，不再让插件直连 8765：video-ui 没有 CORS 头，跨源 fetch 读不到响应。
     """
     return {"omni": omni_status(session), "hypit": studio_status(session)}
 
 
 def omni_status(session: str | None = None) -> dict:
-    """omni 流水线台（video-ui :8765）的意图与存活。意图优先取显式登记，其次取盘上属于本会话的 run。"""
+    """omni 流水线台（video-ui :8765）的意图与存活。
+
+    🔴 触发器只有一个 = 显式登记成 omni。盘上"带本会话标的 run"从此**只用于台里显示**，
+    不再当触发器——它永不过期，会把 67 分钟前跑过的一条 run 变成这条会话的永久页签，
+    等于替用户猜意图（2026-10-02 用户定：不猜，以显式调用为准）。
+    """
     alive = _probe_omni()
     if session is None:
         return {"intent": False, "up": False, "alive": alive, "reason": "ops-view",
@@ -426,15 +437,15 @@ def omni_status(session: str | None = None) -> dict:
     ex = explicit_only(sid, "omni")
     if ex is False:                      # 明确登记了别的流水线 ⇒ 这个台不挂
         return {"intent": False, "up": False, "alive": alive, "reason": "intent-is-" + intent_of(sid)}
-    found = _runs_of_session(sid)
-    if ex is None and not found:         # 没登记也没 run ⇒ 新会话，零 UI
+    if ex is not True:                   # 没登记 ⇒ 零 UI，不看痕迹
         return {"intent": False, "up": False, "alive": alive, "reason": "no-intent"}
+    found = _runs_of_session(sid)        # 只用来告诉人"这个会话最近那条 run 是哪个"
     newest = max(found, key=lambda r: r["ts"]) if found else {}
     return {"intent": True, "up": alive, "alive": alive,
             "url": OMNI_UI + "?session=" + sid, "run": newest.get("run", ""),
             "ready": bool(newest.get("script_approved")),
             "idle_age": round(time.time() - newest["ts"]) if newest else None,
-            "source": "explicit" if ex else "run-tag"}
+            "source": "explicit"}
 
 
 def _probe_omni() -> bool:
