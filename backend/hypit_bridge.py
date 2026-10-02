@@ -56,43 +56,107 @@ def _retryable(msg: str) -> bool:
     return not any(k in msg for k in NON_RETRYABLE) and any(k in msg for k in RETRYABLE)
 MAX_ATTEMPTS = 3
 RETRY_WAITS = (30, 60)
-# 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
-# 不登记主人就会在每个会话里都弹右栏（2026-10-01 实际踩过：omni 会话被弹出 Hypit 工作台）。
+# 归属登记（契约见 C:\dsh\docs\ADR-workbench-presence.md）：
+#   {"runs": {"<工程目录>": {"session":…,"run":…,"port":…,"ts":…}}, "ts":…}
+# ⚠️ 登记的是【会话 ↔ 资源(run)】，不是【会话 ↔ 服务】——studio 是单实例、没有会话概念，
+#    拿"谁起过服务"当归属就会永久产权（2026-10-01/10-02 三次复发的真根因）。
+# 旧格式 {sessions:[…], session, run, port} 一律判无主：不猜，宁可少弹一次不可错弹一次。
 STUDIO_MARK = os.environ.get("HYPIT_STUDIO_MARK") or os.path.join(ROOT, ".gateway_studio.json")
+STUDIO_CLAIM_TTL = 30 * 60.0    # 无心跳 30 分钟自动失效；右栏每 4 秒的探测就是心跳
 # 诊断用：记下右栏探测实际带来的会话 id（运维据此知道该给哪个会话 claim；上限 30 条）
 _SEEN_SESSIONS = {}
-STUDIO_CACHE_TTL = 4.0
-_STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "not-probed"}}
-# 代探结果短缓存：presence 每 4 秒被每个右栏窗口打一次，没缓存就是每个窗口每次都去撞一次死端口。
 STUDIO_CACHE_TTL = 5.0
 _STUDIO_CACHE = {"ts": 0.0, "port": None, "res": {"up": False, "error": "cold"}}
+RUN_CACHE_TTL = 15.0            # studio 服务哪个 run 变得很慢，单独用长一点的缓存
+_RUN_CACHE = {"ts": 0.0, "port": None, "path": None}
+
+
+RUN_EXTS = (".svrun", ".svml", ".svs")
+
+
+def _strip_ext(v: str) -> str:
+    for e in RUN_EXTS:
+        if v.endswith(e):
+            return v[: -len(e)]
+    return v
+
+
+def _norm_run(value: str) -> str:
+    """把 run 归一成【工程目录】token：claims 传 `x.svrun`、studio 自报 `x.svml`，两边要能对上。
+    裸名（不含 /）保留小写名，走 basename 兜底匹配。"""
+    v = str(value or "").strip().replace("\\", "/").strip("/")
+    if not v:
+        return ""
+    if v.endswith(RUN_EXTS):
+        v = v.rsplit("/", 1)[0] if "/" in v else ""
+    return v.lower()
+
+
+def _run_matches(claimed: str, served: str) -> bool:
+    """claimed 是登记时给的原值，served 是 studio 自报的源文件路径。
+    先按【工程目录】精确比；登记时给的是裸工程名（不含 /）才退到 basename 比。"""
+    a, b = _norm_run(claimed), _norm_run(served)
+    if a and a == b:
+        return True
+    raw = str(claimed or "").strip().replace("\\", "/").strip("/")
+    bare = _strip_ext(raw.lower())
+    return bool(bare) and "/" not in bare and bool(b) and bare == b.rsplit("/", 1)[-1]
+
+
+def _studio_record() -> dict:
+    """读登记并顺手回收过期项。旧格式/坏文件 → 空表（=无主）。"""
+    rec = _studio_owner()
+    runs = rec.get("runs")
+    if not isinstance(runs, dict):
+        return {"runs": {}}                     # 旧格式（有 sessions 无 runs）→ 判无主
+    now = time.time()
+    live = {}
+    for key, item in runs.items():
+        if not isinstance(item, dict) or not item.get("session"):
+            continue
+        try:
+            if now - float(item.get("ts") or 0) > STUDIO_CLAIM_TTL:
+                continue                        # TTL 到期自动摘，不再需要谁去 release
+        except (TypeError, ValueError):
+            continue
+        live[str(key)] = {**item, "ts": float(item["ts"]), "run_key": str(key)}
+    if len(live) != len(runs):                  # 有过期项被摘掉 → 落盘，别让文件里堆僵尸
+        try:
+            with open(STUDIO_MARK, "w", encoding="utf-8") as f:
+                json.dump({"runs": live, "ts": now}, f, ensure_ascii=False)
+        except OSError:
+            pass
+    return {"runs": live}
 
 
 def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
-    """登记主人，可多次调用累积（一台 studio 常被多个 DSH 会话同时看，只留一个主人会让其他会话永远不弹）。"""
-    rec = _studio_owner()
-    owners = [str(s) for s in (rec.get("sessions") or []) if s]
-    if rec.get("session") and rec["session"] not in owners:
-        owners.append(str(rec["session"]))
-    if session and session not in owners:
-        owners.append(str(session))
-    out = {"sessions": owners, "session": owners[-1] if owners else "", "run": str(run or rec.get("run") or ""),
-           "port": int(port), "ts": time.time()}
+    """登记"这个 run 属于这个会话"。同一个 run 被别的会话重新 claim = 换主人（不累积）。"""
+    session, run = str(session or "").strip(), str(run or "").strip()
+    if not session or not run:
+        return {"error": "session 和 run 都不能为空", "runs": {}}
+    rec = _studio_record()
+    rec["runs"][_norm_run(run) or run.lower()] = {"session": session, "run": run,
+                                                  "port": int(port), "ts": time.time()}
+    out = {"runs": rec["runs"], "session": session, "run": run, "port": int(port)}
     with open(STUDIO_MARK, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False)
+        json.dump({"runs": rec["runs"], "ts": time.time()}, f, ensure_ascii=False)
     return out
 
 
-def studio_release(session: str = "") -> dict:
-    """不带参数=整条登记作废；带 session=只摘掉那个主人（别人还在看就别清）。"""
-    rec = _studio_owner()
-    owners = [str(s) for s in (rec.get("sessions") or []) if s]
-    if session:
-        owners = [o for o in owners if o != str(session)]
-        if owners:
-            with open(STUDIO_MARK, "w", encoding="utf-8") as f:
-                json.dump({**rec, "sessions": owners, "session": owners[-1]}, f, ensure_ascii=False)
-            return {"remaining": owners}
+def studio_release(session: str = "", run: str = "") -> dict:
+    """带 session=摘掉那个会话名下的 run（别人名下的不动）；带 run=只摘那一个；都不带=整条作废。"""
+    rec = _studio_record()
+    if not session and not run:
+        studio_mark_clear_all()
+        return {"released": True}
+    key = _norm_run(run) if run else ""
+    left = {k: v for k, v in rec["runs"].items()
+            if (session and v["session"] != str(session)) or (key and k != key and not _run_matches(run, k))}
+    if left:
+        with open(STUDIO_MARK, "w", encoding="utf-8") as f:
+            json.dump({"runs": left, "ts": time.time()}, f, ensure_ascii=False)
+        return {"released": sorted(set(str(v["run"]) for v in rec["runs"].values())
+                                   - set(str(v["run"]) for v in left.values())), "remaining": len(left)}
     studio_mark_clear_all()
     return {"released": True}
 
@@ -113,8 +177,22 @@ def _studio_owner() -> dict:
         return {}
 
 
-def _owners_of(rec: dict) -> list:
-    return [str(s) for s in (rec.get("sessions") or []) if s] or ([str(rec["session"])] if rec.get("session") else [])
+def _studio_served_path(port: int) -> str:
+    """问 studio 自己"你在服务哪个源文件"。⚠️ 只取 source.path，绝不外传 source.text（那是完整源码）。"""
+    import urllib.error
+    import urllib.request
+    now = time.time()
+    if _RUN_CACHE["port"] == port and now - _RUN_CACHE["ts"] < RUN_CACHE_TTL:
+        return _RUN_CACHE["path"] or ""
+    path = ""
+    try:
+        with urllib.request.urlopen("http://localhost:%d/__studio/session" % port, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+        path = str((data.get("source") or {}).get("path") or "")
+    except (urllib.error.URLError, OSError, ValueError):
+        path = ""          # 生成工程实测会回 500（异步腿进不了 transient 执行）⇒ 拿不到就不核对
+    _RUN_CACHE.update(port=port, ts=now, path=path)
+    return path
 
 
 def _probe_studio(port: int) -> dict:
@@ -139,28 +217,54 @@ def _probe_studio(port: int) -> dict:
     return res
 
 
+def _mine(rec_runs: dict, session: str) -> dict:
+    """这个会话名下的登记项，取最近一次 claim（一条会话可能先后跑过几个 run）。"""
+    mine = [v for v in rec_runs.values() if str(v.get("session")) == str(session)]
+    return max(mine, key=lambda v: v["ts"]) if mine else {}
+
+
 def studio_status(session: str | None = None) -> dict:
     """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
     浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
 
-    带 session 时按主人过滤：只有起 studio 的那个会话看得到（没登记主人就谁都不弹）。
+    归属谓词（ADR-workbench-presence）：show = 归属 ∧ 存活 ∧ 交叉核对，缺一即 false。
+    **不带 session 的请求不再回 up**（只给运维视图）——防止"端口活着"又被当成跨会话信号。
     """
-    owner = _studio_owner()
-    port = int(owner.get("port") or STUDIO_PORT)
-    if session is not None:
-        _SEEN_SESSIONS[str(session)] = time.time()
-        if len(_SEEN_SESSIONS) > 30:
-            for old in sorted(_SEEN_SESSIONS, key=_SEEN_SESSIONS.get)[:len(_SEEN_SESSIONS) - 30]:
-                _SEEN_SESSIONS.pop(old, None)
-        if str(session) not in _owners_of(owner):
-            return {"up": False, "port": port, "reason": "not-owner", "owners": _owners_of(owner)}
-    res = dict(_probe_studio(port))
-    res.update(port=port, run=owner.get("run") or "", session=owner.get("session") or "",
-               owners=_owners_of(owner))
-    if session is None:   # 不带 session = 运维视角：顺便给出右栏实际用过的会话 id
-        res["seen"] = [{"session": k, "age": round(time.time() - v)}
-                       for k, v in sorted(_SEEN_SESSIONS.items(), key=lambda kv: -kv[1])]
-    return res
+    rec = _studio_record()
+    runs = rec["runs"]
+    if session is None:
+        return {"up": False, "reason": "ops-view",
+                "runs": [{"run": v["run"], "session": v["session"], "port": v["port"],
+                          "age": round(time.time() - v["ts"])} for v in runs.values()],
+                "seen": [{"session": k, "age": round(time.time() - v)}
+                         for k, v in sorted(_SEEN_SESSIONS.items(), key=lambda kv: -kv[1])]}
+
+    _SEEN_SESSIONS[str(session)] = time.time()
+    if len(_SEEN_SESSIONS) > 30:
+        for old in sorted(_SEEN_SESSIONS, key=_SEEN_SESSIONS.get)[:len(_SEEN_SESSIONS) - 30]:
+            _SEEN_SESSIONS.pop(old, None)
+
+    item = _mine(runs, str(session))
+    if not item:                       # 你名下没有 run：这就是"omni 会话不该弹 hypit 页签"的那道闸
+        return {"up": False, "reason": "not-owner",
+                "owners": sorted({str(v["session"]) for v in runs.values()})}
+
+    port = int(item["port"])
+    probe = dict(_probe_studio(port))
+    if not probe.get("up"):
+        probe.update(port=port, run=item["run"], session=item["session"], reason="studio-down")
+        return probe
+
+    # 交叉核对：studio 自报它在服务哪个 run。拿到但不匹配 ⇒ 判死；拿不到（生成工程 session 会 500）⇒ 只认登记。
+    served = _studio_served_path(port)
+    if served and not _run_matches(item["run"], served):
+        return {"up": False, "port": port, "reason": "run-mismatch",
+                "claimed": item["run"], "served": served}
+
+    probe.update(port=port, run=item["run"], session=item["session"],
+                 ttl_left=round(max(0.0, STUDIO_CLAIM_TTL - (time.time() - item["ts"]))),
+                 run_verified=bool(served))
+    return probe
 
 
 def token_required():
@@ -416,18 +520,20 @@ def serve_asset(name: str):
 
 
 if __name__ == "__main__":
-    # studio 主人登记（skill 契约）：起 studio 前 claim、停掉后 release。
-    #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run名> [端口]
-    #   python backend/hypit_bridge.py studio-release [会话id]      带 id 只摘掉自己，不带=整条作废
-    #   python backend/hypit_bridge.py studio-status [会话id]
+    # studio 归属登记（契约见 C:\dsh\docs\ADR-workbench-presence.md）：起 studio 前 claim 这个 run。
+    #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run源路径或工程名> [端口]
+    #   python backend/hypit_bridge.py studio-release [会话id] [run]   都不带=整条作废
+    #   python backend/hypit_bridge.py studio-status [会话id]          不带=运维视图（不会回 up）
+    # 过期项不用手动清：claim TTL 30 分钟，读的时候自动回收。
     import sys
     args = sys.argv[1:]
     cmd = args[0] if args else ""
-    if cmd == "studio-claim" and len(args) >= 2:
-        print(json.dumps(studio_claim(args[1], args[2] if len(args) > 2 else "",
+    if cmd == "studio-claim" and len(args) >= 3:
+        print(json.dumps(studio_claim(args[1], args[2],
                                       int(args[3]) if len(args) > 3 else STUDIO_PORT), ensure_ascii=False))
     elif cmd == "studio-release":
-        print(json.dumps(studio_release(args[1] if len(args) > 1 else ""), ensure_ascii=False))
+        print(json.dumps(studio_release(args[1] if len(args) > 1 else "",
+                                        args[2] if len(args) > 2 else ""), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
     else:
