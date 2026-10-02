@@ -46,7 +46,14 @@ RESOLUTIONS = ("720p",)
 STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
 # 上游 vinted 的瞬时错误（实测：503 参考图下载繁忙、400 参考图解析失败、生成超时且明确退积分）⇒ 原话让重试。
 # ⚠️ 不含"轮询超时"：那是我们自己等够了，上游可能还在出片，盲目重试会重复花费。
-RETRYABLE = ("503", "service_unavailable", "参考图", "生成超时")
+RETRYABLE = ("502", "503", "504", "service_unavailable", "参考图", "生成超时")
+# 策略/身份类拒绝：重试也不会变，只会白等 15~20 分钟（实测 "参考图未通过肖像保护" 含"参考图"三字，
+# 会被上面那档误判成可重试 ⇒ 必须先排除）。
+NON_RETRYABLE = ("肖像", "本人肖像", "内容不合规", "违规", "敏感")
+
+
+def _retryable(msg: str) -> bool:
+    return not any(k in msg for k in NON_RETRYABLE) and any(k in msg for k in RETRYABLE)
 MAX_ATTEMPTS = 3
 RETRY_WAITS = (30, 60)
 # 谁起的 studio 登记在这（{session, run, port, ts}）。studio 本身没有 DSH 会话概念，
@@ -295,7 +302,7 @@ def _run(jid: str, body: dict):
             break
         # 上游 503 原文就是"请稍后使用同样的请求重试"（参考图下载繁忙）；生成超时它会退积分 ⇒ 重试不重复收钱
         why = str(env.get("error") or "")
-        if attempt == MAX_ATTEMPTS or not any(k in why for k in RETRYABLE):
+        if attempt == MAX_ATTEMPTS or not _retryable(why):
             break
         time.sleep(RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)])
     res = env.get("result") or {}
@@ -306,6 +313,8 @@ def _run(jid: str, body: dict):
             msg += "（上游任务 %s，可据此查它到底出没出片）" % res["job_id"]
         if attempts > 1:
             msg += "（已重试 %d 次）" % (attempts - 1)
+        elif any(k in msg for k in NON_RETRYABLE):
+            msg += "（内容/身份策略拒绝：不重试，要换参考图或换路由）"
         _touch(jid, state="failed", credits=credits,
                error=json.dumps({"code": "GATEWAY_ERROR" if env.get("_exc") else "GATEWAY_FAILED",
                                  "message": msg}, ensure_ascii=False))
