@@ -103,8 +103,12 @@ def _run_matches(claimed: str, served: str) -> bool:
     return bool(bare) and "/" not in bare and bool(b) and bare == b.rsplit("/", 1)[-1]
 
 
-def _studio_record() -> dict:
-    """读登记并顺手回收过期项。旧格式/坏文件 → 空表（=无主）。"""
+def _studio_record(refresh_session: str = "") -> dict:
+    """读登记并顺手回收过期项。旧格式/坏文件 → 空表（=无主）。
+
+    带 refresh_session 时把该会话名下的 run 的 ts 顶到现在（右栏每 4 秒的探测就是心跳）——
+    否则一条 30 分钟的 build 会因为"没人重新 claim"而被误判过期、页签半路自己关掉。
+    """
     rec = _studio_owner()
     runs = rec.get("runs")
     if not isinstance(runs, dict):
@@ -112,7 +116,7 @@ def _studio_record() -> dict:
     now = time.time()
     live = {}
     for key, item in runs.items():
-        if not isinstance(item, dict) or not item.get("session"):
+        if not isinstance(item, dict) or not _owners_of(item):
             continue
         try:
             if now - float(item.get("ts") or 0) > STUDIO_CLAIM_TTL:
@@ -120,7 +124,13 @@ def _studio_record() -> dict:
         except (TypeError, ValueError):
             continue
         live[str(key)] = {**item, "ts": float(item["ts"]), "run_key": str(key)}
-    if len(live) != len(runs):                  # 有过期项被摘掉 → 落盘，别让文件里堆僵尸
+    bumped = False
+    if refresh_session:
+        for item in live.values():
+            if str(refresh_session) in _owners_of(item) and now - item["ts"] > 30.0:
+                item["ts"] = now                # 顶心跳（30 秒内不重复落盘）
+                bumped = True
+    if bumped or len(live) != len(runs):
         try:
             with open(STUDIO_MARK, "w", encoding="utf-8") as f:
                 json.dump({"runs": live, "ts": now}, f, ensure_ascii=False)
@@ -129,34 +139,52 @@ def _studio_record() -> dict:
     return {"runs": live}
 
 
+def _owners_of(item: dict) -> list:
+    """一个 run 的主人列表：{sessions:[…]} 为主，兼容单值 session（多会话共看同一台 studio）。"""
+    out = [str(s) for s in (item.get("sessions") or []) if s]
+    if item.get("session") and str(item["session"]) not in out:
+        out.append(str(item["session"]))
+    return out
+
+
 def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
-    """登记"这个 run 属于这个会话"。同一个 run 被别的会话重新 claim = 换主人（不累积）。"""
+    """登记"这个 run 属于这些会话"。同一个 run 再 claim = 加一个观看者；
+    换 run claim 只影响那个 run 的名单（不会像旧版那样全局只增不减）。"""
     session, run = str(session or "").strip(), str(run or "").strip()
     if not session or not run:
         return {"error": "session 和 run 都不能为空", "runs": {}}
     rec = _studio_record()
-    rec["runs"][_norm_run(run) or run.lower()] = {"session": session, "run": run,
-                                                  "port": int(port), "ts": time.time()}
-    out = {"runs": rec["runs"], "session": session, "run": run, "port": int(port)}
+    key = _norm_run(run) or run.lower()
+    item = rec["runs"].get(key) or {}
+    owners = _owners_of(item)
+    if session not in owners:
+        owners.append(session)
+    rec["runs"][key] = {"sessions": owners, "session": owners[-1], "run": run,
+                        "port": int(port), "ts": time.time()}
     with open(STUDIO_MARK, "w", encoding="utf-8") as f:
         json.dump({"runs": rec["runs"], "ts": time.time()}, f, ensure_ascii=False)
-    return out
+    return {"runs": rec["runs"], "session": session, "run": run, "port": int(port), "owners": owners}
 
 
 def studio_release(session: str = "", run: str = "") -> dict:
-    """带 session=摘掉那个会话名下的 run（别人名下的不动）；带 run=只摘那一个；都不带=整条作废。"""
+    """带 session=把这些会话从各 run 名单里摘掉（名单空了才删那个 run）；带 run=只动那个 run；都不带=整条作废。"""
     rec = _studio_record()
     if not session and not run:
         studio_mark_clear_all()
         return {"released": True}
-    key = _norm_run(run) if run else ""
-    left = {k: v for k, v in rec["runs"].items()
-            if (session and v["session"] != str(session)) or (key and k != key and not _run_matches(run, k))}
+    only = _norm_run(run) if run else ""
+    left = {}
+    for key, item in rec["runs"].items():
+        if only and key != only and not _run_matches(run, key):
+            left[key] = item
+            continue
+        owners = [o for o in _owners_of(item) if o != str(session)] if session else _owners_of(item)
+        if owners:
+            left[key] = {**item, "sessions": owners, "session": owners[-1]}
     if left:
         with open(STUDIO_MARK, "w", encoding="utf-8") as f:
             json.dump({"runs": left, "ts": time.time()}, f, ensure_ascii=False)
-        return {"released": sorted(set(str(v["run"]) for v in rec["runs"].values())
-                                   - set(str(v["run"]) for v in left.values())), "remaining": len(left)}
+        return {"remaining": {k: _owners_of(v) for k, v in left.items()}}
     studio_mark_clear_all()
     return {"released": True}
 
@@ -218,8 +246,8 @@ def _probe_studio(port: int) -> dict:
 
 
 def _mine(rec_runs: dict, session: str) -> dict:
-    """这个会话名下的登记项，取最近一次 claim（一条会话可能先后跑过几个 run）。"""
-    mine = [v for v in rec_runs.values() if str(v.get("session")) == str(session)]
+    """这个会话名下的登记项，取心跳最新的那个（一条会话可能先后看几个 run；一个 run 也可多人共看）。"""
+    mine = [v for v in rec_runs.values() if str(session) in _owners_of(v)]
     return max(mine, key=lambda v: v["ts"]) if mine else {}
 
 
@@ -230,11 +258,11 @@ def studio_status(session: str | None = None) -> dict:
     归属谓词（ADR-workbench-presence）：show = 归属 ∧ 存活 ∧ 交叉核对，缺一即 false。
     **不带 session 的请求不再回 up**（只给运维视图）——防止"端口活着"又被当成跨会话信号。
     """
-    rec = _studio_record()
+    rec = _studio_record(refresh_session=str(session) if session else "")
     runs = rec["runs"]
     if session is None:
         return {"up": False, "reason": "ops-view",
-                "runs": [{"run": v["run"], "session": v["session"], "port": v["port"],
+                "runs": [{"run": v["run"], "owners": _owners_of(v), "port": v["port"],
                           "age": round(time.time() - v["ts"])} for v in runs.values()],
                 "seen": [{"session": k, "age": round(time.time() - v)}
                          for k, v in sorted(_SEEN_SESSIONS.items(), key=lambda kv: -kv[1])]}
@@ -247,7 +275,7 @@ def studio_status(session: str | None = None) -> dict:
     item = _mine(runs, str(session))
     if not item:                       # 你名下没有 run：这就是"omni 会话不该弹 hypit 页签"的那道闸
         return {"up": False, "reason": "not-owner",
-                "owners": sorted({str(v["session"]) for v in runs.values()})}
+                "owners": sorted({o for v in runs.values() for o in _owners_of(v)})}
 
     port = int(item["port"])
     probe = dict(_probe_studio(port))
