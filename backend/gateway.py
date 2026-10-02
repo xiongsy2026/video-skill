@@ -594,7 +594,7 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
             duration=params.get("duration", 5), ratio=params.get("ratio", "9:16"),
             resolution=params.get("resolution", "720p"),
             image_urls=params.get("image_urls") or params.get("images"),
-            out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 900),
+            out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 1800),
         )
     raise NotImplementedError(
         f"{capability}/{r['purpose']} 适配器待 ③ 后续切片接入（client={r['client']}.{r['fn']}）"
