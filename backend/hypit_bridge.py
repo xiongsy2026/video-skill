@@ -42,6 +42,11 @@ HYPIT_MODELS = {
 # 本适配面真实能带的输入：只有图片参考（vinted/zexapi 都只吃 image_urls，且要公网可取 URL）。
 # 视频/音频参考带不过去 ⇒ 按 hypit 的规矩在 supports 里拒绝，绝不静默丢弃。
 MAX_SECONDS = 10
+# 本路由实测可出片的时长（账本里 succeeded 的段全是 5s；4/6/8s 三条都被上游 422 打回，
+# 而那句 422 的文案还是误导性的"请填写提示词"）。别拿未验证的时长去烧钱：先本地拦，
+# 要扩就在 0 分的 plan/pricing 上验过再改这里或设 HYPIT_ALLOWED_SECONDS（逗号分隔）。
+ALLOWED_SECONDS = tuple(float(x) for x in
+                        (os.environ.get("HYPIT_ALLOWED_SECONDS") or "5").split(","))
 RESOLUTIONS = ("720p",)
 # hypit studio 的工作台端口（agent 起 `hypit studio --run X --port 5179`）。端口不给 HTTP 参数控制：
 # 这个探测口是 ACAO:* 的，能指定端口就等于给本机任意网页做端口扫描。
@@ -739,6 +744,10 @@ def check_support(body: dict) -> tuple:
         return False, "duration 必须是数字"
     if dur > MAX_SECONDS:
         return False, f"本服务最长渲染 {MAX_SECONDS} 秒，不是 {dur:g} 秒"
+    if dur not in ALLOWED_SECONDS:
+        return False, ("本路由实测只有 %s 秒能出片（%g 秒会被上游拒，报的还是误导性的「请填写提示词」）；"
+                       "要改时长就先在 plan/pricing 上验，别直接烧") % (
+            "/".join(("%g" % x) for x in ALLOWED_SECONDS), dur)
     res = str(body.get("resolution") or RESOLUTIONS[0])
     if res not in RESOLUTIONS:
         return False, f"本服务只出 {'/'.join(RESOLUTIONS)}，不出 {res}"

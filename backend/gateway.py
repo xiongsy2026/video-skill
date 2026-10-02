@@ -494,8 +494,20 @@ def _vinted_video(base_url, api_key, prompt, model="seedance2.0fast", duration=5
             return {"success": False, "error": "提交未返回 id: %s" % str(sub)[:200]}
         start = _t.time()
         status = None
+        misses = 0
         while _t.time() - start < poll_timeout:
-            st = _req("%s/v1/videos/%s" % (base, job_id))
+            try:
+                st = _req("%s/v1/videos/%s" % (base, job_id))
+                misses = 0
+            except (urllib.error.URLError, OSError) as e:
+                # 只是轮询这一步断了：上游任务号还在 ⇒ 退避后继续问同一个任务。
+                # 🔴 绝不重发提交（那会真的生成第二条、花两份钱）；连续 6 次问不上才判死，并留 job_id。
+                misses += 1
+                if misses >= 6:
+                    return {"success": False, "job_id": job_id,
+                            "error": "轮询连续 %d 次连接失败（上游任务 %s 可能仍在出片）：%s" % (misses, job_id, e)}
+                _t.sleep(min(60, poll_interval * misses))
+                continue
             status = str(st.get("status", "")).lower()
             if status == "succeeded":
                 break
@@ -594,7 +606,7 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
             duration=params.get("duration", 5), ratio=params.get("ratio", "9:16"),
             resolution=params.get("resolution", "720p"),
             image_urls=params.get("image_urls") or params.get("images"),
-            out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 1800),
+            out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 900),
         )
     raise NotImplementedError(
         f"{capability}/{r['purpose']} 适配器待 ③ 后续切片接入（client={r['client']}.{r['fn']}）"
