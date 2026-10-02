@@ -26,7 +26,9 @@ import uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_DIR = os.path.join(ROOT, "outputs", "_hypit_uploads")
 OUT_DIR = os.path.join(ROOT, "outputs", "_hypit_jobs")
-DB_PATH = os.path.join(ROOT, ".gateway_jobs.sqlite")
+DB_PATH = os.environ.get("HYPIT_JOBS_DB") or os.path.join(ROOT, ".gateway_jobs.sqlite")
+# hypit 的工作区根（工程源文件在这里）。provider 自报的工程路径必须先归一到这个根 inside 才算数。
+HYPIT_WORKSPACE = os.environ.get("HYPIT_WORKSPACE") or r"C:\dsh\hypit_runs"
 # 必须用 localhost 而不是 127.0.0.1：hypit 的 address()/pricing source 校验只放 https 或 hostname=localhost。
 PUBLIC_BASE = os.environ.get("MODEL_GATEWAY_PUBLIC", "http://localhost:8100")
 
@@ -440,6 +442,58 @@ def explicit_only(session: str, skill: str) -> bool | None:
     return None if not cur else (cur == skill)
 
 
+# ══ 生成腿进度（进度台的数据面：账本永久、0 分、不依赖 studio 起没起）════════════════
+_PROGRESS_CACHE = {"sid": None, "ts": 0.0, "res": {}}
+
+
+def jobs_progress(session: str, limit: int = 40) -> dict:
+    """按会话把 hypit 生成腿从网关账本里聚出来。
+
+    归属是【数据面盖章】：provider 提交时带 `need`（内含工程源文件绝对路径）与 `$HYPIT_SESSION_ID`。
+    🔴 这两个字段只用于显示分组；鉴权与扣费依据仍是 token + 服务端路由，自报的一概不信（见 _project_key）。
+    """
+    sid = str(session or "")
+    if not sid:
+        return {"known": False, "reason": "no-session"}
+    now = time.time()
+    if _PROGRESS_CACHE["sid"] == sid and now - _PROGRESS_CACHE["ts"] < STUDIO_CACHE_TTL:
+        return _PROGRESS_CACHE["res"]
+    con = _db()
+    try:
+        rows = con.execute("select id,model,state,run,label,credits,error,created,updated from jobs"
+                           " where session=? order by created desc limit ?", (sid, limit)).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        res = {"known": False, "reason": "no-jobs"}
+    else:
+        seg, tally, spent = [], {"ok": 0, "failed": 0, "running": 0, "queued": 0}, 0
+        for jid, model, state, run, label, credits, err, created, updated in rows:
+            msg = up = ""
+            if err:
+                try:
+                    msg = str(json.loads(err).get("message") or "")[:220]
+                except ValueError:
+                    msg = str(err)[:220]
+                i = msg.find("上游任务")
+                if i >= 0:
+                    up = msg[i:].split("，")[0].split(" ")[-1][:64]
+            tally["ok" if state == "succeeded" else
+                 "failed" if state == "failed" else
+                 "running" if state == "running" else "queued"] += 1
+            spent += credits or 0
+            seg.append({"id": jid, "model": model, "state": state, "project": run or "",
+                        "label": label or "", "credits": credits or 0,
+                        "seconds": int(max(0.0, (updated or created) - (created or 0))),
+                        "ago": int(time.time() - (created or 0)), "error": msg, "upstream": up})
+        res = {"known": True, "segments": seg,
+               "summary": {"total": len(seg), "credits": spent, **tally},
+               "projects": sorted({x["project"] for x in seg if x["project"]}),
+               "source": "gateway-jobs"}
+    _PROGRESS_CACHE.update(sid=sid, ts=now, res=res)
+    return res
+
+
 def workbench_presence(session: str | None = None) -> dict:
     """右栏唯一的判定口：这条会话该挂哪个台、那个台活着没。
 
@@ -448,7 +502,10 @@ def workbench_presence(session: str | None = None) -> dict:
       没登记 ⇒ 什么都不弹，不看盘上痕迹。
     omni 的意图也走这里，不再让插件直连 8765：video-ui 没有 CORS 头，跨源 fetch 读不到响应。
     """
-    return {"omni": omni_status(session), "hypit": studio_status(session)}
+    out = {"omni": omni_status(session), "hypit": studio_status(session)}
+    if session:
+        out["hypit"]["progress"] = jobs_progress(str(session))   # 账本里有腿就出进度，与 studio 无关
+    return out
 
 
 def omni_status(session: str | None = None) -> dict:
@@ -536,13 +593,60 @@ def authorized(header_value: str | None) -> bool:
     return bool(header_value) and header_value.strip().removeprefix("Bearer ").strip() == need
 
 
+_DB_MIGRATED = {"ok": False}
+
+
 def _db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, model TEXT, state TEXT,"
                 " route TEXT, credits INTEGER DEFAULT 0, output TEXT, error TEXT, request TEXT,"
                 " created REAL, updated REAL)")
+    if not _DB_MIGRATED["ok"]:
+        have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+        for col in ("run", "label", "session"):
+            if col not in have:
+                con.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+        _DB_MIGRATED["ok"] = True
     con.commit()
     return con
+
+
+def _project_key(body: dict) -> str:
+    """把 hypit provider 自报的工程标识归一成 `productions/<工程>` 这种工作区相对目录。
+
+    🔴 只用于**显示归属**（进度台按工程分组），绝不用作鉴权/扣费依据——依据只有 token 和服务端路由。
+    自报路径不可信：归一后不在工作区里面的，一律当"没报"，不入库、不展示。
+    两种来源都接：`project`（源文件路径，可能绝对）和 `need`（`need:author:<路径>::component::final:请求名`，
+    路径可能被 %5C 转义）。
+    """
+    import urllib.parse
+    ws = os.path.abspath(HYPIT_WORKSPACE)
+    raw = str(body.get("project") or "")
+    if not raw:
+        # need id 整串是百分号编码的（`::` 编码成 %3A%3A），必须先解码再切分
+        need = urllib.parse.unquote(str(body.get("need") or ""))
+        if need.startswith("need:"):
+            head = need[len("need:"):].split("::", 1)[0]
+            raw = head[len("author:"):] if head.startswith("author:") else head
+    if not raw:
+        return ""
+    raw = urllib.parse.unquote(raw.replace("\\", "/"))        # 反斜杠 → 斜杠
+    cand = raw if os.path.isabs(raw) else os.path.join(ws, raw)
+    try:
+        real = os.path.realpath(cand)
+        rel = os.path.relpath(real if os.path.isdir(real) else os.path.dirname(real), ws)
+    except (ValueError, OSError):
+        return ""
+    rel = rel.replace("\\", "/").strip("/")
+    if rel.startswith("..") or not rel.startswith("productions/"):
+        return ""
+    return "/".join(rel.split("/")[:2])          # productions/<工程目录>
+
+
+def _need_label(body: dict) -> str:
+    """need id 尾巴当段名（`…:request-audio-render` → `request-audio-render`），给进度台一行一个标签。"""
+    need = str(body.get("need") or "")
+    return need.rsplit(":", 1)[-1][:60] if need else ""
 
 
 def _touch(jid, **fields):
@@ -730,9 +834,11 @@ def handle_submit(body: dict) -> tuple:
     jid = uuid.uuid4().hex[:16]
     model = str(body.get("model"))
     con = _db()
-    con.execute("INSERT INTO jobs(id,model,state,route,created,updated,request) VALUES(?,?, 'queued',?,?,?,?)",
+    con.execute("INSERT INTO jobs(id,model,state,route,created,updated,request,run,label,session)"
+                " VALUES(?,?,'queued',?,?,?,?,?,?,?)",
                 (jid, model, "/".join(HYPIT_MODELS[model]), time.time(), time.time(),
-                 json.dumps(body, ensure_ascii=False)[:4000]))
+                 json.dumps(body, ensure_ascii=False)[:4000],
+                 _project_key(body), _need_label(body), str(body.get("session") or "")[:80]))
     con.commit()
     con.close()
     threading.Thread(target=_run, args=(jid, body), daemon=True).start()
