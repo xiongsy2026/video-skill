@@ -509,6 +509,229 @@ def handle_rates(query: dict) -> dict:
                             f"上游实付单价未录入 ⇒ 这只是内部记账单位，不是对客报价")}
 
 
+# ══ 导出口（#29）：一键 build + get，只放"零生成腿"的免费装配工程 ════════════════
+# 四道闸（对齐 AGENTS.md 铁律"花钱前必须报价并等到同意"）：
+#   ① 免费闸：hypit plan --json 的 providerRequestCount 必须 == 0；有生成腿一律拒，让它回 agent 报价流程
+#   ② 路径白名单：run 必须是 HYPIT_WS 下的相对 .svrun；task 必须是 PROD_ROOT 下已存在的目录名
+#   ③ 不走 shell：argv 列表 + 固定可执行文件（实测无 shell 直调 npm 的 `hypit` 垫片会 WinError 2 ⇒ 用 node + hypit.mjs）
+#   ④ 单飞互斥：同时只跑一条，避免本机渲染互踩、同名成片互相覆盖
+HYPIT_WS = os.environ.get("HYPIT_WORKSPACE") or r"C:\dsh\hypit_runs"
+PROD_ROOT = os.environ.get("WEEKSIR_PRODUCTIONS") or r"C:\dsh\productions"
+HYPIT_ENTRY = os.environ.get("HYPIT_ENTRY") or os.path.join(
+    os.environ.get("APPDATA", ""), "npm", "node_modules", "@hypit", "hypit", "bin", "hypit.mjs")
+EXPORT_BUILD_TIMEOUT = float(os.environ.get("HYPIT_EXPORT_TIMEOUT") or 1800)
+# 没带 Bearer 时只认【本机 origin】：按 host 放行、不按端口（DSH 渲染层端口每次可能变）。
+# 外站网页（http://evil.com）一律拒——它带自己的 Origin，藏不住。
+LOCAL_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "[::1]", "dsh-app", "file")
+
+
+def _origin_host(value: str | None) -> str:
+    v = str(value or "").strip().lower()
+    if not v or v in ("null", "python", "curl"):
+        return ""                       # 无 Origin = 本机命令行/脚本，走 Bearer 或下面的本机判定
+    if "://" in v:
+        scheme, rest = v.split("://", 1)
+        # 非 http(s) 的自定义源（如 dsh-app://…）：scheme 才是身份，rest 是路径
+        return scheme if scheme not in ("http", "https") else rest.split("/", 1)[0].split(":", 1)[0]
+    return v.split("/", 1)[0].split(":", 1)[0]
+
+
+def export_authorized(header_value: str | None, origin_value: str | None) -> bool:
+    """Bearer 对 ⇒ 放行；否则只放行本机 origin（插件里不能嵌 token）。"""
+    if authorized(header_value) and token_required():
+        return True
+    host = _origin_host(origin_value)
+    return host in LOCAL_ORIGIN_HOSTS
+
+
+def _hypit(argv: list, timeout: float = 180.0) -> tuple:
+    """跑 hypit CLI：无 shell、cwd 固定在 workspace、强制 utf-8（默认 cp936 会把 UTF-8 输出解码崩）。"""
+    import shutil
+    import subprocess
+    node = shutil.which("node") or "node"
+    if not os.path.isfile(HYPIT_ENTRY):
+        return 127, "", f"找不到 hypit 入口 {HYPIT_ENTRY}"
+    try:
+        r = subprocess.run([node, HYPIT_ENTRY, *argv], cwd=HYPIT_WS, capture_output=True,
+                           timeout=timeout, encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout or ""), (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "", f"hypit {' '.join(argv[:1])} 超过 {timeout:.0f}s"
+    except OSError as e:
+        return 126, "", f"起不了 hypit：{type(e).__name__} {e}"
+
+
+def _inside(root: str, candidate: str) -> bool:
+    r, p = os.path.realpath(root), os.path.realpath(candidate)
+    return p == r or p.startswith(r + os.sep)
+
+
+def resolve_run(run_rel: str) -> tuple:
+    """run 只接受 HYPIT_WS 下的相对 .svrun 路径。"""
+    v = str(run_rel or "").strip().replace("\\", "/")
+    if not v or ".." in v.split("/") or v.startswith("/") or ":" in v:
+        return None, "run 必须是 hypit_runs 下的相对路径（不许 .. / 绝对路径 / 盘符）"
+    p = os.path.join(HYPIT_WS, v)
+    if not p.lower().endswith(".svrun"):
+        return None, "run 必须是 .svrun 工程文件"
+    if not os.path.isfile(p) or not _inside(HYPIT_WS, p):
+        return None, "hypit_runs 下找不到这个 run"
+    return p, ""
+
+
+def resolve_task(task: str) -> tuple:
+    """可选：交付到 productions/<task>/outputs/。task 只能是已存在的一层目录名。"""
+    v = str(task or "").strip()
+    if not v:
+        return "", ""
+    if "/" in v or "\\" in v or ".." in v:
+        return None, "task 只能是 productions 下的目录名"
+    p = os.path.join(PROD_ROOT, v)
+    if not os.path.isdir(p) or not _inside(PROD_ROOT, p):
+        return None, f"productions 下没有这个任务目录：{v}"
+    return p, ""
+
+
+def _safe_name(name: str, fallback: str) -> str:
+    """只收"裸 ASCII 文件名 + .mp4"；含分隔符/穿越/非 ASCII 一律回落默认名。"""
+    raw = str(name or "").strip()
+    keep = "".join(c for c in raw if c.isascii() and (c.isalnum() or c in "._-"))
+    if keep != raw or not keep.endswith(".mp4") or len(keep) <= 4 or ".." in keep or "/" in keep or "\\" in keep:
+        return fallback + ".mp4"
+    return keep[:48]
+
+
+def _exp_db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS exp(id TEXT PRIMARY KEY, run TEXT, state TEXT,"
+                " build_id TEXT, name TEXT, path TEXT, url TEXT, bytes INTEGER, error TEXT,"
+                " created REAL, updated REAL)")
+    return con
+
+
+def _exp_touch(eid: str, **fields) -> None:
+    if not fields:
+        return
+    con = _exp_db()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    con.execute(f"UPDATE exp SET {cols}, updated=? WHERE id=?", (*fields.values(), time.time(), eid))
+    con.commit()
+    con.close()
+
+
+def _exp_row(eid: str) -> dict | None:
+    con = _exp_db()
+    cur = con.execute("SELECT id,run,state,build_id,name,path,url,bytes,error,created,updated"
+                      " FROM exp WHERE id=?", (eid,))
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    con.close()
+    return dict(zip(cols, row)) if row else None
+
+
+def export_reconcile() -> int:
+    """进程重启会打断在跑的导出：把遗留 queued/running 判死（别让人以为还在导）。"""
+    con = _exp_db()
+    n = con.execute("SELECT COUNT(*) FROM exp WHERE state IN ('queued','planning','building','fetching')").fetchone()[0]
+    if n:
+        con.execute("UPDATE exp SET state='failed', error=?, updated=? WHERE state IN ('queued','planning','building','fetching')",
+                    ("网关进程重启，本次导出被打断；请重新点一次", time.time()))
+        con.commit()
+    con.close()
+    return n
+
+
+def _build_ids(run_rel: str) -> list:
+    rc, out, _ = _hypit(["builds", "--json"], timeout=180)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return []
+    want = run_rel.replace("/", "\\").lower()
+    return [b["id"] for b in (data.get("builds") or [])
+            if str(b.get("run", "")).replace("/", "\\").lower() == want]
+
+
+def _export_run(eid: str, run_abs: str, task_dir: str, name: str) -> None:
+    run_rel = os.path.relpath(run_abs, HYPIT_WS).replace("\\", "/")
+    _exp_touch(eid, state="planning")
+    rc, out, err = _hypit(["plan", run_rel, "--json"], timeout=300)
+    if rc != 0:
+        _exp_touch(eid, state="failed", error=(err or out)[:400]); return
+    try:
+        plan = json.loads(out)
+    except ValueError:
+        _exp_touch(eid, state="failed", error="plan 输出解析不了"); return
+    paid = plan.get("providerRequestCount")
+    if paid != 0:                       # 二次核验：入口那次可能被绕过/工程刚被改过
+        _exp_touch(eid, state="failed",
+                   error=f"这个工程有 {paid} 段付费生成，导出闸只放免费装配工程（要走生成请让 agent 报价）"); return
+    targets = plan.get("targets") or []
+    if not targets:
+        _exp_touch(eid, state="failed", error="plan 没给出 target"); return
+
+    before = set(_build_ids(run_rel))
+    _exp_touch(eid, state="building")
+    rc, out, err = _hypit(["build", run_rel, "--follow", "--json"], timeout=EXPORT_BUILD_TIMEOUT)
+    new = [b for b in _build_ids(run_rel) if b not in before]
+    build_id = new[0] if new else ""
+    if rc != 0 and not build_id:
+        _exp_touch(eid, state="failed", build_id=build_id, error=((err or out) or "build 失败")[:400]); return
+    _exp_touch(eid, build_id=build_id)
+
+    _exp_touch(eid, state="fetching")
+    dest = os.path.join(task_dir or OUT_DIR, name)
+    if task_dir:
+        os.makedirs(os.path.join(task_dir, "outputs"), exist_ok=True)
+        dest = os.path.join(task_dir, "outputs", name)
+    rc, out, err = _hypit(["get", build_id, "--output", targets[0], "--to", dest, "--json"], timeout=300)
+    if rc != 0 or not os.path.isfile(dest):
+        _exp_touch(eid, state="failed", error=((err or out) or "取不回成片文件")[:400]); return
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    url_name = name
+    if os.path.realpath(dest) != os.path.realpath(os.path.join(OUT_DIR, url_name)):
+        import shutil
+        shutil.copyfile(dest, os.path.join(OUT_DIR, url_name))
+    _exp_touch(eid, state="done", path=dest, url=f"{PUBLIC_BASE}/api/hypit/assets/{url_name}",
+               bytes=os.path.getsize(dest))
+
+
+def handle_export(body: dict) -> tuple:
+    """POST /api/hypit/export {run, task?, name?} → {id}；花钱的腿一律拒。"""
+    run_abs, why = resolve_run(body.get("run") or "")
+    if why:
+        return 400, {"error": {"code": "BAD_RUN", "message": why}}
+    task_dir, why = resolve_task(body.get("task") or "")
+    if why:
+        return 400, {"error": {"code": "BAD_TASK", "message": why}}
+    con = _exp_db()
+    live = con.execute("SELECT id,state FROM exp WHERE state IN ('queued','planning','building','fetching')").fetchall()
+    con.close()
+    if live:
+        return 409, {"error": {"code": "BUSY", "message": f"已有导出在跑（{live[0][0]} · {live[0][1]}），等它结束再点"}}
+    eid = uuid.uuid4().hex[:12]
+    name = _safe_name(body.get("name") or "", f"export-{eid}")
+    now = time.time()
+    con = _exp_db()
+    con.execute("INSERT INTO exp(id,run,state,name,created,updated) VALUES(?,?,?,?,?,?)",
+                (eid, os.path.relpath(run_abs, HYPIT_WS).replace("\\", "/"), "queued", name, now, now))
+    con.commit()
+    con.close()
+    threading.Thread(target=_export_run, args=(eid, run_abs, task_dir, name), daemon=True).start()
+    return 200, {"id": eid, "name": name}
+
+
+def export_status(eid: str) -> dict:
+    row = _exp_row(eid)
+    if not row:
+        return {"error": {"code": "NOT_FOUND", "message": f"没有这条导出 {eid}"}}
+    row["elapsed"] = round(time.time() - (row.pop("created") or time.time()))
+    return row
+
+
 def serve_asset(name: str):
     path = os.path.normpath(os.path.join(OUT_DIR, os.path.basename(name)))
     if not path.startswith(os.path.normpath(OUT_DIR)) or not os.path.isfile(path):
@@ -536,6 +759,25 @@ if __name__ == "__main__":
                                         args[2] if len(args) > 2 else ""), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
+    elif cmd == "export" and len(args) >= 2:
+        # 走和右栏按钮同一条代码路径（同一套闸）：python backend/hypit_bridge.py export <run相对路径> [task目录名] [文件名]
+        code, payload = handle_export({"run": args[1], "task": args[2] if len(args) > 2 else "",
+                                       "name": args[3] if len(args) > 3 else ""})
+        print(json.dumps({"http": code, **payload}, ensure_ascii=False), flush=True)
+        if code != 200 or not payload.get("id"):
+            sys.exit(1)
+        # 这条命令是前台跑的：不轮询到底，进程一退 daemon 线程就跟着死，导出会被自己掐断
+        eid = payload["id"]
+        while True:
+            row = export_status(eid)
+            state = row.get("state")
+            if state in ("done", "failed"):
+                print(json.dumps(row, ensure_ascii=False), flush=True)
+                sys.exit(0 if state == "done" else 1)
+            time.sleep(5)
+    elif cmd == "export-status" and len(args) >= 2:
+        print(json.dumps(export_status(args[1]), ensure_ascii=False))
     else:
-        print(__doc__ or "", "用法见 studio-claim / studio-release / studio-status", file=sys.stderr)
+        print(__doc__ or "", "用法见 studio-claim / studio-release / studio-status / export / export-status",
+              file=sys.stderr)
         sys.exit(2)

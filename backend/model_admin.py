@@ -535,6 +535,15 @@ class H(BaseHTTPRequestHandler):
                                               "message": "缺/错 MODEL_GATEWAY_TOKEN"}}, ensure_ascii=False))
         return True
 
+    def _export_denied(self):
+        """导出口：Bearer 对 ⇒ 放行；没带 token 时只认本机 origin（DSH 插件里不能嵌 token）。"""
+        if hypit_bridge.export_authorized(self.headers.get("Authorization"), self.headers.get("Origin")):
+            return False
+        self._send(403, json.dumps({"error": {"code": "FORBIDDEN",
+                                              "message": "导出口只收 Bearer 或本机 origin 的请求"}}, ensure_ascii=False),
+                   cors=True)
+        return True
+
     def _read_body(self) -> bytes:
         n = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(n) if n else b""
@@ -578,11 +587,18 @@ class H(BaseHTTPRequestHandler):
             data, ctype = hypit_bridge.serve_upload(u.path.rsplit("/", 1)[-1])
             self._send_file(data, ctype) if data else self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
         elif u.path == "/api/hypit/studio":
-            # DSH 右栏 presence：代探 hypit studio(:5179) 是否活着。只读、不要 Bearer、带 ACAO:*。
-            # 带 ?session= 时按"谁起的 studio"过滤——studio 没有会话概念，不过滤就会在每个会话都弹页签。
+            # DSH 右栏 presence：代探 hypit studio 是否活着。只读、带 ACAO:*。
+            # 必须带 ?session=：归属=「这个会话拥有 studio 正在服务的那个 run」，
+            # 不带就只回运维视图（up 恒 false）——studio 是单实例无会话概念，拿"端口活着"当
+            # 跨会话信号会在每个会话都弹页签（2026-10-01/10-02 三次复发）。
             q = parse_qs(u.query)
             sid = (q.get("session") or [None])[0]
             self._send(200, json.dumps(hypit_bridge.studio_status(sid), ensure_ascii=False), cors=True)
+        elif u.path == "/api/hypit/export":
+            # 导出进度：?id=<导出id>。只读，带 ACAO:* 让右栏能轮询。
+            q = parse_qs(u.query)
+            self._send(200, json.dumps(hypit_bridge.export_status((q.get("id") or [""])[0]), ensure_ascii=False),
+                       cors=True)
         elif u.path == "/api/hypit/rates":
             if self._hypit_denied():
                 return
@@ -614,6 +630,16 @@ class H(BaseHTTPRequestHandler):
                 return
             code, payload = hypit_bridge.handle_submit(body if isinstance(body, dict) else {})
             self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path == "/api/hypit/export":
+            if self._export_denied():
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"error": {"code": "BAD_JSON", "message": str(e)}}, ensure_ascii=False), cors=True)
+                return
+            code, payload = hypit_bridge.handle_export(body if isinstance(body, dict) else {})
+            self._send(code, json.dumps(payload, ensure_ascii=False), cors=True)
         elif u.path == "/api/model/call":
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
@@ -654,6 +680,12 @@ def main():
             print(f"reconciled {n} orphaned hypit job(s) from the previous process")
     except Exception as e:
         print(f"hypit job reconcile skipped: {e}")
+    try:
+        n = hypit_bridge.export_reconcile()    # 导出同理：重启打断的那条要判死，别一直显示 building
+        if n:
+            print(f"reconciled {n} interrupted hypit export(s)")
+    except Exception as e:
+        print(f"hypit export reconcile skipped: {e}")
     print(f"Weeksir model admin on http://127.0.0.1:{port}  (ENV={ENV_PATH})")
     try:
         srv.serve_forever()
