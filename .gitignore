@@ -8,3 +8,5 @@ __pycache__/
 outputs/_hypit_jobs/
 .gateway_studio.json
 .gateway_intent.json
+
+_svc_*.log
