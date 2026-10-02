@@ -7,3 +7,4 @@ __pycache__/
 .gateway_ledger.sqlite
 outputs/_hypit_jobs/
 .gateway_studio.json
+.gateway_intent.json

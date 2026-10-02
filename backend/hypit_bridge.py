@@ -188,6 +188,7 @@ def studio_claim(session: str, run: str = "", port: int = STUDIO_PORT) -> dict:
     rec["runs"] = _trim_runs(rec["runs"])
     with open(STUDIO_MARK, "w", encoding="utf-8") as f:
         json.dump({"runs": rec["runs"], "ts": time.time()}, f, ensure_ascii=False)
+    set_intent(session, "hypit", run)     # 起 studio 本身就是"在做 hypit"，顺手把意图钉死（排他）
     return {"runs": rec["runs"], "session": session, "run": run, "port": int(port), "owners": owners}
 
 
@@ -301,9 +302,16 @@ def studio_status(session: str | None = None) -> dict:
             _SEEN_SESSIONS.pop(old, None)
 
     item = _mine(runs, str(session))
-    if not item:                       # 这条会话没表过意图：新会话 / 别的流水线 ⇒ 不弹台
+    ex = explicit_only(str(session), "hypit")
+    if ex is False:                      # 明确登记了别的流水线 ⇒ 这个台不挂（哪怕以前 claim 过）
+        return {"intent": False, "up": False, "reason": "intent-is-" + intent_of(str(session))}
+    if ex is None and not item:          # 没登记、也没有 run 归属 ⇒ 新会话 ⇒ 零 UI
         return {"intent": False, "up": False, "reason": "no-intent",
                 "owners": sorted({o for v in runs.values() for o in _owners_of(v)})}
+    if ex is True and not item:          # 说了做 hypit 但还没 claim ⇒ 挂台，里面提示怎么起
+        return {"intent": True, "up": False, "alive": False, "reason": "not-claimed",
+                "port": STUDIO_PORT,
+                "how_to_start": "hypit studio --run <工程>.svrun --port %d" % STUDIO_PORT}
 
     port = int(item["port"])
     base = {"intent": True, "port": port, "run": item["run"], "session": item["session"],
@@ -325,6 +333,78 @@ def studio_status(session: str | None = None) -> dict:
     return probe
 
 
+# ══ 会话意图登记（铁律：新会话零 UI，明确意图之后才挂台）═══════════════════════════
+# 之前只靠"碰巧有 claim / 碰巧有带标的 run"来推断意图 ⇒ 该弹的不弹（agent 忘了 claim）、
+# 不该弹的乱弹（一条会话同时挂着两条流水线的痕迹）。现在把意图变成一个【显式动作】：
+#   确认走哪条流水线之后，第一件事就是 set_intent(session, skill)。
+# 规则（排他）：
+#   有显式登记 ⇒ 只挂 skill 匹配的那个台，其余一律不挂
+#   无显式登记 ⇒ 退到佐证（hypit=run 归属登记；omni=盘上有属于本会话的 run）
+#   两者都没有 ⇒ 新会话，零 UI
+INTENT_MARK = os.environ.get("HYPIT_INTENT_MARK") or os.path.join(ROOT, ".gateway_intent.json")
+KNOWN_SKILLS = ("omni", "hypit", "super-clone", "product-video", "film")
+_intent_cache = {"sig": None, "data": {}}
+
+
+def _intent_map() -> dict:
+    try:
+        sig = os.stat(INTENT_MARK).st_mtime_ns
+    except OSError:
+        return {}
+    if _intent_cache["sig"] != sig:
+        try:
+            with open(INTENT_MARK, encoding="utf-8") as f:
+                data = json.load(f)
+            _intent_cache.update(sig=sig, data=data if isinstance(data, dict) else {})
+        except (OSError, ValueError):
+            _intent_cache.update(sig=sig, data={})
+    return _intent_cache["data"]
+
+
+def set_intent(session: str, skill: str, task: str = "") -> dict:
+    """登记"这条会话现在做哪条流水线"。同一会话再登记 = 覆盖（换产品线就靠它）。"""
+    session, skill = str(session or "").strip(), str(skill or "").strip()
+    if not session or not skill:
+        return {"error": "session 和 skill 都不能为空"}
+    data = dict(_intent_map())
+    data[session] = {"skill": skill, "task": str(task or ""), "ts": time.time()}
+    tmp = INTENT_MARK + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, INTENT_MARK)
+    _intent_cache.update(sig=None, data=data)
+    return {"session": session, "skill": skill, "task": task, "known": skill in KNOWN_SKILLS}
+
+
+def intent_of(session: str) -> str:
+    return str((( _intent_map().get(str(session or "")) or {}).get("skill")) or "")
+
+
+def clear_intent(session: str) -> dict:
+    data = dict(_intent_map())
+    gone = data.pop(str(session or ""), None)
+    tmp = INTENT_MARK + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, INTENT_MARK)
+    _intent_cache.update(sig=None, data=data)
+    return {"cleared": bool(gone), "remaining": len(data)}
+
+
+def intent_view() -> list:
+    """运维视图：现在有哪些会话挂着哪条流水线。"""
+    now = time.time()
+    return [{"session": k, "skill": str(v.get("skill") or ""), "task": str(v.get("task") or ""),
+             "age": round(now - float(v.get("ts") or 0))}
+            for k, v in sorted(_intent_map().items(), key=lambda kv: -(kv[1].get("ts") or 0))]
+
+
+def explicit_only(session: str, skill: str) -> bool | None:
+    """True/False = 有显式登记、按它判；None = 没有登记，交给佐证路径。"""
+    cur = intent_of(session)
+    return None if not cur else (cur == skill)
+
+
 def workbench_presence(session: str | None = None) -> dict:
     """右栏唯一的判定口：这条会话该挂哪个台、那个台活着没。
 
@@ -337,18 +417,24 @@ def workbench_presence(session: str | None = None) -> dict:
 
 
 def omni_status(session: str | None = None) -> dict:
-    """omni 流水线台（video-ui :8765）的意图与存活。意图=盘上有属于这条会话的 run。"""
+    """omni 流水线台（video-ui :8765）的意图与存活。意图优先取显式登记，其次取盘上属于本会话的 run。"""
     alive = _probe_omni()
     if session is None:
-        return {"intent": False, "up": False, "alive": alive, "reason": "ops-view"}
+        return {"intent": False, "up": False, "alive": alive, "reason": "ops-view",
+                "intents": intent_view()}
     sid = str(session)
+    ex = explicit_only(sid, "omni")
+    if ex is False:                      # 明确登记了别的流水线 ⇒ 这个台不挂
+        return {"intent": False, "up": False, "alive": alive, "reason": "intent-is-" + intent_of(sid)}
     found = _runs_of_session(sid)
-    if not found:
+    if ex is None and not found:         # 没登记也没 run ⇒ 新会话，零 UI
         return {"intent": False, "up": False, "alive": alive, "reason": "no-intent"}
-    newest = max(found, key=lambda r: r["ts"])
+    newest = max(found, key=lambda r: r["ts"]) if found else {}
     return {"intent": True, "up": alive, "alive": alive,
-            "url": OMNI_UI + "?session=" + sid, "run": newest["run"],
-            "ready": newest["script_approved"], "idle_age": round(time.time() - newest["ts"])}
+            "url": OMNI_UI + "?session=" + sid, "run": newest.get("run", ""),
+            "ready": bool(newest.get("script_approved")),
+            "idle_age": round(time.time() - newest["ts"]) if newest else None,
+            "source": "explicit" if ex else "run-tag"}
 
 
 def _probe_omni() -> bool:
@@ -889,6 +975,13 @@ if __name__ == "__main__":
                                         args[2] if len(args) > 2 else ""), ensure_ascii=False))
     elif cmd == "studio-status":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
+    elif cmd == "intent" and len(args) >= 3:
+        # 铁律动作：确认走哪条流水线之后，第一件事就是登记意图（右栏只按它挂台）
+        print(json.dumps(set_intent(args[1], args[2], args[3] if len(args) > 3 else ""), ensure_ascii=False))
+    elif cmd == "intent-clear" and len(args) >= 2:
+        print(json.dumps(clear_intent(args[1]), ensure_ascii=False))
+    elif cmd == "intent-show":
+        print(json.dumps(intent_view(), ensure_ascii=False))
     elif cmd == "export" and len(args) >= 2:
         # 走和右栏按钮同一条代码路径（同一套闸）：python backend/hypit_bridge.py export <run相对路径> [task目录名] [文件名]
         code, payload = handle_export({"run": args[1], "task": args[2] if len(args) > 2 else "",
