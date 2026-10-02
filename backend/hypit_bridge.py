@@ -458,10 +458,26 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
     now = time.time()
     if _PROGRESS_CACHE["sid"] == sid and now - _PROGRESS_CACHE["ts"] < STUDIO_CACHE_TTL:
         return _PROGRESS_CACHE["res"]
+    # 归属回落链（都不新增"必须有人做"的动作）：① 腿自己带的 session（agent 起 build 时导出了 HYPIT_SESSION_ID）
+    # ② 该会话 claim 过的工程（studio-claim 会带会话）③ 该会话登记的工程名。都没有才算"没腿"。
+    keys = []
+    mine = _mine(_studio_record()["runs"], sid)          # 只认【本会话】claim 过的工程
+    if mine:
+        keys.append(_project_key({"project": mine.get("run") or ""}))
+    intent_task = str((_intent_map().get(sid) or {}).get("task") or "")
+    k = _project_key({"project": intent_task})           # 登记意图时把工程目录写在任务名里也能对上
+    if k and k not in keys:
+        keys.append(k)
     con = _db()
     try:
         rows = con.execute("select id,model,state,run,label,credits,error,created,updated from jobs"
                            " where session=? order by created desc limit ?", (sid, limit)).fetchall()
+        how = "session"
+        if not rows and keys:
+            marks = ",".join("?" * len(keys))
+            rows = con.execute("select id,model,state,run,label,credits,error,created,updated from jobs"
+                               f" where run in ({marks}) order by created desc limit ?", (*keys, limit)).fetchall()
+            how = "project" if rows else "session"
     finally:
         con.close()
     if not rows:
@@ -486,7 +502,7 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
                         "label": label or "", "credits": credits or 0,
                         "seconds": int(max(0.0, (updated or created) - (created or 0))),
                         "ago": int(time.time() - (created or 0)), "error": msg, "upstream": up})
-        res = {"known": True, "segments": seg,
+        res = {"known": True, "segments": seg, "matched_by": how,
                "summary": {"total": len(seg), "credits": spent, **tally},
                "projects": sorted({x["project"] for x in seg if x["project"]}),
                "source": "gateway-jobs"}
