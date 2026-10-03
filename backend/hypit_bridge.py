@@ -328,9 +328,16 @@ def studio_status(session: str | None = None) -> dict:
         if item:
             out["stale_claim"] = item["run"]      # 历史遗留：想恢复就重新 intent 一次
         return out
-    if not item:                         # 登记了 hypit 但还没 claim ⇒ 挂台，里面提示怎么起
-        return {"intent": True, "up": False, "alive": False, "reason": "not-claimed",
-                "port": STUDIO_PORT,
+    if not item:                         # 登记了 hypit 但没起 studio 查看器
+        # 🔴 2026-10-03 更正：studio 只是【查看器】，真正出片的是 hypit runtime worker。
+        #    账本里有在途腿就是"正在生成"，绝不能显示"引擎没在跑"（实测就在谎报）。
+        sm = (jobs_progress(str(session)) or {}).get("summary") or {}
+        act = int(sm.get("running") or 0) + int(sm.get("queued") or 0)
+        if act:
+            return {"intent": True, "up": False, "alive": False, "state": "generating",
+                    "reason": "viewer-down-but-generating", "active_legs": act, "port": STUDIO_PORT}
+        return {"intent": True, "up": False, "alive": False, "state": "not-claimed",
+                "reason": "not-claimed", "port": STUDIO_PORT,
                 "how_to_start": "hypit studio --run <工程>.svrun --port %d" % STUDIO_PORT}
 
     port = int(item["port"])
@@ -338,18 +345,23 @@ def studio_status(session: str | None = None) -> dict:
             "idle_age": round(time.time() - item["ts"])}
     probe = dict(_probe_studio(port))
     if not probe.get("up"):
+        # 查看器死了 ≠ 引擎没工作：先看账本里有没有在途腿
+        sm = (jobs_progress(str(session)) or {}).get("summary") or {}
+        act = int(sm.get("running") or 0) + int(sm.get("queued") or 0)
         base.update(up=False, alive=False, reason="studio-down",
+                    state="generating" if act else "viewer-down", active_legs=act,
                     how_to_start="hypit studio --run %s --port %d" % (item["run"], port))
         return base
 
     # 交叉核对：studio 自报它在服务哪个 run。拿到但不匹配 ⇒ 台里提示；拿不到（生成工程 session 会 500）⇒ 只认登记。
     served = _studio_served_path(port)
     if served and not _run_matches(item["run"], served):
-        base.update(up=False, alive=True, reason="run-mismatch", served=served)
+        base.update(up=False, alive=True, reason="run-mismatch", served=served,
+                    state="viewer-on-another-run")
         return base
 
     probe.update(base)
-    probe.update(up=True, alive=True, run_verified=bool(served))
+    probe.update(up=True, alive=True, state="viewer-up", run_verified=bool(served))
     return probe
 
 
@@ -461,7 +473,7 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
     if not sid:
         return {"known": False, "reason": "no-session"}
     now = time.time()
-    if _PROGRESS_CACHE["sid"] == sid and now - _PROGRESS_CACHE["ts"] < STUDIO_CACHE_TTL:
+    if _PROGRESS_CACHE["sid"] == sid and now - _PROGRESS_CACHE["ts"] < 5:   # 5 秒：状态要够新鲜
         return _PROGRESS_CACHE["res"]
     # 归属回落链（都不新增"必须有人做"的动作）：① 腿自己带的 session（agent 起 build 时导出了 HYPIT_SESSION_ID）
     # ② 该会话 claim 过的工程（studio-claim 会带会话）③ 该会话登记的工程名。都没有才算"没腿"。
