@@ -326,7 +326,7 @@ _LIVE_CHAT = {"text.complete", "video.analyze"}
 _ADAPTED = {("text.complete", "*"), ("video.analyze", "*"),
             ("image.generate", "default"), ("image.generate", "nano"),
             ("video.generate", "omni-t2v"), ("video.generate", "seedance-2.5"),
-            ("video.generate", "seedance-2.0")}
+            ("video.generate", "seedance-2.0"), ("video.generate", "agnes-v")}
 
 
 def is_adapted(capability: str, purpose: str) -> bool:
@@ -530,6 +530,29 @@ def _vinted_video(base_url, api_key, prompt, model="seedance2.0fast", duration=5
         return {"success": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+def _dig(obj, keys, depth: int = 0):
+    """在不知道返回形状时按 keys 顺序挖第一个非空值（dict/list 递归，限深 3 防自引用绕圈）。"""
+    if depth > 3 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:                                   # 先按 key 找（越具体越优先，避免抓到无关 id）
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in obj.values():                           # 再钻进任意容器（实测响应把结果塞在 data:[{...}] 里）
+            if isinstance(v, (dict, list)):
+                got = _dig(v, keys, depth + 1)
+                if got:
+                    return got
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            got = _dig(item, keys, depth + 1)
+            if got:
+                return got
+    return None
+
+
 def call(capability: str, purpose: str | None = None, **params) -> dict:
     """能力级分发：调用方只给能力名+标准参数，本层按路由注入 model/凭证并转调现有 client。
 
@@ -549,6 +572,41 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
             video_url=params.get("video_url"),
             image_urls=params.get("image_urls"),
         )
+    if capability == "video.generate" and r["purpose"] == "agnes-v":
+        # Agnes Video 2.5 **Flash**：上游走免费额度，所以这条是"能出片但不必占付费腿"的兜底。
+        # 客户端只暴露 create_flash_task/wait_flash_task，且 Flash 不收参考视频（实测会 400）⇒ 本地先明拒，不静默丢字段。
+        import asyncio
+        from backend.services import agnes_video_client as agnes_v
+        if params.get("video_urls") or params.get("videos"):
+            return {"success": False,
+                    "error": "Agnes Flash 不支持参考视频（会 400）；要参考视频走 seedance 或 agnes-2.5"}
+        if params.get("firstFrame") or params.get("lastFrame") or params.get("first_frame") or params.get("last_frame"):
+            return {"success": False, "error": "Agnes Flash 没有首尾帧模式（那是 agnes-2.5 的 keyframe）"}
+        try:
+            sub = asyncio.run(agnes_v.create_flash_task(
+                params["prompt"],
+                seconds=str(params.get("duration") or 5),
+                aspect_ratio=params.get("aspect_ratio") or "9:16",
+                images=params.get("image_urls") or params.get("images"),
+                seed=params.get("seed")))
+        except Exception as e:                                   # 客户端抛 RuntimeError 带上游原文
+            return {"success": False, "error": "%s: %s" % (type(e).__name__, str(e)[:300])}
+        vid = _dig(sub, ("video_id", "task_id", "id"))
+        if not vid:
+            return {"success": False, "error": "Agnes 提交没返回 video_id：%s" % str(sub)[:200]}
+        try:
+            done = asyncio.run(agnes_v.wait_flash_task(
+                vid, poll_s=float(params.get("poll_interval") or 3.0),
+                timeout_s=float(params.get("poll_timeout") or 600.0)))
+        except Exception as e:
+            return {"success": False, "job_id": vid, "error": "%s: %s（可据此查它到底出没出片）" % (type(e).__name__, str(e)[:220])}
+        url = _dig(done, ("file", "video_url", "download_url", "url"))
+        path = None
+        if url and params.get("output_path"):
+            path = asyncio.run(agnes_v.download_file(url, params["output_path"]))
+        return {"success": bool(url), "url": url, "path": path, "job_id": vid,
+                "error": None if url else "Agnes 回成功了但既没文件也没 URL：%s" % str(done)[:200]}
+
     if capability == "video.analyze":
         return analyze_media(
             path=params["path"],
