@@ -264,6 +264,111 @@ def _studio_served_path(port: int) -> str:
     return path
 
 
+# ══ 选了就给界面：把这条会话的工程用 studio 查看器打开（不让人敲命令行）════════════
+def _session_project(sid: str) -> str:
+    """这条会话该看哪个工程：本会话 claim → 意图任务里的路径 → 本会话最近生成腿所属工程目录。"""
+    item = _mine(_studio_record()["runs"], sid)
+    if item and item.get("run"):
+        return str(item["run"])
+    task = str((_intent_map().get(sid) or {}).get("task") or "")
+    if task.lower().endswith((".svrun", ".svml")):
+        return task
+    con = _db()
+    try:
+        row = con.execute("select run from jobs where session=? and run is not null and run<>''"
+                          " order by created desc limit 1", (sid,)).fetchone()
+    finally:
+        con.close()
+    return str(row[0]) if row and row[0] else ""
+
+
+def _pick_svrun(target: str) -> str:
+    """把"工程目录 / .svml / .svrun"统一解析成一个真实存在的 .svrun 绝对路径；越界或找不到回 ""。"""
+    import glob
+    ws = os.path.realpath(HYPIT_WORKSPACE)
+    cand = target if os.path.isabs(target) else os.path.join(ws, str(target).replace("\\", "/"))
+    if not _inside(ws, cand):
+        return ""
+    real = os.path.realpath(cand)
+    if real.endswith(".svrun"):
+        return real if os.path.isfile(real) else ""
+    if real.endswith(".svml"):
+        swp = real[:-5] + ".svrun"
+        if os.path.isfile(swp):
+            return swp
+        real = os.path.dirname(real)          # 同名 .svrun 不存在（实测 clone.svml 配 build.svrun）⇒ 退回同目录找
+    if os.path.isdir(real):
+        hits = sorted(glob.glob(os.path.join(real, "*.svrun")))
+        if hits:
+            return hits[0]
+    return ""
+
+
+def _free_studio_port(span: int = 12) -> int:
+    """studio 实测绑 [::1]，所以按 IPv6 环回找空闲口；5179 被别的会话的服务占着就往上走，绝不抢。"""
+    import socket
+    for port in range(STUDIO_PORT, STUDIO_PORT + span):
+        sk = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            sk.bind(("::1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            sk.close()
+    return 0
+
+
+def studio_up(session: str, run: str = "") -> dict:
+    """给这条会话起（或复用）一个 studio 查看器，并把归属 claim 给它。
+
+    为什么要它：用户点了 /hypit-pipeline，右栏就该出官方界面，而不是"引擎没在跑 + 一行命令行"。
+    触发者 = agent 跑 `intent` 那一步（CLI 进程内），所以**不新增 HTTP 执行端点**——
+    那是要鉴权的面（ADR-pipeline Gate0），能不加就不加。
+    """
+    sid = str(session or "").strip()
+    if not sid:
+        return {"started": False, "reason": "no-session"}
+    target = run or _session_project(sid)
+    svrun = _pick_svrun(target) if target else ""
+    if not svrun:
+        return {"started": False, "reason": "no-project", "tried": target,
+                "detail": "这条会话名下还没找到 .svrun 工程（先按 skill 把工程写出来再起查看器）"}
+    ws = os.path.realpath(HYPIT_WORKSPACE)
+    rel = os.path.relpath(svrun, ws).replace("\\", "/")
+    for key, item in _studio_record()["runs"].items():          # 已有查看器在服务这个 run ⇒ 复用
+        port = int(item["port"])
+        if _run_matches(rel, key) and _probe_studio(port).get("up"):
+            studio_claim(sid, rel, port)
+            return {"started": False, "reused": True, "port": port, "run": rel,
+                    "url": "http://localhost:%d/" % port}
+    port = _free_studio_port()
+    if not port:
+        return {"started": False, "reason": "no-port", "detail": "%d..%d 全被占" % (STUDIO_PORT, STUDIO_PORT + 11)}
+    if not os.path.isfile(HYPIT_ENTRY):
+        return {"started": False, "reason": "no-hypit-entry", "detail": HYPIT_ENTRY}
+    import shutil
+    import subprocess
+    node = shutil.which("node") or "node"
+    log = open(os.path.join(ROOT, "_studio_%d.log" % port), "ab")
+    try:
+        subprocess.Popen([node, HYPIT_ENTRY, "studio", "--workspace", ws, "--run", svrun, "--port", str(port)],
+                         cwd=ws, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        return {"started": False, "reason": "spawn-failed", "detail": "%s: %s" % (type(e).__name__, e)}
+    finally:
+        log.close()
+    for _ in range(30):                                         # 最多等 15 秒
+        time.sleep(0.5)
+        _STUDIO_CACHE.update(port=0, ts=0.0)
+        if _probe_studio(port).get("up"):
+            studio_claim(sid, rel, port)
+            return {"started": True, "port": port, "run": rel, "url": "http://localhost:%d/" % port}
+    return {"started": False, "reason": "not-listening", "port": port,
+            "detail": "起了但 15 秒没在 [::1]:%d 应答，看 %s_studio_%d.log" % (port, ROOT, port)}
+
+
 def _probe_studio(port: int) -> dict:
     """探一次 studio 的只读口；结果缓存 5 秒——多个右栏窗口共用一份，免得各自每 4 秒去撞死端口。"""
     import urllib.error
@@ -1207,7 +1312,12 @@ if __name__ == "__main__":
         print(json.dumps(studio_status(args[1] if len(args) > 1 else None), ensure_ascii=False))
     elif cmd == "intent" and len(args) >= 3:
         # 铁律动作：确认走哪条流水线之后，第一件事就是登记意图（右栏只按它挂台）
-        print(json.dumps(set_intent(args[1], args[2], args[3] if len(args) > 3 else ""), ensure_ascii=False))
+        out = set_intent(args[1], args[2], args[3] if len(args) > 3 else "")
+        if args[2] == "hypit":                      # 🔴 选了就给界面：登记意图这一步顺手把 studio 起起来
+            out["viewer"] = studio_up(args[1], args[3] if len(args) > 3 else "")
+        print(json.dumps(out, ensure_ascii=False))
+    elif cmd == "studio-up" and len(args) >= 2:
+        print(json.dumps(studio_up(args[1], args[2] if len(args) > 2 else ""), ensure_ascii=False))
     elif cmd == "intent-clear" and len(args) >= 2:
         print(json.dumps(clear_intent(args[1]), ensure_ascii=False))
     elif cmd == "intent-show":

@@ -10,3 +10,4 @@ outputs/_hypit_jobs/
 .gateway_intent.json
 
 _svc_*.log
+_studio_*.log
