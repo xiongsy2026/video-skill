@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     # 注释里的标记：OK=实测出词 / BUDGET=实测能跑但思考会吃满小预算(max_tokens 需 ≥2000) / 需充值·开通见 ADR
     TEXT_MODEL_GEMINI38: str = "gemini-3.8-flash"        # zexapi OK（5.7s·908 tok）gemini-3.5 那条已无渠道
     TEXT_MODEL_CLAUDE48: str = "claude-opus-4-8"         # zexapi OK（4.7s·139 tok）最省 token
-    TEXT_MODEL_GPT61: str = "gpt-6.1-sol"                # hub.nocannobb OK（4.0s·28 tok）必须带浏览器 UA 才过 Cloudflare
+    TEXT_MODEL_GPT61: str = "gpt-6.1-sol"                # hub.nocannobb OK（4.0s·28 tok）必须带浏览器 UA
+    TEXT_MODEL_GPT56: str = "gpt-5.6-sol"                # hub.nocannobb 同 hub 另一条；用 GPT56_API_KEY 才过 Cloudflare
     TEXT_MODEL_QWEN38MAX: str = "qwen3.8-max"            # dashscope compatible-mode OK（1.2s·97 tok）
     TEXT_MODEL_MIMO_PRO: str = "mimo-v2.6-pro"           # mimo OK（6.1s·232 tok）上一题样本最有人味
     TEXT_MODEL_DEEPSEEKV4: str = "deepseek-v4-pro"       # zexapi/manxue BUDGET：900 预算返回空，需 ≥2000
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     # 切到 hub.nocannobb.com 中转（codex.theyouyi.site 网关 60s 超时会 504）
     GPT55_BASE_URL: str = "https://hub.nocannobb.com/v1"
     GPT55_API_KEY: str = ""
+    # 同一个 hub 的第二把 key（2026-10-04 用户给的，专给 gpt-5.6-sol 这条腿）。
+    # ⚠️ 不覆盖 GPT55_API_KEY：那条正在给 text.complete/gpt61 用，换掉会把能跑的腿弄死。
+    GPT56_API_KEY: str = ""
 
     # OpenAI 兼容 API（视频翻译用：ASR Whisper + GPT翻译）
     # 切到 hub.nocannobb.com 中转（codex.theyouyi.site 网关 60s 超时会 504）
@@ -70,8 +74,8 @@ class Settings(BaseSettings):
     CHROME_PATH: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
     # RunningHub API 配置（动作迁移）
-    # 注：b64d2b434d58401c8bbaf8b9260f34fd 是旧 key（部分工作流返回 414）
-    # 新消费级 key 可访问更多工作流
+    # 注：仓库里曾把旧 key 写在注释中（部分工作流对它返回 414）——那把已进 git 历史、撤不回，
+    #     只能在 RunningHub 侧作废轮换。密钥一律只从 .env 读，源码/注释里都不许留。
     RUNNINGHUB_API_KEY: str = ""
     RUNNINGHUB_API_KEY_OLD: str = ""
     # 企业级 API Key（不受 810 限制，可调用任意工作流）
@@ -225,6 +229,25 @@ class Settings(BaseSettings):
     # 提交 POST {base}/v1/videos，轮询 GET /v1/videos/{id}，下载 GET /v1/videos/{id}/signed_url?download=1
     VINTED_VIDEO_API_BASE: str = "https://vinted.cam"
     VINTED_VIDEO_API_KEY: str = ""
+    # === 火山引擎·豆包语音「音频生成」HTTP 非流式（seed-audio）===
+    # POST {base}/api/v3/tts/create，鉴权走 X-Api-Key 头（不是 Bearer）；成功回二进制音频体。
+    # 文档口径=按字符计费（不是按条），所以网关这条的 unit_price 记「分/千字」。
+    BYTEDANCE_AUDIO_BASE_URL: str = "https://openspeech.bytedance.com"
+    BYTEDANCE_AUDIO_API_KEY: str = ""
+    BYTEDANCE_AUDIO_MODEL: str = "seed-audio-1.0"
+
+    # === 网页/CLI 型生图通道（没有 API key，靠【登录态】；网关只做统一入口 + 账本）===
+    # 豆包生图 = Playwright 驱动本机 Chrome 上的豆包网页版；真码在 video-ui 里（不在本仓），
+    # 所以网关用 subprocess 调它的 CLI 契约，不 import 跨仓模块。
+    # ⚠️ DOUBAO_PYTHON 必须是【装了 playwright 的那个解释器】= 跑 video-ui(:8765) 的那个，
+    #    不是网关自己所在的 .venv（venv 里没装 playwright，子进程一上来就 ModuleNotFound）。
+    VIDEO_UI_ROOT: str = r"C:\dsh\scratch\video-ui\video-ui"
+    DOUBAO_PYTHON: str = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe"
+    DOUBAO_IMAGE_MODEL: str = "Seedream 4.5"
+    # gflow = Google Flow 命令行（transport=ui_automation，同样是驱动网页），生图走 Imagen/Nano Banana
+    GFLOW_EXE: str = r"C:\Users\Administrator\.local\bin\gflow-cli.exe"
+    GFLOW_IMAGE_MODEL: str = "nano2"        # nano2 | nano-pro | nano2-lite | image4 | imagen4
+    GFLOW_PROJECT: str = "75cd0b95-7ffb-4df1-8d5b-688ff9e20d10"
     # MiMo Step1 调用参数（参考爆款复刻 1:1 流程）
     ONESHOT_MIMO_FPS: float = 4.0
     ONESHOT_MIMO_MEDIA_RESOLUTION: str = "max"
@@ -347,6 +370,8 @@ class Settings(BaseSettings):
     RUNNINGHUB_H3_DIRECTOR_REF2VA_WORKFLOW_ID: str = "2084788947984666625"
     # 导演台核心节点 ID（MiniMaxH3Director 节点）
     RUNNINGHUB_H3_DIRECTOR_NODE_ID: str = "12"
+    # H3 走 RunningHub 国际站（与 .env 里的企业 key 匹配）；网关路由表以此显示健康
+    RUNNINGHUB_H3_BASE_URL: str = "https://www.runninghub.ai"
 
     # 1人漫剧 H3（manxueapi 网关，OpenAI 兼容协议）
     MANXUE_H3_BASE_URL: str = "https://manxueapi.com"

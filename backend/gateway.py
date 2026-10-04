@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os as _os
 import sys as _sys
+import threading as _threading
 
 _d = _os.path.dirname(_os.path.abspath(__file__))
 while _d and not _os.path.exists(_os.path.join(_d, "config.py")):
@@ -21,7 +22,7 @@ if _d and _d not in _sys.path:
 
 from config import settings  # noqa: E402
 
-CAPABILITIES = ["text.complete", "image.generate", "image.edit", "video.generate", "video.analyze", "lipsync", "transcribe"]
+CAPABILITIES = ["text.complete", "image.generate", "image.edit", "video.generate", "video.analyze", "lipsync", "transcribe", "audio.generate"]
 
 # (capability, purpose) -> route。model/base_url/api_key 存 settings 的字段名，运行时解析，不落明文。
 # provider/client 仅内部与日志用，不出现在客户对话。凭证字段全部映射 config.py（唯一 API 真相源）。
@@ -32,13 +33,17 @@ ROUTES = {
     # —— 文本 / 多模态脑（gpt hub 503 抖动、grok degraded → 暂移出；agnes 默认、mimo 备选，二者实测稳）——
     ("text.complete", "agnes"):     {"provider": "agnes",  "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
     ("text.complete", "mimo"):      {"provider": "mimo",   "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "MIMO_BASE_URL",    "api_key": "MIMO_API_KEY",    "model": None}},
-    ("text.complete", "zexapi"):    {"provider": "zexapi", "client": "openai_compat",      "fn": "chat",                "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": None}},
+    # 2026-10-04 删掉两条：("text.complete","zexapi") 与 ("text.complete","qwen38max")
+    # —— 连测 3 轮全不通（zexapi 聊天分组无可用渠道 503；阿里百炼整把 key 欠费 Arrearage，管理台早已屏蔽）。
+    # 留着只会让人以为"换条 purpose 就能兜底"。欠费/无渠道修好后要加回来，先看 ADR 的下线记录。
+    # —— 2026-10-04 定：gpt 系【只认 hub.nocannobb】，下面两条就是全部 gpt 腿。
     # —— 2026-10-01 全中转实测后补的推理脑（模型名集中在 config，.env 可覆盖）——
     ("text.complete", "gemini38"):  {"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_GEMINI38"}},
     ("text.complete", "claude48"):  {"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_CLAUDE48"}},
     ("text.complete", "deepseekv4"):{"provider": "zexapi",     "client": "openai_compat", "fn": "chat", "fields": {"base_url": "OMNI_BASE_URL",           "api_key": "OMNI_API_KEY",    "model": "TEXT_MODEL_DEEPSEEKV4"}},
     ("text.complete", "gpt61"):     {"provider": "nocannobb",  "client": "openai_compat", "fn": "chat", "fields": {"base_url": "GPT55_BASE_URL",          "api_key": "GPT55_API_KEY",   "model": "TEXT_MODEL_GPT61"}},
-    ("text.complete", "qwen38max"): {"provider": "dashscope",  "client": "openai_compat", "fn": "chat", "fields": {"base_url": "DASHSCOPE_CHAT_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "TEXT_MODEL_QWEN38MAX"}},
+    # 同一个 hub 的第二把 key 走这条（2026-10-04）：不复用 GPT55_API_KEY，免得换密钥把 gpt61 那条弄死
+    ("text.complete", "gpt56"):     {"provider": "nocannobb",  "client": "openai_compat", "fn": "chat", "fields": {"base_url": "GPT55_BASE_URL",          "api_key": "GPT56_API_KEY",   "model": "TEXT_MODEL_GPT56"}},
     ("text.complete", "mimo_pro"):  {"provider": "mimo",       "client": "openai_compat", "fn": "chat", "fields": {"base_url": "MIMO_BASE_URL",           "api_key": "MIMO_API_KEY",    "model": "TEXT_MODEL_MIMO_PRO"}},
     # —— 看图 / 看视频（多模态理解）——
     ("video.analyze", "default"):   {"provider": "agnes",  "client": "agnes",              "fn": "analyze_media",       "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_TEXT_MODEL"}},
@@ -51,6 +56,12 @@ ROUTES = {
     ("image.generate", "generic"):  {"provider": "image2",   "client": "image2_client",        "fn": "Image2Client.text_to_image_sync", "fields": {"base_url": "IMAGE2_BASE_URL",  "api_key": "IMAGE2_API_KEY",  "model": None}},
     # zexapi nano_banana（/v1/videos 提交轮询·同 omni 形·复用 OMNI 凭证）——已实现，见 call() 的 nano 分支
     ("image.generate", "nano"):     {"provider": "zexapi",   "client": "omni_client", "fn": "submit_omni_task(model=nano_banana_pro-2K)", "fields": {"base_url": "OMNI_BASE_URL",  "api_key": "OMNI_API_KEY",  "model": None}},
+    # —— 网页/CLI 型生图（没有 api_key，靠登录态；网关仍然预扣/结算/审计，只是这一条腿走子进程）——
+    # doubao: subprocess 调 video-ui 的 `doubao.py gen`（Playwright 驱动本机 Chrome）；gflow: `gflow image t2i|i2i --json`
+    ("image.generate", "doubao"):   {"provider": "doubao-web", "client": "VIDEO_UI_ROOT/doubao.py", "fn": "gen --ref --out --model",
+                                     "fields": {"base_url": None, "api_key": None, "model": "DOUBAO_IMAGE_MODEL"}},
+    ("image.generate", "gflow"):    {"provider": "gflow-cli", "client": "GFLOW_EXE", "fn": "image t2i|i2i --json",
+                                     "fields": {"base_url": None, "api_key": None, "model": "GFLOW_IMAGE_MODEL"}},
     # —— 图片编辑 / 换脸（真实入口 video_face_swap.run_face_swap:53，分段+on_log，也是流水线级）——
     ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "run_face_swap", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     # —— 生视频 ——
@@ -61,13 +72,17 @@ ROUTES = {
     ("video.generate", "agnes-v"):       {"provider": "agnes",    "client": "agnes_video_client", "fn": "create_flash_task", "fields": {"base_url": "AGNES_BASE_URL",   "api_key": "AGNES_API_KEY",   "model": "AGNES_VIDEO_FLASH_MODEL"}},
     ("video.generate", "clone-r2v"):     {"provider": "wan3",     "client": "wan3_client",        "fn": "run_one_segment",   "fields": {"base_url": "RUNNINGHUB_WAN3_BASE_URL", "api_key": "RUNNINGHUB_WAN3_API_KEY", "model": None}},
     ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无现成 client·要照 dashscope 视频生成协议新写)", "fn": "-", "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
-    ("video.generate", "h3"):            {"provider": "manxue",   "client": "manxue_h3_client",   "fn": "generate_video",    "fields": {"base_url": "MANXUE_H3_BASE_URL", "api_key": "MANXUE_H3_API_KEY", "model": "MANXUE_H3_MODEL"}},
+    ("video.generate", "h3"):            {"provider": "runninghub", "client": "h3_director_client", "fn": "submit_h3_director+poll_and_download", "fields": {"base_url": "RUNNINGHUB_H3_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     ("video.generate", "motion"):        {"provider": "runninghub","client": "runninghub_client", "fn": "submit_motion_transfer+poll_task_until_done","fields": {"base_url": "RUNNINGHUB_MOTION_WAN22_BASE_URL", "api_key": "RUNNINGHUB_MOTION_WAN22_API_KEY", "model": None}},
     # —— 对口型（真实码在流水线模块里，非独立 client；run_lip_sync 吃本地路径、无 api_key 形参=流水线级）——
     ("lipsync", "default"):         {"provider": "runninghub", "client": "video_translate_pipeline", "fn": "run_lip_sync",  "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_LIPSYNC_API_KEY", "model": None}},
     ("lipsync", "vo"):              {"provider": "runninghub", "client": "voiceover_replace", "fn": "_run_lipsync_workflow(私有,接前先提公开入口)","fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     # —— 转写（本地 ASR，免费，零密钥：FunASR paraformer-zh → faster_whisper 回退；仓库里没有 whisperx）——
     ("transcribe", "asr"):          {"provider": "local-asr", "client": "video_translate_pipeline", "fn": "run_asr", "fields": {"base_url": None, "api_key": None, "model": None}},
+    # —— 音频生成（火山引擎·豆包语音 seed-audio：一条请求同时出【音效+配乐+多角色配音】）——
+    # 鉴权是 X-Api-Key 头（不是 Bearer）；成功回二进制音频体 ⇒ 必须给 output_path 落盘，别只回链接。
+    ("audio.generate", "seed-audio"): {"provider": "bytedance-audio", "client": "gateway._seed_audio", "fn": "POST /api/v3/tts/create",
+                                       "fields": {"base_url": "BYTEDANCE_AUDIO_BASE_URL", "api_key": "BYTEDANCE_AUDIO_API_KEY", "model": "BYTEDANCE_AUDIO_MODEL"}},
 }
 
 DEFAULT_PURPOSE = {
@@ -78,11 +93,14 @@ DEFAULT_PURPOSE = {
     "video.analyze": "default",
     "lipsync": "default",
     "transcribe": "asr",
+    "audio.generate": "seed-audio",
 }
 
 # provider 默认模型名（route 未带 model 字段时兜底，避免把 A 家模型名发给 B 家端点）
-_MODEL_FALLBACK = {"agnes": "agnes-3.0-flash", "mimo": "mimo-v2.5", "gpt": "gpt-5.6-sol", "openai": "gpt-5.6-sol", "zexapi": "gemini-3.5-flash",
-                   "nocannobb": "gpt-6.1-sol", "dashscope": "qwen3.8-max", "manxue": "deepseek-v4-pro"}
+# 2026-10-04 清掉三个死条目：gpt / openai / manxue —— 没有任何路由再用这些 provider，
+# 留着等于宣称"有兜底"，实际一调就 RouteError。（gpt 系现在只有 nocannobb 两条腿。）
+_MODEL_FALLBACK = {"agnes": "agnes-3.0-flash", "mimo": "mimo-v2.5", "zexapi": "gemini-3.5-flash",
+                   "nocannobb": "gpt-6.1-sol", "dashscope": "qwen3.8-max"}
 
 # ⚠️ 必须带浏览器 User-Agent：hub.nocannobb.com 这类 Cloudflare 前置的中转对无 UA 的脚本请求回
 #    403 error code: 1010（带 UA 即 200）。之前我把这个当成"key 坏了"，是误判（见 ADR）。
@@ -139,19 +157,28 @@ def safe_summary(r: dict) -> dict:
 PRICE_ROUTES = {
     ("text.complete", "agnes"): 1, ("text.complete", "mimo"): 1,
     # 推理脑按 2026-10-01 实测 token 量分档（约 100 tok ≈ 1 分；思考型模型预算要留足）
-    ("text.complete", "gpt61"): 1, ("text.complete", "qwen38max"): 2, ("text.complete", "claude48"): 2,
+    ("text.complete", "gpt61"): 1, ("text.complete", "claude48"): 2,
+    # gpt-5.6-sol 这条：整条单价只当报价，真扣按 token 结算（同族同档取 1 分）
+    ("text.complete", "gpt56"): 1,
     ("text.complete", "mimo_pro"): 3, ("text.complete", "gemini38"): 6, ("text.complete", "deepseekv4"): 7,
     ("video.analyze", "default"): 6, ("video.analyze", "mimo"): 6,
     ("image.generate", "default"): 4, ("image.generate", "detail"): 8, ("image.generate", "generic"): 4, ("image.generate", "nano"): 4,
+    # 网页/CLI 两条腿：我方账本先记 0（不谎报扣费）。豆包网页版不花钱；gflow 烧的是 Google Flow 额度，
+    # 那是【另一个账户的配额】不是我方现金 ⇒ 等"1 元=几分"定了再一起补价。
+    ("image.generate", "doubao"): 0, ("image.generate", "gflow"): 0,
     ("image.edit", "faceswap"): 20,
     ("video.generate", "omni-t2v"): 40, ("video.generate", "agnes-v"): 30, ("video.generate", "clone-r2v"): 50,
     ("video.generate", "seedance-2.5"): 60, ("video.generate", "seedance-2.0"): 50,
     ("video.generate", "wan3-dashscope"): 50, ("video.generate", "h3"): 60, ("video.generate", "motion"): 50,
     ("lipsync", "default"): 20, ("lipsync", "vo"): 24,
     ("transcribe", "asr"): 0,   # 本地 ASR 免费
+    # ⚠️ 音频这条是【分/千字】不是分/条（上游按字符计费）。0 = 还没实测单价、也没定"1 元=几分"，
+    #    所以先记 0 分：能跑通链路、不谎报扣费。定价后改 model_prices.json 的这一个数即可，不用动代码。
+    ("audio.generate", "seed-audio"): 0,
 }
 PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
-                "video.generate": 40, "video.analyze": 6, "lipsync": 20, "transcribe": 0}
+                "video.generate": 40, "video.analyze": 6, "lipsync": 20, "transcribe": 0,
+                "audio.generate": 0}
 
 # ---- 可外置配置：价目 + 每能力默认路由 → model_prices.json（改价/换默认供应商=改这个文件，不动代码）----
 # 文件按 mtime 懒加载（面板保存后下一次调用即生效）；缺失或损坏则回落上面两张内置表，绝不让管线跑不动。
@@ -243,6 +270,10 @@ def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
     if capability == "video.generate":
         dur = int((params or {}).get("duration", 10))
         est = base * max(1, (dur + 9) // 10)   # 每 10s 一个单位
+    if capability == "audio.generate":
+        # 上游按字符计费 ⇒ 单价是"分/千字"，一条请求向下取整到 1 个千字单位（100 字也按 1 千字算）
+        text = str((params or {}).get("prompt") or (params or {}).get("text_prompt") or "")
+        est = base * max(1, -(-len(text) // 1000))
     return {"capability": capability, "purpose": purpose, "unit_price": base,
             "credits_estimate": est, "ledger": "STUB", "note": "TODO 3.0: weeksir.com 预扣/回滚/流水"}
 
@@ -326,7 +357,9 @@ _LIVE_CHAT = {"text.complete", "video.analyze"}
 _ADAPTED = {("text.complete", "*"), ("video.analyze", "*"),
             ("image.generate", "default"), ("image.generate", "nano"),
             ("video.generate", "omni-t2v"), ("video.generate", "seedance-2.5"),
-            ("video.generate", "seedance-2.0"), ("video.generate", "agnes-v")}
+            ("video.generate", "seedance-2.0"), ("video.generate", "agnes-v"),
+            ("video.generate", "h3"), ("audio.generate", "seed-audio"),
+            ("image.generate", "doubao"), ("image.generate", "gflow")}
 
 
 def is_adapted(capability: str, purpose: str) -> bool:
@@ -347,6 +380,38 @@ def test_route(capability: str, purpose: str) -> dict:
     if r["provider"].startswith("local"):
         return {"provider": r["provider"], "model": r["model"] or "(本地)", "status": "local",
                 "detail": "本地引擎·无需密钥，不在 HTTP 探活范围（要用得实跑）", "ms": None}
+    if r["provider"] == "gflow-cli":
+        # 网页/CLI 型腿没有密钥可验，能验的是【登录态】。auth status 是 gflow 自己的只读检查
+        # （不开浏览器、不烧额度），video-ui 的状态接口用的就是它。
+        exe = _get("GFLOW_EXE") or ""
+        if not _os.path.isfile(exe):
+            return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": "config-error",
+                    "detail": "GFLOW_EXE 不存在：%s（没装就 pip install gflow-cli，或把路径配进 .env）" % exe, "ms": None}
+        code, so, se, why = _run_cli(exe, ["auth", "status"], 30.0)
+        if why:
+            return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": "unreachable",
+                    "detail": why, "ms": None}
+        return {"provider": r["provider"], "model": r["model"] or "(默认)",
+                "status": "live-ok" if code == 0 else "auth-fail",
+                "detail": ("Google 会话在（auth status 0）" if code == 0
+                           else "没登录：跑 gflow auth login") + " | " + _tail(so or se, n=160), "ms": None}
+    if r["provider"] == "doubao-web":
+        py, root = _get("DOUBAO_PYTHON"), _get("VIDEO_UI_ROOT")
+        script, state = _os.path.join(root or "", "doubao.py"), _os.path.join(root or "", "doubao_state.json")
+        miss = [n for n, p in (("DOUBAO_PYTHON", py), ("doubao.py", script)) if not (p and _os.path.isfile(p))]
+        if miss:
+            return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": "config-error",
+                    "detail": "缺 %s（网页腿要装 playwright 的那个解释器 + video-ui 的 doubao.py）" % "/".join(miss),
+                    "ms": None}
+        code, so, se, why = _run_cli(py, ["-c", "import playwright"], 60.0)
+        if code != 0:
+            return {"provider": r["provider"], "model": r["model"] or "(默认)", "status": "config-error",
+                    "detail": "那个解释器 import playwright 失败：%s" % (why or _tail(se, so, n=160)), "ms": None}
+        logged = _os.path.isfile(state)
+        return {"provider": r["provider"], "model": r["model"] or "(默认)",
+                "status": "reachable" if logged else "auth-fail",
+                "detail": ("登录态文件在（%s）；真通不通要实跑一条" % _os.path.basename(state) if logged
+                           else "没登录态：python doubao.py login 手动登一次"), "ms": None}
     if not r["api_key"] or not r["base_url"]:
         return {"provider": r["provider"], "model": r["model"] or "(默认)",
                 "status": "no-creds", "detail": "密钥或 base_url 未配置", "ms": None}
@@ -553,6 +618,328 @@ def _dig(obj, keys, depth: int = 0):
     return None
 
 
+# ---- 网页/CLI 型生图腿（豆包网页版 / Google Flow 命令行）----
+# 两条腿都没有 API key，只有【一个登录态】：豆包=本机 Chrome profile，gflow=一个 Google 会话，
+# 而且都是驱动网页（Playwright / ui_automation）。并发两条会去抢同一个浏览器 ⇒ 网关这里串行化。
+_BROWSER_LOCK = _threading.Lock()
+
+
+def _run_cli(exe, args, timeout=300.0, cwd=None, env=None):
+    """跑一条外部命令（绝不走 shell：参数是数组，防提示词里的引号/反引号变成命令）。
+
+    返回 (exit_code|None, stdout, stderr, why)。FileNotFoundError / 超时都翻译成可读原因，
+    不抛出去 —— 抛出去会让 invoke() 回滚预扣但调用方只看到 500。
+    """
+    import subprocess
+    e = dict(_os.environ)
+    e["PYTHONIOENCODING"] = "utf-8"
+    e["GFLOW_CLI_UPDATE_CHECK"] = "0"        # 新版提示会混进 stdout，把 --json 污染成解析失败
+    if env:
+        e.update(env)
+    try:
+        p = subprocess.run([str(exe)] + [str(a) for a in args], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=float(timeout),
+                           cwd=cwd or None, env=e)
+        return p.returncode, p.stdout or "", p.stderr or "", None
+    except FileNotFoundError:
+        return None, "", "", "找不到可执行文件: %s" % exe
+    except _os.error as e2:
+        return None, "", "", "启动失败 %s: %s" % (type(e2).__name__, str(e2)[:200])
+    except Exception as e2:                                  # 含 subprocess.TimeoutExpired
+        if type(e2).__name__ == "TimeoutExpired":
+            return None, "", "", "超时 %ss（网页型通道本来就慢，可给 timeout 加大）" % timeout
+        return None, "", "", "%s: %s" % (type(e2).__name__, str(e2)[:200])
+
+
+def _tail(*parts, n=260):
+    text = " | ".join(str(p).strip() for p in parts if p and str(p).strip())
+    return text[-n:]
+
+
+def _doubao_image(prompt, out_path, refs=None, model="", timeout=300.0, headless=False,
+                  win_pos="", win_size="") -> dict:
+    """豆包网页版生图（Seedream）：subprocess 调 video-ui 里的 `doubao.py gen`。
+
+    headless=True 走 Chrome【新版无头】（Playwright 1.61 + channel=chrome，真渲染，和老
+    headless 不是一回事）—— 2026-10-04 之前 doubao.py 的 launch() 在有登录态时硬编码有头，
+    传什么都不算；那行已放开，所以这里 honored 不再看登录态文件在不在。
+    win_pos/win_size = 有头时把窗口挪到屏内角落（不挡人）。⚠️ 只能屏内：挪出屏幕=未渲染=掉登录。
+    它只落盘、不回 URL，所以 output_path 必填。
+    """
+    import time
+    py, root = _get("DOUBAO_PYTHON"), _get("VIDEO_UI_ROOT")
+    script = _os.path.join(root, "doubao.py") if root else ""
+    if not (py and _os.path.isfile(py)):
+        return {"success": False, "error": "DOUBAO_PYTHON 不存在：这条要指向【装了 playwright 的解释器】"
+                                           "（= 跑 video-ui 那个），不是网关所在的 .venv：%s" % py}
+    if not _os.path.isfile(script or ""):
+        return {"success": False, "error": "VIDEO_UI_ROOT/doubao.py 找不到：%s" % script}
+    if not str(prompt or "").strip():
+        return {"success": False, "error": "image.generate 缺 prompt"}
+    if not out_path:
+        return {"success": False, "error": "豆包生图必须给 output_path（它只落盘，不回 URL）"}
+    bad = [str(r) for r in (refs or []) if not _os.path.isfile(str(r))]
+    if bad:
+        return {"success": False, "error": "参考图必须是本机存在的文件（不收公网 URL）：%s" % ", ".join(bad[:3])}
+    args = [script, "gen", prompt, "--out", out_path,
+            "--model", model or _get("DOUBAO_IMAGE_MODEL") or "Seedream 4.5"]
+    for r in refs or []:
+        args += ["--ref", str(r)]
+    if not headless:
+        args.append("--headed")
+    env = {}
+    if win_pos:
+        env["DOUBAO_WIN_POS"] = str(win_pos)
+    if win_size:
+        env["DOUBAO_WIN_SIZE"] = str(win_size)
+    t = time.time()
+    with _BROWSER_LOCK:
+        code, so, se, why = _run_cli(py, args, timeout, cwd=root, env=env or None)
+    ms = round((time.time() - t) * 1000)
+    ok = code == 0 and _os.path.isfile(out_path) and _os.path.getsize(out_path) > 1024
+    if why and "超时" in why:
+        # 超时不一定是"慢"。Playwright 每步都往 _doubao_probe 写现场截图：gen_05_sent 是本次
+        # 新写的 ⇒ 提示词已经发出去了、卡在等回图，那个位置最常见的就是图形验证码（实测）。
+        sent = _os.path.join(root, "_doubao_probe", "gen_05_sent.png")
+        if _os.path.isfile(sent) and _os.path.getmtime(sent) > t:
+            why += "；但现场截图 gen_05_sent.png 是本次新写的 ⇒ 提示词已发出、卡在等回图，" \
+                   "这个位置实测多半是豆包的图形验证码（无头尤其容易被拦）"
+    return {"success": ok, "path": out_path if ok else None,
+            "bytes": _os.path.getsize(out_path) if _os.path.isfile(out_path) else 0,
+            "model": args[args.index("--model") + 1], "ms": ms, "exit_code": code,
+            "headless": bool(headless), "window": (win_pos or win_size) and "%s/%s" % (win_pos, win_size) or "默认",
+            "error": None if ok else (why or "豆包这条没落到文件。两种已知形态：① 登录态掉了（跑 "
+                                             "python doubao.py login 重登）；② 【豆包弹了图形验证码】—— "
+                                             "2026-10-04 实测无头跑到『发送提示词』成功、随后被"
+                                             "『请选择所有符合上文描述的图片并拖拽』的验证窗口挡住，"
+                                             "于是一直等到超时，所以这条默认有头。现场截图看 "
+                                             "VIDEO_UI_ROOT/_doubao_probe/gen_05_sent.png。上游原文：%s"
+                                      % _tail(se, so))}
+
+
+def _gflow_image(prompt, out_path, refs=None, model="", aspect="9:16", project="", timeout=300.0,
+                 headless=False) -> dict:
+    """Google Flow 生图（Imagen / Nano Banana）：subprocess 调 `gflow image t2i|i2i --json`。
+
+    给了参考图就走 i2i；`--project` 只在单条提示词时有效（多提示词 gflow 自己限制）。
+    gflow 把文件写进 `--out` 目录并自己命名，所以先按 --json 里的路径找，找不到就取该目录里
+    本次新生成的最新 png，再挪到调用方要的 output_path。
+    ⚠️ 默认有头，但 headless 不是变量：2026-10-04 无头/有头各跑一次，两边都进了 Flow 项目页、
+    UI 逐字段相同，都退 `WafRejectionError`(exit 10)。上游给的定性是
+    `Flow's bot check scored this browser profile as unusual activity … nothing was charged`
+    （KNOWN_ISSUES:PUBLIC_ERROR_UNUSUAL_ACTIVITY）—— 被打分的是 gflow 那个 Playwright profile，
+    不是账号：`gflow auth status` 当场验过会话有效，且同一账号在浏览器里能正常出图。
+    换 project、换提示词都试过，同样拒 ⇒ 解法只有"等几小时"或"换 profile"（gflow auth login 新建）。
+    """
+    import glob
+    import shutil
+    import time
+    exe = _get("GFLOW_EXE") or ""
+    if not _os.path.isfile(exe):
+        import shutil as _sh
+        exe = _sh.which("gflow") or ""
+    if not exe:
+        return {"success": False, "error": "gflow 可执行文件找不到（GFLOW_EXE 没配对，或没 pip 装 gflow-cli）"}
+    if not str(prompt or "").strip():
+        return {"success": False, "error": "image.generate 缺 prompt"}
+    if not out_path:
+        return {"success": False, "error": "gflow 生图必须给 output_path（Flow 侧链接会过期）"}
+    refs = [str(r) for r in (refs or []) if r]
+    bad = [r for r in refs if not _os.path.isfile(r)]
+    if bad:
+        return {"success": False, "error": "gflow 的 --ref 要本机文件路径（它自己负责上传）：%s" % ", ".join(bad[:3])}
+    out_dir = _os.path.dirname(_os.path.abspath(out_path)) or _os.getcwd()
+    _os.makedirs(out_dir, exist_ok=True)
+    mode = "i2i" if refs else "t2i"
+    before = set(glob.glob(_os.path.join(out_dir, "*.png")))
+    t = time.time()
+    env = {"GFLOW_CLI_HEADLESS": "true" if headless else "false"}
+    with _BROWSER_LOCK:
+        code, so, se, why = _run_cli(exe, ["auth", "status"], 30.0, env=env)      # 先验登录态，别白跑一条生成
+        if code != 0:
+            return {"success": False, "error": "gflow 没登录（auth status 退 %s）：跑 gflow auth login：%s"
+                                                % (code, _tail(se, so))}
+        args = ["image", mode, prompt, "--model", model or _get("GFLOW_IMAGE_MODEL") or "nano2",
+                "--aspect", aspect or "9:16", "--out", out_dir, "--json"]
+        for r in refs:
+            args += ["--ref", r]
+        proj = project or _get("GFLOW_PROJECT")
+        if proj and not refs:
+            args += ["--project", proj]
+        code, so, se, why = _run_cli(exe, args, timeout, env=env)
+    ms = round((time.time() - t) * 1000)
+    if code != 0:
+        return {"success": False, "error": "gflow image %s 退 %s：%s" % (mode, code, _tail(se, so)),
+                "exit_code": code, "headless": headless, "ms": ms}
+    found = None
+    try:
+        import json as _j
+        found = _dig(_j.loads(so), ("path", "file", "output_path", "local_path", "dest", "saved"))
+    except Exception:
+        found = None                                      # 版本差异导致 --json 形变了：走目录扫描兜底
+    if not (found and _os.path.isfile(str(found))):
+        fresh = [p for p in glob.glob(_os.path.join(out_dir, "*.png")) if p not in before]
+        found = max(fresh, key=_os.path.getmtime) if fresh else None
+    if not found or not _os.path.isfile(str(found)):
+        return {"success": False, "error": "gflow 回 0 但没找到落盘文件：%s" % _tail(so, se), "ms": ms}
+    src = str(found)
+    if _os.path.abspath(src) != _os.path.abspath(out_path):
+        try:
+            shutil.copy2(src, out_path)
+        except OSError as e:
+            return {"success": False, "error": "gflow 出图了但挪不到你要的路径 %s: %s" % (out_path, e),
+                    "source": src, "ms": ms}
+    return {"success": True, "path": out_path, "source": src, "bytes": _os.path.getsize(out_path),
+            "model": args[args.index("--model") + 1], "mode": "image " + mode, "ms": ms,
+            "headless": headless, "exit_code": code, "error": None}
+
+
+def _seed_audio(base_url: str, api_key: str, text: str, out_path: str | None = None,
+                model: str = "seed-audio-1.0", fmt: str = "mp3", sample_rate: int = 48000,
+                pitch_rate: int = 0, speech_rate: int = 0, loudness_rate: int = 0,
+                timeout: float = 300.0) -> dict:
+    """火山引擎·豆包语音「音频生成」非流式：一条请求同时出音效+配乐+多角色配音。
+
+    与其余适配器不同的两点，都是实测/文档口径逼出来的：
+      1) 鉴权是 `X-Api-Key` 头，不是 `Authorization: Bearer`（401 时再按 Bearer 重试一次，
+         这样文档口径变了也不用改代码，结果里回 `auth` 说明哪条通的）；
+      2) 成功回的是【二进制音频体】而不是链接 ⇒ 不落盘就等于没拿到（上游不留档）。
+    """
+    import base64 as _b64
+    import json as _json
+    import time
+    import urllib.error
+    import urllib.request
+    if not (base_url and api_key):
+        return {"success": False, "error": "缺 BYTEDANCE_AUDIO_BASE_URL/API_KEY"}
+    if not str(text or "").strip():
+        return {"success": False, "error": "audio.generate 缺 prompt（这条上游的报错文案会误导成参数问题，先本地拦）"}
+    if not out_path:
+        return {"success": False, "error": "audio.generate 必须给 output_path（成功回二进制音频体，不落盘就没了）"}
+    payload = {"model": model, "text_prompt": text,
+               "audio_config": {"format": fmt, "sample_rate": int(sample_rate), "pitch_rate": int(pitch_rate),
+                                "speech_rate": int(speech_rate), "loudness_rate": int(loudness_rate)},
+               "watermark": {}}
+    body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    url = base_url.rstrip("/") + "/api/v3/tts/create"
+    t = time.time()
+    data = ctype = None
+    used = "x-api-key"
+    for attempt, headers in enumerate((
+            {"Content-Type": "application/json", "X-Api-Key": api_key},
+            {"Content-Type": "application/json", "Authorization": "Bearer " + api_key})):
+        used = "bearer" if attempt else "x-api-key"
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                data = r.read()
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if e.code in (401, 403) and attempt == 0:
+                continue                          # 只换鉴权形再试一次，不重投计费请求
+            return {"success": False, "error": "HTTP %d: %s" % (e.code, detail), "http_status": e.code}
+        except Exception as e:
+            return {"success": False, "error": "%s: %s" % (type(e).__name__, str(e)[:260])}
+    if data is None:
+        return {"success": False, "error": "两次鉴权都没回内容"}
+    ms = round((time.time() - t) * 1000)
+    if "json" in ctype:                             # 有的区域/版本回 JSON：里面要么 base64 要么链接
+        try:
+            obj = _json.loads(data.decode("utf-8", "replace"))
+        except Exception:
+            return {"success": False, "error": "Content-Type 是 json 但解析不了: %s" % data[:200]}
+        b64 = _dig(obj, ("data", "audio", "audio_data", "base64", "b64_json"))
+        link = _dig(obj, ("url", "audio_url", "file_url", "download_url"))
+        raw = None
+        if isinstance(b64, str) and b64:
+            try:
+                raw = _b64.b64decode(b64)
+            except Exception:
+                raw = None
+        if raw is None and isinstance(link, str) and link.startswith("http"):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(link, headers={"User-Agent": BROWSER_UA}),
+                                            timeout=timeout) as r:
+                    raw = r.read()
+            except Exception as e:
+                return {"success": False, "error": "JSON 给了链接但下载失败 %s: %s" % (type(e).__name__, str(e)[:200]),
+                        "url": link, "ms": ms}
+        if not raw:
+            return {"success": False, "error": "上游回 200 但没音频字段：%s" % str(obj)[:240], "ms": ms}
+        data = raw
+    if len(data) < 128:
+        return {"success": False, "error": "音频体只有 %d 字节，判失败（不落假成功）" % len(data), "ms": ms}
+    try:
+        parent = _os.path.dirname(_os.path.abspath(out_path))
+        if parent:
+            _os.makedirs(parent, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        return {"success": False, "error": "写盘失败 %s: %s" % (type(e).__name__, e)}
+    return {"success": True, "path": out_path, "bytes": len(data), "content_type": ctype or "audio/" + fmt,
+            "chars": len(text), "model": model, "auth": used, "ms": ms, "error": None}
+
+
+def _h3_payload(params: dict):
+    """把网关的标准参数拼成 H3 导演台的一段输入，返回 (segments, task_type, error)。
+
+    形态由【给了哪些参考】决定，不靠调用方记参数名：
+      视频 + 图片 ⇒ rv2v（视频出动作、图片换主体——"动作照原片、鞋换新鞋"就是这条）
+      只有视频    ⇒ v2v
+      图片 ≥2     ⇒ r2v ｜ 图片 1 张 ⇒ i2v（首帧）｜ 都没有 ⇒ t2v
+    H3 导演台只吃【本地文件】：提交时由 client 上传换 fileName，公网 URL 会在 client 里炸成
+    FileNotFoundError（那是我们的错，不该让上游替我们报 400）。
+    """
+    refs = [str(p) for p in (params.get("image_paths") or []) if str(p).strip()]
+    vids = [str(p) for p in (params.get("video_paths") or []) if str(p).strip()]
+    for x in vids + refs:
+        if x.startswith(("http://", "https://")):
+            return None, None, ("H3 的 image_paths/video_paths 只收本地文件，这里收到公网 URL：%s"
+                                "（先用 /uploads 落地再提交）" % x[:80])
+        if not _os.path.isfile(x):
+            return None, None, "H3 参考文件不存在：%s" % x[:120]
+    if len(vids) > 3:
+        return None, None, "H3 参考视频最多 3 条（上游端口表），这次给了 %d 条" % len(vids)
+    if len(refs) > 9:
+        return None, None, "H3 参考图片最多 9 条（上游端口表），这次给了 %d 条" % len(refs)
+    # fl2v 首尾帧：显式 startImage + endImage 路径（尾帧继承链用）
+    sp, ep = str(params.get("start_image") or "").strip(), str(params.get("end_image") or "").strip()
+    for x in (sp, ep):
+        if x and not _os.path.isfile(x):
+            return None, None, "H3 首尾帧文件不存在：%s" % x[:120]
+    seg = {"durationSec": float(params.get("duration") or 5), "prompt": params["prompt"],
+           "negativePrompt": params.get("negative_prompt") or "bad video"}
+    if sp:
+        seg["startImagePath"] = sp
+        refs = [r for r in refs if r != sp]
+    if ep:
+        seg["endImagePath"] = ep
+        refs = [r for r in refs if r != ep]
+    if vids:
+        seg["referenceVideoPath"] = vids[0]
+        if len(vids) > 1:
+            seg["refVideoPaths"] = vids[1:]
+        if refs:
+            seg["refImagePaths"] = refs
+        ttype = params.get("task_type") or ("rv2v" if refs else "v2v")
+    elif sp or ep:
+        ttype = params.get("task_type") or "fl2v"
+        if refs:
+            seg["refImagePaths"] = refs
+    elif len(refs) >= 2:
+        seg["refImagePaths"] = refs
+        ttype = params.get("task_type") or "r2v"
+    elif refs:
+        seg["startImagePath"] = refs[0]
+        ttype = params.get("task_type") or "i2v"
+    else:
+        ttype = params.get("task_type") or "t2v"
+    return [seg], ttype, None
+
+
 def call(capability: str, purpose: str | None = None, **params) -> dict:
     """能力级分发：调用方只给能力名+标准参数，本层按路由注入 model/凭证并转调现有 client。
 
@@ -606,6 +993,50 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
             path = asyncio.run(agnes_v.download_file(url, params["output_path"]))
         return {"success": bool(url), "url": url, "path": path, "job_id": vid,
                 "error": None if url else "Agnes 回成功了但既没文件也没 URL：%s" % str(done)[:200]}
+
+    if capability == "video.generate" and r["purpose"] == "h3":
+        # RunningHub H3 导演台（ComfyUI 工作流）。工作流号从 .env 取（实测出片那条 = 2095474072795865090）。
+        # 🔴 上游按 GPU 秒**真扣钱**（plus/48G 实例），不是 agnes 那种免费档；链接 24 小时失效 ⇒ 必须落盘。
+        # 不直接用 h3_director_client.generate_video：它内部 submit+poll 但不回 taskId，失败就没法查上游（"别让人盲跑"这条不能破）。
+        import asyncio
+        from backend.services import h3_director_client as h3d
+        from backend.services.runninghub_client import RunningHubClient
+        if params.get("image_urls"):
+            return {"success": False, "error": "H3 导演台吃的是本地文件（提交时上传拿 fileName），不支持公网 URL；"
+                                               "先把参考图落到本地路径再用 image_paths"}
+        if not str(params.get("prompt") or "").strip():
+            return {"success": False, "error": "H3 缺 prompt（上游这类拒绝的文案会误导成参数问题，先本地拦）"}
+        out = params.get("output_path")
+        if not out:
+            return {"success": False, "error": "H3 必须给 output_path（上游链接 24 小时就失效）"}
+        segs, ttype, err = _h3_payload(params)
+        if err:
+            return {"success": False, "error": err}
+        try:
+            sub = asyncio.run(h3d.submit_h3_director(
+                task_type=ttype, segments=segs,
+                width=int(params.get("width") or 576), height=int(params.get("height") or 1024),
+                global_prompt=params.get("global_prompt") or params["prompt"],
+                seed=int(params.get("seed") or 0)))
+        except Exception as e:
+            return {"success": False, "error": "H3 提交失败 %s: %s" % (type(e).__name__, str(e)[:300])}
+        tid = sub.get("taskId")
+        if not tid:
+            return {"success": False, "error": "H3 提交没回 taskId：%s" % str(sub)[:200]}
+        try:
+            path = asyncio.run(h3d.poll_and_download(tid, out, timeout=float(params.get("poll_timeout") or 2400)))
+        except Exception as e:
+            return {"success": False, "job_id": tid,
+                    "error": "H3 %s: %s（可据此查上游任务）" % (type(e).__name__, str(e)[:260])}
+        url = ""
+        try:                       # 补一次查询只为拿回链接；拿不到不影响成片已落盘
+            url = next((i.get("url", "") for i in (asyncio.run(RunningHubClient().query_task(tid)) or {}).get("results") or []
+                        if i.get("url")), "")
+        except Exception:
+            pass
+        return {"success": bool(path), "url": url, "path": path, "job_id": tid,
+                "workflow_id": sub.get("workflow_id"), "unet_type": sub.get("unet_type"),
+                "error": None if path else "H3 回成功了但没落到文件"}
 
     if capability == "video.analyze":
         return analyze_media(
@@ -666,6 +1097,36 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
             image_urls=params.get("image_urls") or params.get("images"),
             out_path=params.get("output_path"), poll_timeout=params.get("poll_timeout", 900),
         )
+    if capability == "image.generate" and r["purpose"] == "doubao":
+        return _doubao_image(
+            params.get("prompt") or params.get("text_prompt"),
+            out_path=params.get("output_path"),
+            refs=params.get("image_urls") or params.get("images") or params.get("refs"),
+            model=params.get("model") or r["model"] or "",
+            timeout=float(params.get("timeout") or 300),
+            headless=bool(params.get("headless")),
+            win_pos=str(params.get("win_pos") or ""), win_size=str(params.get("win_size") or ""))
+    if capability == "image.generate" and r["purpose"] == "gflow":
+        return _gflow_image(
+            params.get("prompt") or params.get("text_prompt"),
+            out_path=params.get("output_path"),
+            refs=params.get("image_urls") or params.get("images") or params.get("refs"),
+            model=params.get("model") or r["model"] or "",
+            aspect=params.get("aspect") or params.get("ratio") or "9:16",
+            project=params.get("project") or "",
+            headless=bool(params.get("headless", False)),
+            timeout=float(params.get("timeout") or 300))
+    if capability == "audio.generate" and r["purpose"] == "seed-audio":
+        text = params.get("prompt") or params.get("text_prompt")
+        return _seed_audio(
+            r["base_url"], r["api_key"], text,
+            out_path=params.get("output_path"),
+            model=params.get("model") or r["model"] or "seed-audio-1.0",
+            fmt=params.get("format") or params.get("fmt") or "mp3",
+            sample_rate=params.get("sample_rate", 48000),
+            pitch_rate=params.get("pitch_rate", 0), speech_rate=params.get("speech_rate", 0),
+            loudness_rate=params.get("loudness_rate", 0),
+            timeout=float(params.get("timeout") or 300))
     raise NotImplementedError(
         f"{capability}/{r['purpose']} 适配器待 ③ 后续切片接入（client={r['client']}.{r['fn']}）"
     )

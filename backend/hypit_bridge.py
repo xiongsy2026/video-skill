@@ -38,6 +38,9 @@ HYPIT_MODELS = {
     "seedance-2.0": ("video.generate", "seedance-2.0"),
     "seedance-2.5": ("video.generate", "seedance-2.5"),
     "omni-flash-10s": ("video.generate", "omni-t2v"),
+    # RunningHub H3 导演台（ComfyUI 工作流 v2v/i2v）；hypit provider.js model="mini" 映射到此。
+    # 参考图走 RunningHub 自家上传（本地文件 → fileName），吃 image paths，不吃公网 URL。
+    "h3": ("video.generate", "h3"),
 }
 # 本适配面真实能带的输入：只有图片参考（vinted/zexapi 都只吃 image_urls，且要公网可取 URL）。
 # 视频/音频参考带不过去 ⇒ 按 hypit 的规矩在 supports 里拒绝，绝不静默丢弃。
@@ -48,6 +51,32 @@ MAX_SECONDS = 10
 ALLOWED_SECONDS = tuple(float(x) for x in
                         (os.environ.get("HYPIT_ALLOWED_SECONDS") or "5").split(","))
 RESOLUTIONS = ("720p",)
+# 🔴 档位是【每条路由各自的事实】，不是一套全局值套所有模型（2026-10-03 定）：
+# provider.js 的 LANES 必须与这里逐条一致（scripts/check-runtime-bindings.py 钉着）——两边都在，
+# 是因为改了 provider 但还跑着的老 runtime 进程仍会发旧字段，服务端这一道才是花钱前的最后一闸。
+# aspects/last_frame 空 = 本路由兑现不了那个输入，宁可本地拒（0 分）也别提交后让上游乱扣。
+LANE_SPECS = {
+    "seedance-2-mini": {"seconds": None, "resolutions": RESOLUTIONS,
+                        "aspects": None, "last_frame": True, "refs": ("image",)},
+    "seedance-2.5": {"seconds": None, "resolutions": RESOLUTIONS,
+                     "aspects": None, "last_frame": True, "refs": ("image",)},
+    # h3 导演台有 v2v/rv2v 节点（client 的 referenceVideoPath/refImagePaths），所以【收视频参考】：
+    # 视频出动作、图片换主体。音频参考仍不收（这条路由没实测过带音频的形态）。
+    "h3": {"seconds": None, "resolutions": (), "aspects": ("9:16",), "last_frame": False,
+           "refs": ("image", "video")},
+    "omni-flash-10s": {"seconds": None, "resolutions": RESOLUTIONS,
+                       "aspects": None, "last_frame": True, "refs": ("image",)},
+}
+DEFAULT_SPEC = LANE_SPECS["seedance-2-mini"]
+
+
+def _lane_spec(model: str) -> dict:
+    """seconds=None ⇒ 跟随 ALLOWED_SECONDS（HYPIT_ALLOWED_SECONDS 可扩，验过才扩）。
+    某条路由要单独放时长就把它的 seconds 写成具体元组。"""
+    spec = dict(LANE_SPECS.get(str(model), DEFAULT_SPEC))
+    if spec["seconds"] is None:
+        spec["seconds"] = ALLOWED_SECONDS
+    return spec
 # hypit studio 的工作台端口（agent 起 `hypit studio --run X --port 5179`）。端口不给 HTTP 参数控制：
 # 这个探测口是 ACAO:* 的，能指定端口就等于给本机任意网页做端口扫描。
 STUDIO_PORT = int(os.environ.get("HYPIT_STUDIO_PORT") or 5179)
@@ -265,13 +294,41 @@ def _studio_served_path(port: int) -> str:
 
 
 # ══ 选了就给界面：把这条会话的工程用 studio 查看器打开（不让人敲命令行）════════════
+def _viewable(p: str) -> str:
+    """同一个工程，能渲染的那份优先：有 `assemble.svrun` 就用它替掉 `build.svrun`。
+
+    为什么必须替：生成工程里挂着异步腿，而 studio 的编辑期投影【按设计拒绝异步 capability】
+    （@hypit/hypit/packages/runtime-host-node/src/index.ts:308）⇒ `/__studio/session` 必然 500、
+    时间轴/产物/预览三页全空。结果就是用户看到的"视频都出来了导演台还不同步"
+    （2026-10-03 实测：claim 钉在 productions/replica-final/build.svrun:58637，同目录已有 assemble.svrun）。
+    claim 的语义是【这条会话 owns 哪个工程】，不是"必须打开哪个文件"，所以在这里换成可看形态是正解。
+    """
+    if not p:
+        return ""
+    ws = os.path.realpath(HYPIT_WORKSPACE)
+    cand = p if os.path.isabs(p) else os.path.join(ws, str(p).replace("\\", "/"))
+    d = cand if os.path.isdir(cand) else os.path.dirname(cand)
+    a = os.path.join(d, "assemble.svrun")
+    try:
+        if os.path.isfile(a) and _inside(ws, a):
+            # 返回形态跟着输入：claim 存的是相对路径就别突然变成绝对路径（presence 的 run 字段要能对比）
+            return a if os.path.isabs(p) else os.path.relpath(a, ws).replace("\\", "/")
+    except OSError:
+        pass
+    return p
+
+
 def _session_project(sid: str) -> str:
     """这条会话该看哪个工程：本会话 claim → 意图任务里的路径 → 本会话最近生成腿所属工程目录。"""
     item = _mine(_studio_record()["runs"], sid)
     if item and item.get("run"):
-        return str(item["run"])
+        return _viewable(str(item["run"]))
     task = str((_intent_map().get(sid) or {}).get("task") or "")
     if task.lower().endswith((".svrun", ".svml")):
+        return task
+    # 传工程【目录】也要认（2026-10-03 实测坑：只认后缀 ⇒ 文档里写"可以传目录"是假的，
+    # agent 老老实实给目录就被判 no-project）。_pick_svrun 自己会做工作区越界检查。
+    if task and os.path.isdir(task):
         return task
     con = _db()
     try:
@@ -279,7 +336,7 @@ def _session_project(sid: str) -> str:
                           " order by created desc limit 1", (sid,)).fetchone()
     finally:
         con.close()
-    return str(row[0]) if row and row[0] else ""
+    return _viewable(str(row[0])) if row and row[0] else ""
 
 
 def _pick_svrun(target: str) -> str:
@@ -305,7 +362,12 @@ def _pick_svrun(target: str) -> str:
 
 
 def _free_studio_port(span: int = 12) -> int:
-    """studio 实测绑 [::1]，所以按 IPv6 环回找空闲口；5179 被别的会话的服务占着就往上走，绝不抢。"""
+    """studio 实测绑 [::1]，所以按 IPv6 环回找空闲口；5179 被别的会话的服务占着就往上走，绝不抢。
+
+    2026-10-03 实测：一台机器上跑了 11 个历史查看器 ⇒ 5179..5190 这 12 个口全占，本函数返回 0，
+    结果是【新会话点了 skill 也起不了查看器】。所以窗口占满时改为向系统要一个空闲口
+    （右栏 iframe 的地址由 presence 带 port，端口不固定不影响挂载）。
+    """
     import socket
     for port in range(STUDIO_PORT, STUDIO_PORT + span):
         sk = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -316,7 +378,14 @@ def _free_studio_port(span: int = 12) -> int:
             continue
         finally:
             sk.close()
-    return 0
+    sk = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        sk.bind(("::1", 0))
+        return int(sk.getsockname()[1])
+    except OSError:
+        return 0
+    finally:
+        sk.close()
 
 
 def studio_up(session: str, run: str = "") -> dict:
@@ -338,10 +407,28 @@ def studio_up(session: str, run: str = "") -> dict:
     rel = os.path.relpath(svrun, ws).replace("\\", "/")
     for key, item in _studio_record()["runs"].items():          # 已有查看器在服务这个 run ⇒ 复用
         port = int(item["port"])
-        if _run_matches(rel, key) and _probe_studio(port).get("up"):
-            studio_claim(sid, rel, port)
-            return {"started": False, "reused": True, "port": port, "run": rel,
-                    "url": "http://localhost:%d/" % port}
+        if not _run_matches(rel, key):
+            continue
+        if not _probe_studio(port).get("up"):
+            continue
+        # 🔴 "端口活着"不够，必须验它服务的就是这个工程：studio-claim 不带端口时会默认记 5179，
+        #    而 5179 可能挂着另一台查看器（2026-10-03 实测：装配工程被复用到旧 e2e 工程的台上）。
+        #    比的是【同名工程】不是同一路径：studio 自报 .svml，claim 记的是 .svrun，
+        #    直接比字符串永远不等 ⇒ 每过冷却就再起一台新的（进程泄漏）。
+        served = str(_studio_served_path(port) or "")
+        want = os.path.realpath(svrun)
+        if served:
+            got = os.path.realpath(_pick_svrun(served) or served)
+            if got != want:
+                continue
+        elif os.path.realpath(os.path.join(ws, str(item.get("run") or "").replace("\\", "/"))) != want:
+            # 🔴 自报不出来（生成工程的 /__studio/session 会 500）时【不能】直接复用：
+            #    2026-10-03 就是这个洞让装配目标复用到了一台正服务 build.svrun 的旧台上。
+            #    拿不到自报就只能比登记表，对不上宁肯新起一台。
+            continue
+        studio_claim(sid, rel, port)
+        return {"started": False, "reused": True, "port": port, "run": rel,
+                "url": "http://localhost:%d/" % port}
     port = _free_studio_port()
     if not port:
         return {"started": False, "reason": "no-port", "detail": "%d..%d 全被占" % (STUDIO_PORT, STUDIO_PORT + 11)}
@@ -397,6 +484,53 @@ def _mine(rec_runs: dict, session: str) -> dict:
     return max(mine, key=lambda v: v["ts"]) if mine else {}
 
 
+_viewer_tick: dict = {}
+_viewer_busy: set = set()
+VIEWER_TICK_COOLDOWN = 120.0
+
+
+def viewer_tick(session: str) -> dict | None:
+    """服务端替这条会话把 studio 查看器起起来：登记了 hypit + 名下有真工程 + 还没有查看器 ⇒ 起。
+
+    为什么搬到 8100 这一侧：过去"选了就要看到界面"绑在 agent 跑 `intent` 那条 CLI 上，而 DSH 的
+    文件沙箱让它写不了 D:\video-skill（2026-10-03 实测被拒）⇒ 触发动作压根发生不了。
+    右栏每 5 秒轮询一次 presence，这本身才是"必然发生的动作"，绑在这儿 agent 一条命令都不用敲。
+    带冷却：同一 sid 两分钟内只试一次，轮询不会把进程起爆。
+    """
+    sid = str(session or "").strip()
+    if not sid or os.environ.get("HYPIT_NO_AUTOSTART") or intent_of(sid) != "hypit":
+        return None
+    item = _mine(_studio_record()["runs"], sid)
+    # 🔴 "已经有 claim" 不等于 "台已经对了、还活着"。两个真实坑：
+    #    ① claim 钉在 build.svrun 而同工程已有可渲染的 assemble.svrun ⇒ 该换台；
+    #    ② 那台已经被杀/自己退了（端口空着）⇒ 该重起。过去两条都会被这个守卫挡掉，
+    #    用户看到的就是"右栏说查看器没起，但没人去起"。
+    if item and _viewable(str(item.get("run") or "")) == str(item.get("run") or "") \
+            and _probe_studio(int(item.get("port") or 0)).get("up"):
+        return None
+    if not _session_project(sid):
+        return None
+    now = time.time()
+    if now - float(_viewer_tick.get(sid) or 0) < VIEWER_TICK_COOLDOWN or sid in _viewer_busy:
+        return None
+    _viewer_tick[sid] = now
+    _viewer_busy.add(sid)
+
+    def _go():
+        # 🔴 必须后台起：studio_up 里要等查看器应答（最长 15 秒），而判定口是 5 秒一轮的轮询，
+        #    同步等会把右栏整条对账堵住（2026-10-03 实测第一次调用 6 秒超时）。
+        #    失败也吃掉这次冷却：下一次冷却到期再试，不做"每 5 秒重试"的起爆器。
+        try:
+            studio_up(sid)
+        except Exception:
+            pass
+        finally:
+            _viewer_busy.discard(sid)
+
+    threading.Thread(target=_go, daemon=True).start()
+    return {"started": False, "reason": "spawning"}
+
+
 def studio_status(session: str | None = None) -> dict:
     """右栏 presence 信号：DSH 插件在 dsh-app:// 源里 fetch，Vite 的 CORS 只放行白名单 origin，
     浏览器直连 5179 会被拦 ⇒ 由 8100 代探一次，回 ACAO:* 的紧凑状态（不泄露原文，只给计数）。
@@ -441,9 +575,28 @@ def studio_status(session: str | None = None) -> dict:
         if act:
             return {"intent": True, "up": False, "alive": False, "state": "generating",
                     "reason": "viewer-down-but-generating", "active_legs": act, "port": STUDIO_PORT}
+        if not _session_project(str(session)):
+            # 🔴 和"起了但连不上"分开说：这条会话还没有工程，查看器根本无从打开（2026-10-03 实测：
+            #    过去两种情况都印成"studio 查看器没起"，人只能猜是哪一种）
+            return {"intent": True, "up": False, "alive": False, "state": "no-project",
+                    "reason": "no-project", "port": STUDIO_PORT,
+                    "detail": "这条会话名下还没有 .svrun 工程，查看器无从打开（先按 skill 把工程写出来）"}
         return {"intent": True, "up": False, "alive": False, "state": "not-claimed",
                 "reason": "not-claimed", "port": STUDIO_PORT,
                 "how_to_start": "hypit studio --run <工程>.svrun --port %d" % STUDIO_PORT}
+
+    # 🔴 同工程下有装配工程 ⇒ 该打开的是它，不是 claim 里那个 build.svrun（2026-10-03 实测：
+    #    段都出来了导演台还钉在生成工程上 ⇒ 编辑期投影 500、时间轴永远不动，用户看到的就是"不同步"）。
+    #    归属（run_key）不变，只换打开目标。这里【不能】直接报 up=true：旧端口服务的是另一个文件，
+    #    报上去等于把 500 的台挂进 iframe。回 up=false + 明说原因，presence 的 viewer_tick 会按
+    #    _session_project（已换成装配工程）起/复用对的台，并把 claim 挪过去。
+    want = _viewable(str(item["run"]))
+    if want != str(item["run"]):
+        return {"intent": True, "up": False, "alive": True, "state": "not-claimed",
+                "reason": "assemble-preferred", "port": int(item["port"]),
+                "run": want, "stale_claim": item["run"], "session": item["session"],
+                "detail": "同工程下有 assemble.svrun（可渲染的装配形态），查看器正在换过去；"
+                          "生成工程的编辑期投影不出画面，所以台不会停在 build.svrun 上"}
 
     port = int(item["port"])
     base = {"intent": True, "port": port, "run": item["run"], "session": item["session"],
@@ -480,23 +633,69 @@ def studio_status(session: str | None = None) -> dict:
 #                （它们不过期 ⇒ 会把一次旧任务变成这条会话的永久页签，那就是替用户猜意图）
 # 纯提示词、知识库类 skill（seedance-* prompt 库、film-* 写作类）【不登记意图】：没有引擎，挂了也是空壳。
 INTENT_MARK = os.environ.get("HYPIT_INTENT_MARK") or os.path.join(ROOT, ".gateway_intent.json")
+# 🔴 工作区侧的意图登记（2026-10-03 实测）：DSH 自带 agent 跑在文件沙箱里，写 D:\video-skill 会被拒
+#   （`sandbox escalation … is not strictly wider`），但它【一定】写得 own 工作区。
+#   过去把"选了就要看到界面"绑在一条沙箱里跑不动的命令上 ⇒ 点了 skill 却什么都不弹。
+#   所以意图允许落在 <工作区>/.dsh/intent.json，presence 两个源合并读（同 sid 取 ts 更新的那个）。
+WORKSPACE_INTENT = os.environ.get("HYPIT_WORKSPACE_INTENT") or os.path.join(
+    os.environ.get("DSH_WORKSPACE") or r"C:\dsh", ".dsh", "intent.json")
 KNOWN_SKILLS = ("omni", "hypit", "super-clone", "product-video", "film")
+# 🔴 意图有效期（2026-10-03）：过期 ⇒ 不再弹台，也不再被 viewer_tick 自动起查看器。
+#    为什么必须有：判定口现在会顺手起进程，一条几天前的登记 = 只要那个会话被点开一次就再起一个 studio。
+#    注意这不是"被别的台挤掉"（那条禁令仍然成立：意图只能被显式覆盖/清除），是自己到期。
+INTENT_TTL_SEC = float(os.environ.get("HYPIT_INTENT_TTL") or 24 * 3600)
 _intent_cache = {"sig": None, "data": {}}
 
 
-def _intent_map() -> dict:
-    try:
-        sig = os.stat(INTENT_MARK).st_mtime_ns
-    except OSError:
-        return {}
-    if _intent_cache["sig"] != sig:
+def _live_only(d: dict) -> dict:
+    """滤掉过期条目。坏记录（没 ts / ts 不是数）当过期，宁可少弹不误起进程。"""
+    now = time.time()
+    out = {}
+    for sid, rec in (d or {}).items():
         try:
-            with open(INTENT_MARK, encoding="utf-8") as f:
-                data = json.load(f)
-            _intent_cache.update(sig=sig, data=data if isinstance(data, dict) else {})
-        except (OSError, ValueError):
-            _intent_cache.update(sig=sig, data={})
-    return _intent_cache["data"]
+            if now - float(rec.get("ts") or 0) <= INTENT_TTL_SEC:
+                out[sid] = rec
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _read_mark(path: str) -> tuple:
+    """读一份登记文件 → (mtime_ns 或 None, {sid: {skill,task,ts}})。坏文件/没文件都当空，不抛。"""
+    try:
+        sig = os.stat(path).st_mtime_ns
+    except OSError:
+        return None, {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return sig, {}
+    return sig, (data if isinstance(data, dict) else {})
+
+
+def _intent_map() -> dict:
+    def _mt(p: str):
+        try:
+            return os.stat(p).st_mtime_ns
+        except OSError:
+            return None
+
+    sig = (_mt(INTENT_MARK), _mt(WORKSPACE_INTENT))     # 🔴 必须是 mtime：常驻进程靠它感知"agent 刚写了登记"
+    if _intent_cache["sig"] != sig:
+        _, main = _read_mark(INTENT_MARK)
+        _, side = _read_mark(WORKSPACE_INTENT)
+        data = dict(main)
+        for sid, rec in side.items():          # 工作区侧同 sid 覆盖：agent 刚点的那一下必须立刻生效
+            if not isinstance(rec, dict) or not str(rec.get("skill") or ""):
+                continue
+            old = data.get(sid)
+            if isinstance(old, dict) and float(old.get("ts") or 0) > float(rec.get("ts") or 0):
+                continue
+            data[sid] = rec
+        _intent_cache.update(sig=sig, data=data)
+    # 过期过滤每次现算（不能缓存过滤结果：文件没动，但时间在走，到点就该不弹）
+    return _live_only(_intent_cache["data"])
 
 
 def _replace_retry(src: str, dst: str, tries: int = 4) -> bool:
@@ -592,12 +791,13 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
         keys.append(k)
     con = _db()
     try:
-        rows = con.execute("select id,model,state,run,label,credits,error,created,updated from jobs"
-                           " where session=? order by created desc limit ?", (sid, limit)).fetchall()
+        cols = "id,model,state,run,label,credits,error,created,updated,output,clip"
+        rows = con.execute(f"select {cols} from jobs where session=? order by created desc limit ?",
+                           (sid, limit)).fetchall()
         how = "session"
         if not rows and keys:
             marks = ",".join("?" * len(keys))
-            rows = con.execute("select id,model,state,run,label,credits,error,created,updated from jobs"
+            rows = con.execute(f"select {cols} from jobs"
                                f" where run in ({marks}) order by created desc limit ?", (*keys, limit)).fetchall()
             how = "project" if rows else "session"
     finally:
@@ -606,7 +806,7 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
         res = {"known": False, "reason": "no-jobs"}
     else:
         seg, tally, spent = [], {"ok": 0, "failed": 0, "running": 0, "queued": 0}, 0
-        for jid, model, state, run, label, credits, err, created, updated in rows:
+        for jid, model, state, run, label, credits, err, created, updated, out, clip in rows:
             msg = up = ""
             if err:
                 try:
@@ -622,6 +822,11 @@ def jobs_progress(session: str, limit: int = 40) -> dict:
             spent += credits or 0
             seg.append({"id": jid, "model": model, "state": state, "project": run or "",
                         "label": label or "", "credits": credits or 0,
+                        # 🔴 成功的腿必须带成片地址：右栏"看片"、agent 回传贴图都靠它，
+                        #    否则进度台只有计数，人得自己去翻账本（用户 2026-10-03 点名过）
+                        "output": (out or "") if state == "succeeded" else "",
+                        # 回传进工程的相对路径（装配工程就靠它拼时间轴；没回传成功就是空串）
+                        "clip": (clip or "") if state == "succeeded" else "",
                         "seconds": int(max(0.0, (updated or created) - (created or 0))),
                         "ago": int(time.time() - (created or 0)), "error": msg, "upstream": up})
         res = {"known": True, "segments": seg, "matched_by": how,
@@ -640,10 +845,39 @@ def workbench_presence(session: str | None = None) -> dict:
       没登记 ⇒ 什么都不弹，不看盘上痕迹。
     omni 的意图也走这里，不再让插件直连 8765：video-ui 没有 CORS 头，跨源 fetch 读不到响应。
     """
-    out = {"omni": omni_status(session), "hypit": studio_status(session)}
+    if session:
+        # 🔴 起查看器绑在轮询上（右栏每 5 秒一次，本身必然发生），而不是绑在"agent 跑一条 CLI"上——
+        #    那条命令在 DSH 沙箱里写不了 D 盘，实测发生不了。viewer_tick 自带 120s 冷却。
+        viewer_tick(str(session))
+    out = {"omni": omni_status(session), "hypit": studio_status(session),
+           "film": film_status(session)}
     if session:
         out["hypit"]["progress"] = jobs_progress(str(session))   # 账本里有腿就出进度，与 studio 无关
     return out
+
+
+def film_status(session: str | None = None) -> dict:
+    """film 全流程看板台（8100 同域静态页）的意图与存活。
+
+    短剧带货/影视类 skill（film 档）登记意图后，右栏弹这个台——它不是"引擎活不活"，
+    而是"这条会话的 productions/<task>/ 全流程看板活不活"。8100 自己托管看板页，
+    所以 up = 8100 自己活着（恒 True，只要判定口回话了就在）；intent 决定弹不弹。
+    看板读的是项目文件（01-08 各阶段产物 + 分镜图 + 视频 + 成片），输入→中间→输出全串起来。
+    """
+    if session is None:
+        return {"intent": False, "up": True, "alive": True, "reason": "ops-view",
+                "url": "http://127.0.0.1:8100/api/film/board"}
+    sid = str(session)
+    ex = explicit_only(sid, "film")
+    if ex is False:
+        return {"intent": False, "up": True, "alive": True, "reason": "intent-is-" + intent_of(sid)}
+    if ex is not True:
+        return {"intent": False, "up": True, "alive": True, "reason": "no-intent"}
+    # intent 登记了 film ⇒ 挂台；url 指 8100 看板页（task 由看板页自己扫最近项目，带 ?task= 可钉死）
+    task = str(((_intent_map().get(sid) or {}).get("task")) or "")
+    url = "http://127.0.0.1:8100/api/film/board" + ("?task=" + task if task else "")
+    return {"intent": True, "up": True, "alive": True, "url": url, "task": task,
+            "source": "explicit"}
 
 
 def omni_status(session: str | None = None) -> dict:
@@ -741,7 +975,7 @@ def _db():
                 " created REAL, updated REAL)")
     if not _DB_MIGRATED["ok"]:
         have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
-        for col in ("run", "label", "session"):
+        for col in ("run", "label", "session", "clip"):
             if col not in have:
                 con.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         _DB_MIGRATED["ok"] = True
@@ -859,18 +1093,33 @@ def check_support(body: dict) -> tuple:
         dur = float(body.get("duration") or 5)
     except (TypeError, ValueError):
         return False, "duration 必须是数字"
+    spec = _lane_spec(model)
     if dur > MAX_SECONDS:
         return False, f"本服务最长渲染 {MAX_SECONDS} 秒，不是 {dur:g} 秒"
-    if dur not in ALLOWED_SECONDS:
-        return False, ("本路由实测只有 %s 秒能出片（%g 秒会被上游拒，报的还是误导性的「请填写提示词」）；"
-                       "要改时长就先在 plan/pricing 上验，别直接烧") % (
-            "/".join(("%g" % x) for x in ALLOWED_SECONDS), dur)
-    res = str(body.get("resolution") or RESOLUTIONS[0])
-    if res not in RESOLUTIONS:
-        return False, f"本服务只出 {'/'.join(RESOLUTIONS)}，不出 {res}"
-    for field in ("videoReferences", "audioReferences"):
-        if body.get(field):
-            return False, f"本服务不接受 {field}（上游只收图片参考；不静默丢弃）"
+    if dur not in spec["seconds"]:
+        return False, ("%s 实测只有 %s 秒能出片（%g 秒没数据，不拿去烧钱%s）：要扩时长先在 plan/pricing 上验过再改 LANE_SPECS" % (
+            model, "/".join(("%g" % x) for x in spec["seconds"]), dur,
+            "；seedance 路的 4/6/8 秒都被上游 422 打回过，报的还是误导性的「请填写提示词」"
+            if model.startswith("seedance") else ""))
+    res = body.get("resolution")
+    if res is None or str(res) == "":
+        res = spec["resolutions"][0] if spec["resolutions"] else ""
+    if spec["resolutions"]:
+        if str(res) not in spec["resolutions"]:
+            return False, "%s 只出 %s，不出 %s" % (model, "/".join(spec["resolutions"]), res)
+    elif res:
+        return False, ("%s 这条路由兑现不了 \"%s\" 档位标注（RunningHub 导演台实测只出 576×1024、5 秒）："
+                       "别写 resolution 就能跑，要接 768P/2K 先把工作流出幅跑实测") % (model, res)
+    ratio = body.get("ratio")
+    if spec["aspects"] is not None and ratio not in (None, "") and str(ratio) not in spec["aspects"]:
+        return False, "%s 的出幅固定 %s，aspect-ratio 要么不写要么写它（不是 %s）" % (
+            model, "/".join(spec["aspects"]), ratio)
+    if not spec["last_frame"] and body.get("lastFrame"):
+        return False, "%s 不接尾帧（这条工作流没实测过首/尾帧形态）" % model
+    for field, kind in (("videoReferences", "video"), ("audioReferences", "audio")):
+        if body.get(field) and kind not in spec["refs"]:
+            return False, ("%s 只带得动 %s 参考，不接 %s 参考（不静默丢弃；要接就把 %s 参考接进这条路由的网关适配器）"
+                           % (model, "/".join(spec["refs"]), kind, kind))
     refs = body.get("references") or []
     if not isinstance(refs, list):
         return False, "references 必须是数组"
@@ -937,6 +1186,108 @@ def _normalize(body: dict) -> dict:
     return out
 
 
+def _local_upload(url: str) -> str:
+    """我们 /uploads 发出去的回环地址（/api/hypit/uploads/files/<name>）⇒ 直接指回磁盘上那份。
+    视频动辄几 MB，绕本机一圈再下载回来既慢又会把扩展名猜错（content-type 回的是 octet-stream）。"""
+    if "/api/hypit/uploads/files/" not in url:
+        return ""
+    path = os.path.normpath(os.path.join(UPLOAD_DIR, os.path.basename(url.split("?")[0])))
+    return path if path.startswith(os.path.normpath(UPLOAD_DIR)) and os.path.isfile(path) else ""
+
+
+def _media_urls(body: dict, fields: tuple) -> list:
+    out = []
+    for f in fields:
+        v = body.get(f)
+        if isinstance(v, list):
+            out += [str((x.get("url") if isinstance(x, dict) else x)) for x in v if x]
+        elif v:
+            out.append(str(v))
+    return out
+
+
+def _leg_name(body: dict) -> str:
+    """这条腿的组件名：need id 形如 `…clone.svml::component::seg1-video:generate` ⇒ 取回 `seg1`。
+
+    段必须按【leg】命名，不能按完成先后：腿会乱序完成、也会单独重跑（重跑要覆盖同一段，
+    而不是多出一个 seg9）。取不到 leg 名就不回传（宁缺勿错，绝不瞎起名）。
+    """
+    import urllib.parse
+    need = urllib.parse.unquote(str(body.get("need") or ""))
+    parts = [p for p in need.split("::") if p]
+    if len(parts) < 2:
+        return ""
+    comp = parts[-1].split(":")[0].strip()
+    for suffix in ("-video", "-audio", "-image", "-clip"):
+        if comp.endswith(suffix):
+            comp = comp[:-len(suffix)]
+            break
+    ok = comp and all(c.isalnum() or c in "_.-" for c in comp)
+    return comp[:40] if ok else ""
+
+
+def _land_clip(body: dict, src: str) -> str:
+    """把成功的段回传进工程的 clips/<leg>.mp4。
+
+    为什么必须回传进工程：hypit 编辑期投影【不执行异步腿】（runtime-host-node/index.ts:308），
+    所以生成工程里的导演台永远看不到段；只有把段落成素材、由装配工程引用，时间轴才会出现片段。
+    🔴 回传失败绝不能把已花积分的腿判死：一律吞掉异常，只回 ""。
+    """
+    import shutil
+    try:
+        proj = str(_project_key(body) or "")
+        leg = _leg_name(body)
+        if not proj or not leg or not src or not os.path.isfile(src):
+            return ""
+        ws = os.path.realpath(HYPIT_WORKSPACE)
+        dst_dir = os.path.realpath(os.path.join(ws, proj.replace("\\", "/"), "clips"))
+        if not dst_dir.startswith(ws + os.sep):
+            return ""
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, f"{leg}.mp4")
+        shutil.copyfile(src, dst)
+        return f"{proj}/clips/{leg}.mp4"
+    except OSError:
+        return ""
+
+
+def _materialize_refs(body: dict, jid: str,
+                      fields: tuple = ("references", "firstFrame", "lastFrame")) -> list:
+    """把参考媒体 url 换成本地文件路径：自家回环地址→直接指回磁盘那份；真公网 url→下载到
+    OUT_DIR/<jid>_refs/；本来就是本地路径→原样保留。
+    H3 导演台只吃本地文件（提交时上传拿 fileName），所以这一步是它与 seedance 路的分水岭。"""
+    import urllib.request
+    urls = _media_urls(body, fields)
+    paths = []
+    for u in urls:
+        # 已经是本地文件路径（罕见，比如 future 本地直传）⇒ 直接用
+        if not u.startswith("http"):
+            paths.append(u)
+            continue
+        mine = _local_upload(u)
+        if mine:
+            paths.append(mine)
+            continue
+        refs_dir = os.path.join(OUT_DIR, f"{jid}_refs")
+        os.makedirs(refs_dir, exist_ok=True)
+        try:
+            resp = urllib.request.urlopen(u, timeout=120)
+            raw = resp.read()
+            ct = (resp.headers.get("content-type") or "").lower()
+            ext = (".png" if "png" in ct else ".webp" if "webp" in ct else
+                   ".jpg" if "jpeg" in ct or "jpg" in ct else
+                   ".mp4" if "mp4" in ct or "video" in ct else
+                   ".wav" if "wav" in ct else ".mp3" if "mpeg" in ct else ".bin")
+            p = os.path.join(refs_dir, f"ref{len(paths)+1}{ext}")
+            with open(p, "wb") as f:
+                f.write(raw)
+            paths.append(p)
+        except Exception as e:
+            # 下载失败就记原 url，让 H3 上游报 400（不静默丢）
+            paths.append(u)
+    return paths
+
+
 def _run(jid: str, body: dict):
     cap, purpose = HYPIT_MODELS[str(body.get("model"))]
     params = {"prompt": str(body.get("prompt") or ""),
@@ -951,6 +1302,15 @@ def _run(jid: str, body: dict):
         params["image_urls"] = urls
     os.makedirs(OUT_DIR, exist_ok=True)
     params["output_dir"] = params["output_path"] = os.path.join(OUT_DIR, f"{jid}")
+    # H3 腿走本地文件路径（RunningHub 自家上传拿 fileName），不走公网 URL：图片=换主体、视频=出动作
+    if purpose == "h3":
+        local_paths = _materialize_refs(body, jid)
+        vids = _materialize_refs(body, jid, ("videoReferences",))
+        if local_paths:
+            params["image_paths"] = local_paths
+        if vids:
+            params["video_paths"] = vids
+        params.pop("image_urls", None)
     _touch(jid, state="running")
     from backend import gateway
     env, attempts = None, 0
@@ -994,7 +1354,8 @@ def _run(jid: str, body: dict):
                error=json.dumps({"code": "NO_OUTPUT", "message": "上游报成功但既无文件也无 URL"}, ensure_ascii=False))
         return
     output = f"{PUBLIC_BASE}/api/hypit/assets/{name}" if name else str(res.get("url"))
-    _touch(jid, state="succeeded", credits=credits, output=output)
+    clip = _land_clip(body, os.path.join(OUT_DIR, name)) if name else ""
+    _touch(jid, state="succeeded", credits=credits, output=output, clip=clip)
 
 
 def handle_submit(body: dict) -> tuple:
@@ -1036,10 +1397,21 @@ def handle_rates(query: dict) -> dict:
         return {"error": {"code": "UNKNOWN_MODEL", "message": f"未登记 {model}"}}
     cap, purpose = HYPIT_MODELS[model]
     unit = gateway.unit_price(cap, purpose)
+    # 🔴 报价文案必须由 LANE_SPECS 生成，不许再写死全局常量：上一版这里印的是"720p、最长 10 秒、只收图片参考"，
+    # 而真实闸已经是"每条路由各自档位"（h3 是 5 秒、不写 resolution、图片+视频参考）⇒ 页面上说的是假话。
+    spec = _lane_spec(model)
+    secs = "/".join(("%g" % x) for x in spec["seconds"])
+    res = "/".join(spec["resolutions"]) if spec["resolutions"] else "不写 resolution（本路由只实测一种出幅）"
+    refs = "+".join(spec["refs"])
+    frames = ("，可带首/尾帧" if spec["last_frame"] else "，不接尾帧")
     return {"model": model, "route": f"{cap}/{purpose}", "credits_per_10s": unit,
-            "description": (f"本服务（Weeksir 网关 {cap}/{purpose}）：{RESOLUTIONS[0]}、最长 {MAX_SECONDS} 秒、"
-                            f"只收图片参考；扣费 {unit} 分/10 秒（文本/看图才按 token 结算），"
-                            f"上游实付单价未录入 ⇒ 这只是内部记账单位，不是对客报价")}
+            "lane": {"seconds": list(spec["seconds"]), "resolutions": list(spec["resolutions"]),
+                     "aspects": list(spec["aspects"]) if spec["aspects"] is not None else None,
+                     "refs": list(spec["refs"]), "last_frame": bool(spec["last_frame"])},
+            "description": (f"本服务（Weeksir 网关 {cap}/{purpose}）：{res}、实测时长 {secs} 秒、"
+                            f"只收 {refs} 参考{frames}；扣费 {unit} 分/条"
+                            f"（文本/看图才按 token 结算），上游实付单价未录入 ⇒ "
+                            f"这只是内部记账单位，不是对客报价")}
 
 
 # ══ 导出口（#29）：一键 build + get，只放"零生成腿"的免费装配工程 ════════════════
