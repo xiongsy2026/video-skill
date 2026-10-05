@@ -22,7 +22,7 @@ if _d and _d not in _sys.path:
 
 from config import settings  # noqa: E402
 
-CAPABILITIES = ["text.complete", "image.generate", "image.edit", "video.generate", "video.analyze", "lipsync", "transcribe", "audio.generate"]
+CAPABILITIES = ["text.complete", "image.generate", "image.edit", "video.generate", "video.edit", "video.analyze", "lipsync", "transcribe", "audio.generate"]
 
 # (capability, purpose) -> route。model/base_url/api_key 存 settings 的字段名，运行时解析，不落明文。
 # provider/client 仅内部与日志用，不出现在客户对话。凭证字段全部映射 config.py（唯一 API 真相源）。
@@ -64,6 +64,12 @@ ROUTES = {
                                      "fields": {"base_url": None, "api_key": None, "model": "GFLOW_IMAGE_MODEL"}},
     # —— 图片编辑 / 换脸（真实入口 video_face_swap.run_face_swap:53，分段+on_log，也是流水线级）——
     ("image.edit", "faceswap"):     {"provider": "runninghub", "client": "video_face_swap", "fn": "run_face_swap", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
+    # —— 视频后处理（去水印）——
+    # RunningHub AI App 2012077432525824001：吃【本地视频文件】（提交时上传拿 fileName），清 Sora/Seedance 的文字与图标。
+    # 节点号全部住 config（.env 可覆盖），因为它们是对方工作流的内部编号，对方一改版就得换。
+    ("video.edit", "dewatermark"):   {"provider": "runninghub", "client": "gateway._dewatermark", "fn": "upload→run/ai-app→query→落盘",
+                                      "fields": {"base_url": "RUNNINGHUB_DEWATERMARK_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY",
+                                                 "model": "RUNNINGHUB_DEWATERMARK_APP_ID"}},
     # —— 生视频 ——
     ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_generate",      "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
     # —— Seedance（vinted.cam 直连·/v1/videos·model=seedance2.5/2.0；见 _vinted_video）——
@@ -89,6 +95,7 @@ DEFAULT_PURPOSE = {
     "text.complete": "agnes",
     "image.generate": "default",
     "image.edit": "faceswap",
+    "video.edit": "dewatermark",
     "video.generate": "omni-t2v",
     "video.analyze": "default",
     "lipsync": "default",
@@ -167,6 +174,9 @@ PRICE_ROUTES = {
     # 那是【另一个账户的配额】不是我方现金 ⇒ 等"1 元=几分"定了再一起补价。
     ("image.generate", "doubao"): 0, ("image.generate", "gflow"): 0,
     ("image.edit", "faceswap"): 20,
+    # ⚠️ 去水印这条【没有实测价】：RunningHub 按 GPU 秒真扣钱，而"1 元=几分"还没定。
+    #    20 是照同一家 faceswap 档借的占位数，只用于报价量级；跑通第一条后要按上游 usage 校准并改 model_prices.json。
+    ("video.edit", "dewatermark"): 20,
     ("video.generate", "omni-t2v"): 40, ("video.generate", "agnes-v"): 30, ("video.generate", "clone-r2v"): 50,
     ("video.generate", "seedance-2.5"): 60, ("video.generate", "seedance-2.0"): 50,
     ("video.generate", "wan3-dashscope"): 50, ("video.generate", "h3"): 60, ("video.generate", "motion"): 50,
@@ -177,7 +187,7 @@ PRICE_ROUTES = {
     ("audio.generate", "seed-audio"): 0,
 }
 PRICE_BY_CAP = {"text.complete": 1, "image.generate": 4, "image.edit": 20,
-                "video.generate": 40, "video.analyze": 6, "lipsync": 20, "transcribe": 0,
+                "video.generate": 40, "video.edit": 20, "video.analyze": 6, "lipsync": 20, "transcribe": 0,
                 "audio.generate": 0}
 
 # ---- 可外置配置：价目 + 每能力默认路由 → model_prices.json（改价/换默认供应商=改这个文件，不动代码）----
@@ -270,6 +280,10 @@ def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
     if capability == "video.generate":
         dur = int((params or {}).get("duration", 10))
         est = base * max(1, (dur + 9) // 10)   # 每 10s 一个单位
+    if capability == "video.edit":
+        # 去水印烧的是 GPU 秒 ⇒ 时长越长越贵，先照 video.generate 的"每 10 秒一档"估（占位价，见 PRICE_ROUTES 注释）
+        dur = int((params or {}).get("duration") or 10)
+        est = base * max(1, (dur + 9) // 10)
     if capability == "audio.generate":
         # 上游按字符计费 ⇒ 单价是"分/千字"，一条请求向下取整到 1 个千字单位（100 字也按 1 千字算）
         text = str((params or {}).get("prompt") or (params or {}).get("text_prompt") or "")
@@ -329,13 +343,15 @@ def _probe_reachable(base_url: str, api_key: str):
     base = str(base_url).rstrip("/")
     last = None
     for path in ("/models", "/v1/models"):
-        ms = round((time.time() - t) * 1000)
+        t0 = time.time()   # 🔴 每条请求【各自】计时：原来 ms 在发请求之前算，于是所有可达腿都显示 0ms，
+                           #    面板的"平均延迟"KPI 一直是假的（2026-10-04 接去水印腿时撞见）
         try:
             with urllib.request.urlopen(urllib.request.Request(
                     base + path, headers={"Authorization": f"Bearer {api_key}", "User-Agent": BROWSER_UA}), timeout=15) as r:
                 r.read()
-            return ("reachable", f"GET {path} 鉴权通过(未提交生成)", ms)
+            return ("reachable", f"GET {path} 鉴权通过(未提交生成)", round((time.time() - t0) * 1000))
         except urllib.error.HTTPError as e:
+            ms = round((time.time() - t0) * 1000)
             if e.code == 404:
                 last = f"GET {path} 404"
                 continue
@@ -359,6 +375,7 @@ _ADAPTED = {("text.complete", "*"), ("video.analyze", "*"),
             ("video.generate", "omni-t2v"), ("video.generate", "seedance-2.5"),
             ("video.generate", "seedance-2.0"), ("video.generate", "agnes-v"),
             ("video.generate", "h3"), ("audio.generate", "seed-audio"),
+            ("video.edit", "dewatermark"),
             ("image.generate", "doubao"), ("image.generate", "gflow")}
 
 
@@ -940,6 +957,181 @@ def _h3_payload(params: dict):
     return [seg], ttype, None
 
 
+# —— 视频去水印（RunningHub AI App 2012077432525824001）——
+# 上游是别人发布的工作流：节点号（142/143/138/128）与 App 号全住 config，.env 可覆盖，改版不动代码。
+_RH_FPS_ALLOWED = ("16", "24")                       # 上游文档写死这两档
+_RH_INSTANCE_ALLOWED = ("default", "plus", "ultra")  # 24G / 48G / 84G
+
+
+def _dewatermark_payload(params: dict):
+    """发请求【之前】的校验，返回 (vals, err)。这条按 GPU 秒真扣钱，参数错了不该花钱才知道。"""
+    src = str(params.get("video_path") or "").strip()
+    if not src:
+        return None, "去水印要给 video_path（本地视频文件路径）"
+    if src.startswith(("http://", "https://")):
+        return None, ("去水印的 video_path 只收本地文件，这里收到公网 URL：%s"
+                      "（先落到本地再提交；上游给的结果链接 24 小时就失效，不能当输入用）" % src[:80])
+    if not _os.path.isfile(src):
+        return None, "去水印的视频文件不存在：%s" % src[:160]
+    out = str(params.get("output_path") or "").strip()
+    if not out:
+        return None, "去水印必须给 output_path（结果链接 24 小时失效，不落盘等于白花钱）"
+    dur = params.get("duration")
+    if dur in (None, ""):
+        from backend.services.super_clone_wan3 import _ffprobe_duration
+        dur = _ffprobe_duration(src)
+        if dur is None:
+            return None, ("探不到视频时长（本机 ffprobe 没在 PATH？），而这条工作流要把秒数填进节点"
+                          "⇒ 显式给 duration 再跑：%s" % src[:120])
+    try:
+        dur = max(1, int(round(float(dur))))
+    except (TypeError, ValueError):
+        return None, "duration 不是数字：%r" % (params.get("duration"),)
+    fps = str(params.get("fps") or _get("RUNNINGHUB_DEWATERMARK_FPS") or "24")
+    if fps not in _RH_FPS_ALLOWED:
+        return None, "fps 只认 %s（上游文档），给了 %r" % ("/".join(_RH_FPS_ALLOWED), fps)
+    inst = str(params.get("instance_type") or _get("RUNNINGHUB_DEWATERMARK_INSTANCE_TYPE") or "default")
+    if inst not in _RH_INSTANCE_ALLOWED:
+        return None, "instance_type 只认 %s，给了 %r" % ("/".join(_RH_INSTANCE_ALLOWED), inst)
+    miss = [k for k in ("VIDEO", "DURATION", "FPS", "PROMPT")
+            if not str(_get("RUNNINGHUB_DEWATERMARK_%s_NODE" % k) or "").strip()]
+    if miss:
+        return None, "缺节点号配置 RUNNINGHUB_DEWATERMARK_%s_NODE（花钱前先补上）" % "/".join(miss)
+    return {"video_path": src, "output_path": out, "duration": dur, "fps": fps,
+            "instance_type": inst,
+            "prompt": str(params.get("prompt") or _get("RUNNINGHUB_DEWATERMARK_PROMPT") or "").strip()}, None
+
+
+def _dewatermark_nodes(file_name, duration, fps, prompt):
+    """拼 nodeInfoList（纯函数，好单独断言）。⚠️ video 节点要的是上传后的 fileName，不是 download_url。
+
+    节点号【只住 config】（代码里不留字面量兜底）：那是对方工作流的内部编号，改版要改 .env，
+    不该在两个地方各存一份 —— 留一份就会漂移。
+    """
+    ids = {"video": _get("RUNNINGHUB_DEWATERMARK_VIDEO_NODE"),
+           "duration": _get("RUNNINGHUB_DEWATERMARK_DURATION_NODE"),
+           "fps": _get("RUNNINGHUB_DEWATERMARK_FPS_NODE"),
+           "prompt": _get("RUNNINGHUB_DEWATERMARK_PROMPT_NODE")}
+    miss = [k for k, v in ids.items() if not str(v or "").strip()]
+    if miss:
+        raise RuntimeError("去水印缺节点号配置：%s（在 config.py / .env 里补 RUNNINGHUB_DEWATERMARK_*_NODE）"
+                           % "/".join(miss))
+    return [
+        {"nodeId": ids["video"], "fieldName": "video", "fieldValue": file_name, "description": "Load video"},
+        {"nodeId": ids["duration"], "fieldName": "value", "fieldValue": str(duration), "description": "Video duration"},
+        {"nodeId": ids["fps"], "fieldName": "value", "fieldValue": str(fps), "description": "Frames per second (16 or 24)"},
+        {"nodeId": ids["prompt"], "fieldName": "text", "fieldValue": prompt, "description": "Input prompt"},
+    ]
+
+
+def _register_delivery_dewatermark(params, vals):
+    """先记账再花钱：去水印欠一条产物，期望路径就是 `output_path`（文件真出现才销账）。
+
+    为什么登记在【调用之前】：这条腿会超时/会失败，事后登记等于没记 ——
+    台账的意义是让"还欠着"在有人想收工时可见（docs/PRD-delivery-loop.md §1）。
+    会话 id 只有两个来源：显式 params["session"] 或 DSH 注入子进程的 $env:DSH_SESSION_ID；
+    都拿不到就不登记（fail-closed，不给没主人的会话记账）。🔴 记账炸了绝不能影响这次调用。
+    """
+    sid = str(params.get("session") or _os.environ.get("DSH_SESSION_ID") or "").strip()
+    if not sid:
+        return
+    try:
+        import delivery_ledger
+        out = str(vals.get("output_path") or "").strip()
+        if not out:
+            return
+        stem = _os.path.splitext(_os.path.basename(out))[0]
+        task = str(params.get("task") or stem)[:60]
+        delivery_ledger.open_obligation(sid, task, "dewatermark", [out],
+                                        budget_credits=int(params.get("budget_credits") or 0))
+    except Exception as e:
+        # 🔴 不许静默：上一版这里写的是 `except: pass`，结果一个 NameError 把登记整块吃掉、
+        #    测试只看到"没登记"，查不到原因。记账不能拖垮调用，但必须留下声音。
+        print("[delivery] 去水印义务登记失败（不影响本次调用）：%s" % e, file=_sys.stderr)
+
+
+def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, poll_interval=10.0):
+    """上传→跑 AI App→轮询→落盘。job_id 给了就【只捞结果不重提交】（孤儿任务捞回=0 分，重提交=双花）。
+
+    轮询按 2026-10-03 那条 SSL 掐线教训写：同一个 taskId 退避重试、连续 6 次查询异常才判死，
+    判死也只报 taskId 让人去查上游，绝不在这一步重新提交。
+    """
+    import asyncio
+    import httpx
+    import time
+    from pathlib import Path
+    from backend.services.runninghub_client import RunningHubClient
+    try:
+        client = RunningHubClient(api_key) if api_key else RunningHubClient()
+    except Exception as e:
+        return {"success": False, "error": "去水印拿不到 RunningHub 密钥：%s" % str(e)[:200]}
+    if not app_id:
+        return {"success": False, "error": "没配 RUNNINGHUB_DEWATERMARK_APP_ID（AI App 号）"}
+
+    async def _go():
+        tid = job_id
+        if not tid:
+            up = await client.upload_resource(vals["video_path"])
+            if not up:
+                return {"success": False, "error": "去水印：视频上传后没拿到 fileName（不提交，0 分）"}
+            sub = await client.submit_task(workflow_id=app_id, is_ai_app=True,
+                                           instance_type=vals["instance_type"],
+                                           node_info_list=_dewatermark_nodes(
+                                               up, vals["duration"], vals["fps"], vals["prompt"]))
+            tid = sub.get("taskId")
+            if not tid:
+                return {"success": False, "error": "去水印：提交没回 taskId %s" % str(sub)[:200]}
+        start = time.time()
+        fails = 0
+        while time.time() - start < poll_timeout:
+            await asyncio.sleep(poll_interval)
+            try:
+                resp = await client.query_task(tid)
+                fails = 0
+            except Exception as e:
+                fails += 1
+                if fails >= 6:
+                    return {"success": False, "job_id": tid,
+                            "error": "去水印：查询连续失败 6 次（任务可能还在跑，别重提交）%s" % str(e)[:200]}
+                await asyncio.sleep(min(poll_interval, 3 * fails))
+                continue
+            st = resp.get("taskStatus") or resp.get("status") or "UNKNOWN"
+            if st == "SUCCESS":
+                item = next((i for i in (resp.get("results") or []) if i.get("url")), None)
+                if not item:
+                    return {"success": False, "job_id": tid,
+                            "error": "去水印：上游回 SUCCESS 但没有结果链接 %s" % str(resp.get("results"))[:200]}
+                url = item["url"]
+                p = Path(vals["output_path"])
+                p.parent.mkdir(parents=True, exist_ok=True)
+                async with httpx.AsyncClient(timeout=300.0) as hc:
+                    r = await hc.get(url)
+                    r.raise_for_status()
+                    if len(r.content) < 1024:      # 404 页/错误页也是 200，别把它当 mp4 落盘
+                        return {"success": False, "job_id": tid,
+                                "error": "去水印：下载到的只有 %d 字节，不像视频" % len(r.content)}
+                    p.write_bytes(r.content)
+                usage = resp.get("usage") or {}
+                return {"success": True, "path": str(p), "url": url, "job_id": tid,
+                        "output_type": item.get("outputType") or p.suffix.lstrip("."),
+                        # 上游自己报的耗时/消耗：校准占位单价就看这一个数
+                        "upstream_usage": {"task_cost_time": usage.get("taskCostTime"),
+                                           "consume_money": usage.get("consumeMoney"),
+                                           "consume_coins": usage.get("consumeCoins")},
+                        "error": None}
+            if st in ("FAILED", "ERROR"):
+                return {"success": False, "job_id": tid,
+                        "error": "去水印：上游任务失败 %s" % (resp.get("msg") or resp.get("errorMessage")
+                                                            or resp.get("failedReason") or st)}
+        return {"success": False, "job_id": tid,
+                "error": "去水印：轮询超时 %ss（taskId 已留存，可继续查，不重提交）" % int(poll_timeout)}
+
+    try:
+        return asyncio.run(_go())
+    except Exception as e:
+        return {"success": False, "error": "去水印异常 %s: %s" % (type(e).__name__, str(e)[:260])}
+
+
 def call(capability: str, purpose: str | None = None, **params) -> dict:
     """能力级分发：调用方只给能力名+标准参数，本层按路由注入 model/凭证并转调现有 client。
 
@@ -1037,6 +1229,17 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         return {"success": bool(path), "url": url, "path": path, "job_id": tid,
                 "workflow_id": sub.get("workflow_id"), "unet_type": sub.get("unet_type"),
                 "error": None if path else "H3 回成功了但没落到文件"}
+
+    if capability == "video.edit" and r["purpose"] == "dewatermark":
+        # RunningHub AI App 去水印（清 Sora / Seedance 的文字与图标）。先本地拦，再花钱。
+        vals, err = _dewatermark_payload(params)
+        if err:
+            return {"success": False, "error": err}
+        _register_delivery_dewatermark(params, vals)
+        return _dewatermark_run(vals, r["model"], api_key=r["api_key"] or "",
+                                job_id=str(params.get("job_id") or ""),
+                                poll_timeout=float(params.get("poll_timeout") or 1800),
+                                poll_interval=float(params.get("poll_interval") or 10))
 
     if capability == "video.analyze":
         return analyze_media(
@@ -1320,6 +1523,35 @@ def _cli(argv):
                     else:
                         extra = ""
                     print(f"  {mark} {cap}/{p:<14} {unit_price(c, p):>4} 分 {extra}")
+    elif cmd == "quote":
+        # 用法: python gateway.py quote <cap> [purpose] [--json '{...}']
+        # 只算不花钱（不建预扣、不提交）。铁律要求"报价数字一律从命令读"，而按时长分档的腿
+        # （video.generate / video.edit）光看单价算不出总扣分 ⇒ 要把 params 一起喂进来。
+        import json
+        if len(argv) < 2:
+            print("用法: python gateway.py quote <cap> [purpose] [--json '{...}']")
+            return 2
+        cap = argv[1]
+        rest = argv[2:]
+        pur = rest[0] if rest and not rest[0].startswith("--") else None
+        params = {}
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--json" and i + 1 < len(rest):
+                try:
+                    params = json.loads(rest[i + 1])
+                except Exception as e:
+                    print("参数 JSON 坏: %s" % e)
+                    return 2
+                i += 2
+            else:
+                i += 1
+        try:
+            pur = resolve(cap, pur)["purpose"]
+        except RouteError as e:
+            print("ERROR: %s" % e)
+            return 2
+        print(json.dumps(meter(cap, pur, params), ensure_ascii=False, indent=2))
     elif cmd == "credits":
         led = ledger()
         print("余额:", _json.dumps(led.accounts(), ensure_ascii=False))

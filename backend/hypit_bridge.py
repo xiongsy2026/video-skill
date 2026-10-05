@@ -1374,7 +1374,39 @@ def handle_submit(body: dict) -> tuple:
     con.commit()
     con.close()
     threading.Thread(target=_run, args=(jid, body), daemon=True).start()
+    _register_delivery_leg(str(body.get("session") or ""), _project_key(body), jid)
     return 200, {"id": jid}
+
+
+def _register_delivery_leg(session, task, jid):
+    """提交一条生成腿 = 这条会话当场欠一条产物 ⇒ 追加进交付义务台账。
+
+    为什么用 job_id 而不是文件路径：腿的产物名来自上游回包，提交那一刻还不存在
+    （`handle_submit` 里只有 jid），拿路径表达就是假话。台账的 decide() 因此支持
+    `{"job_id": ...}` 型期望，由 delivery_job_done() 判它是否已 succeeded。
+    🔴 记账炸了绝不能影响提交（和 omni 的 store._register_delivery 同一条纪律）。
+    """
+    if not session:
+        return
+    try:
+        import delivery_ledger
+        delivery_ledger.append_obligation(session[:80], task or "hypit", "hypit",
+                                          [{"job_id": jid, "kind": "video"}])
+    except Exception:
+        pass
+
+
+def delivery_job_done(jid):
+    """台账问"这条腿交付了吗"：jobs 表里 succeeded 才算，failed/queued/running 都不算。"""
+    try:
+        con = _db()
+        try:
+            row = con.execute("SELECT state FROM jobs WHERE id=?", (str(jid or "")[:40],)).fetchone()
+        finally:
+            con.close()
+        return bool(row and row[0] == "succeeded")
+    except Exception:
+        return False
 
 
 def handle_get(jid: str) -> dict:

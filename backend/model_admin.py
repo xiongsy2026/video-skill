@@ -510,7 +510,39 @@ boot();
 """
 
 
+def delivery_pending_view(sid):
+    """交付欠账的读视图（右栏 / 收工拦截 / 回归闸共用同一个口径，不开第二个口）。
+
+    🔴 三态纪律（presence 五修的同一条）：读不到台账 ⇒ `known:false`，意思是"没查清"，
+       绝不能报成"这条会话不欠东西" —— 那会让拦截器以为可以收工。
+    期望项有两种：文件路径（omni / 去水印）与 job_id（hypit 的腿，提交时还没有文件名），
+    所以 hypit 的销账要靠 jobs 表的终态判据 `delivery_job_done`。
+    """
+    try:
+        import delivery_ledger as DL
+        rows = DL.pending(session=sid, job_done=hypit_bridge.delivery_job_done)
+        now = time.time()
+        items = []
+        for r in rows[:12]:
+            items.append({"task": r.get("task"), "skill": r.get("skill"), "session": r.get("session"),
+                          "outstanding": len(r.get("outstanding") or []),
+                          "delivered": len(r.get("delivered") or []),
+                          "paths": [(i.get("path") or ("job:" + str(i.get("job_id") or "")))
+                                    for i in (r.get("outstanding") or [])][:12],
+                          "age_sec": int(now - float(r.get("created_at") or now)),
+                          "budget_credits": r.get("budget_credits") or 0})
+        return {"known": True, "session": sid or "", "count": len(rows),
+                "outstanding_credits": sum(int(r.get("budget_credits") or 0) for r in rows),
+                "items": items}
+    except Exception as e:
+        return {"known": False, "session": sid or "", "error": str(e)[:200]}
+
+
 class H(BaseHTTPRequestHandler):
+    # 206/Range 是 HTTP/1.1 的特性，1.0 下浏览器把视频当整段下载 ⇒ 播得了、拖不动。
+    # 切 1.1 的前提是全部分支都带 Content-Length（本类只有 _send/_send_file 两处写口，都带）。
+    protocol_version = "HTTP/1.1"
+
     def _send(self, code, body, ctype="application/json", cors=False):
         b = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
@@ -522,11 +554,40 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def _send_file(self, data, ctype):   # 二进制：不能带 charset，否则 hypit collect 的 content-type 判定会脏
-        self.send_response(200)
+        total = len(data)
+        start, end = 0, total - 1
+        state, part = 200, False
+        spec = (self.headers.get("Range") or "").strip()
+        if total and spec.startswith("bytes="):
+            first = spec[6:].split(",")[0].strip()   # 只认第一段：播放器本就逐段请求，多段合成在这台本机没意义
+            if first.count("-") == 1:
+                a, bnd = first.split("-", 1)
+                if a == "" and bnd.isdigit():                    # bytes=-N ⇒ 尾 N 字节
+                    start = max(0, total - int(bnd))
+                elif a.isdigit():                                 # bytes=A-B（B 可空＝到末尾）
+                    start = int(a)
+                    if bnd and not bnd.isdigit():
+                        start = None
+                    elif bnd:
+                        end = min(int(bnd), end)
+                else:
+                    start = None
+            if start is not None and start >= total:              # 越界要明说 416，别回 200 全量骗人
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % total)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            part = start is not None and start <= end
+        body = data[start:end + 1] if part else data
+        self.send_response(206 if part else 200)
+        self.send_header("Accept-Ranges", "bytes")
+        if part:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def _hypit_denied(self):
         if hypit_bridge.authorized(self.headers.get("Authorization")):
@@ -604,6 +665,108 @@ class H(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             sid = (q.get("session") or [None])[0]
             self._send(200, json.dumps(hypit_bridge.workbench_presence(sid), ensure_ascii=False), cors=True)
+        elif u.path == "/api/delivery/pending":
+            # 交付欠账读口（docs/PRD-delivery-loop.md §5）：只读、带 CORS，写不进任何东西。
+            q = parse_qs(u.query)
+            sid = (q.get("session") or [None])[0]
+            self._send(200, json.dumps(delivery_pending_view(sid), ensure_ascii=False), cors=True)
+        elif u.path == "/api/film/pipeline":
+            # 短剧带货全流程看板数据口:读 productions/<task>/ 各阶段文件,组织成"输入→中间→输出"。
+            # 只读、带 CORS(右栏 iframe 轮询)。task 缺省给最近的 film 项目。
+            import sys, os as _os, json as _json
+            task = (parse_qs(u.query).get("task") or [""])[0]
+            if not task:
+                # 缺省:扫 productions/ 找最近改过的含 00_project 的项目
+                proots = [_os.environ.get("DSH_PROD_ROOT") or _os.path.join(_os.environ.get("DSH_WORKSPACE") or r"C:\dsh", "productions")]
+                cand = []
+                for pr in proots:
+                    if _os.path.isdir(pr):
+                        for d in _os.listdir(pr):
+                            dd = _os.path.join(pr, d)
+                            if _os.path.isdir(_os.path.join(dd, "00_project")):
+                                cand.append((dd, _os.path.getmtime(dd)))
+                cand.sort(key=lambda x: -x[1])
+                task = _os.path.basename(cand[0][0]) if cand else ""
+            import importlib
+            sys.path.insert(0, r"C:\dsh")
+            try:
+                fps = importlib.import_module("_film_pipeline_status")
+                payload = fps.film_pipeline(task)
+            except Exception as e:
+                payload = {"error": "读项目失败: %s: %s" % (type(e).__name__, str(e)[:150]), "task": task}
+            self._send(200, json.dumps(payload, ensure_ascii=False), cors=True)
+        elif u.path == "/api/film/file":
+            # 看板页托管项目内图片/视频:GET ?task=&rel=,只放行 productions/<task>/ 内的 PNG/JPG/MP4。
+            # 防路径穿越:realpath 后必须在项目根内。带 Range(MP4 播放器要 206)。
+            import os as _os, urllib.parse as _up
+            task = (parse_qs(u.query).get("task") or [""])[0]
+            rel = _up.unquote((parse_qs(u.query).get("rel") or [""])[0])
+            proots = [_os.environ.get("DSH_PROD_ROOT") or _os.path.join(_os.environ.get("DSH_WORKSPACE") or r"C:\dsh", "productions")]
+            if not task or not rel:
+                self._send(400, json.dumps({"error": "缺 task 或 rel"}), cors=True); return
+            target = None
+            for pr in proots:
+                p = _os.path.normpath(_os.path.join(pr, task, rel))
+                if _os.path.isfile(p):
+                    target = p; break
+            if not target or not _os.path.isfile(target) or ".." in rel:
+                self._send(404, json.dumps({"error": "文件不存在或越界"}), cors=True); return
+            ext = _os.path.splitext(target)[1].lower()
+            ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                     "webp": "image/webp", "mp4": "video/mp4", "json": "application/json"}.get(ext, "application/octet-stream")
+            with open(target, "rb") as f:
+                data = f.read()
+            # MP4 大文件走 _send_file(带 Range);小文件直接 _send
+            if ext == ".mp4" and len(data) > 1024 * 1024:
+                self._send_file(data, ctype)
+            else:
+                self._send(200, data, ctype, cors=True)
+        elif u.path == "/api/film/projects":
+            # 全流程看板的项目下拉:列 productions/ 下含 00_project 的 film 项目。
+            import importlib, sys as _sys
+            _sys.path.insert(0, r"C:\dsh")
+            try:
+                fps = importlib.import_module("_film_pipeline_status")
+                self._send(200, json.dumps(fps.film_projects(), ensure_ascii=False), cors=True)
+            except Exception as e:
+                self._send(500, json.dumps({"error": "读项目列表失败: %s: %s" % (type(e).__name__, str(e)[:150])}), cors=True)
+        elif u.path == "/api/film/pipeline":
+            import importlib, sys as _sys
+            _sys.path.insert(0, r"C:\dsh")
+            task = (parse_qs(u.query).get("task") or [""])[0]
+            try:
+                fps = importlib.import_module("_film_pipeline_status")
+                payload = fps.film_pipeline(task)
+            except Exception as e:
+                payload = {"error": "读项目失败: %s: %s" % (type(e).__name__, str(e)[:150]), "task": task}
+            self._send(200, json.dumps(payload, ensure_ascii=False), cors=True)
+        elif u.path == "/api/film/file":
+            # 看板页托管项目内图片/视频(只读,防路径穿越,MP4 走 Range)
+            import importlib, sys as _sys, urllib.parse as _up
+            _sys.path.insert(0, r"C:\dsh")
+            task = (parse_qs(u.query).get("task") or [""])[0]
+            rel = _up.unquote((parse_qs(u.query).get("rel") or [""])[0])
+            try:
+                fps = importlib.import_module("_film_pipeline_status")
+                data, ctype, code = fps.film_file(task, rel)
+                if data is None:
+                    self._send(code, json.dumps({"error": "文件不存在或越界"}), cors=True)
+                    return
+                if code == 200 and ctype == "video/mp4" and len(data) > 512 * 1024:
+                    self._send_file(data, ctype)
+                else:
+                    self._send(200, data, ctype, cors=True)
+            except Exception as e:
+                self._send(500, json.dumps({"error": "读文件失败: %s: %s" % (type(e).__name__, str(e)[:120])}), cors=True)
+        elif u.path == "/api/film/board":
+            # 看板页(8100 同域,iframe 直接 src)
+            import importlib, sys as _sys
+            _sys.path.insert(0, r"C:\dsh")
+            try:
+                fps = importlib.import_module("_film_pipeline_status")
+                self._send(200, fps.film_board_html(), "text/html; charset=utf-8")
+            except Exception as e:
+                self._send(500, "<html><body>看板页加载失败: %s: %s</body></html>" % (type(e).__name__, str(e)[:150]), "text/html; charset=utf-8")
         elif u.path == "/api/hypit/rates":
             if self._hypit_denied():
                 return
