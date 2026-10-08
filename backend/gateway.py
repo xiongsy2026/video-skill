@@ -54,6 +54,10 @@ ROUTES = {
     #    /api/detail-image 正在跑它)；要接网关得先把里面的单模型原语剥出来，别把编排搬第二遍。
     ("image.generate", "detail"):   {"provider": "ideogram", "client": "detail_image_agent",  "fn": "run_pipeline(流水线级)", "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_IDEOGRAM4_API_KEY", "model": None}},
     ("image.generate", "generic"):  {"provider": "image2",   "client": "image2_client",        "fn": "Image2Client.text_to_image_sync", "fields": {"base_url": "IMAGE2_BASE_URL",  "api_key": "IMAGE2_API_KEY",  "model": None}},
+    # —— GPT Image 2.5（同 Image2 端点；/models 实测 sunburst/flare 两型，model 住 config 的 IMAGE2_IMAGE25_MODEL）——
+    #    sunburst=保真默认、flare=显式提速档（Framewright gpt_image_2_5 adapter 的 default/speed 模型 ID 就是这两个）。
+    ("image.generate", "gpt-image2.5"): {"provider": "image2", "client": "image2_client", "fn": "Image2Client.text_to_image_sync",
+                                         "fields": {"base_url": "IMAGE2_BASE_URL", "api_key": "IMAGE2_API_KEY", "model": "IMAGE2_IMAGE25_MODEL"}},
     # zexapi nano_banana（/v1/videos 提交轮询·同 omni 形·复用 OMNI 凭证）——已实现，见 call() 的 nano 分支
     ("image.generate", "nano"):     {"provider": "zexapi",   "client": "omni_client", "fn": "submit_omni_task(model=nano_banana_pro-2K)", "fields": {"base_url": "OMNI_BASE_URL",  "api_key": "OMNI_API_KEY",  "model": None}},
     # —— 网页/CLI 型生图（没有 api_key，靠登录态；网关仍然预扣/结算/审计，只是这一条腿走子进程）——
@@ -70,6 +74,12 @@ ROUTES = {
     ("video.edit", "dewatermark"):   {"provider": "runninghub", "client": "gateway._dewatermark", "fn": "upload→run/ai-app→query→落盘",
                                       "fields": {"base_url": "RUNNINGHUB_DEWATERMARK_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY",
                                                  "model": "RUNNINGHUB_DEWATERMARK_APP_ID"}},
+    # —— 视频高清修复（RunningHub AI App 1990029249488801793，2026-10-05 接入）——
+    # 与 dewatermark 同一套协议（upload→run/ai-app→query→落盘）。节点号住 config（.env 可覆盖），
+    # 默认空 = 花钱前拦截（同 dewatermark 规矩：节点号只住 config，代码里不留字面量兜底）。
+    ("video.edit", "enhance"):       {"provider": "runninghub", "client": "gateway._enhance", "fn": "upload→run/ai-app→query→落盘",
+                                       "fields": {"base_url": "RUNNINGHUB_ENHANCE_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY",
+                                                  "model": "RUNNINGHUB_ENHANCE_APP_ID"}},
     # —— 生视频 ——
     ("video.generate", "omni-t2v"):      {"provider": "omni",     "client": "omni_generate",      "fn": "run_omni",          "fields": {"base_url": "OMNI_BASE_URL",    "api_key": "OMNI_API_KEY",    "model": "OMNI_MODEL_T2V"}},
     # —— Seedance（vinted.cam 直连·/v1/videos·model=seedance2.5/2.0；见 _vinted_video）——
@@ -80,6 +90,32 @@ ROUTES = {
     ("video.generate", "wan3-dashscope"):{"provider": "dashscope","client": "TODO(无现成 client·要照 dashscope 视频生成协议新写)", "fn": "-", "fields": {"base_url": "DASHSCOPE_BASE_URL", "api_key": "DASHSCOPE_API_KEY", "model": "DASHSCOPE_WAN3_MODEL"}},
     ("video.generate", "h3"):            {"provider": "runninghub", "client": "h3_director_client", "fn": "submit_h3_director+poll_and_download", "fields": {"base_url": "RUNNINGHUB_H3_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
     ("video.generate", "motion"):        {"provider": "runninghub","client": "runninghub_client", "fn": "submit_motion_transfer+poll_task_until_done","fields": {"base_url": "RUNNINGHUB_MOTION_WAN22_BASE_URL", "api_key": "RUNNINGHUB_MOTION_WAN22_API_KEY", "model": None}},
+    # —— 动作迁移·第二条腿：8091 nzdh 工作室的【浏览器 RPA】路（Playwright 登录 RH 账号池 → 操作公共工作流
+    # 2106377827540103169 → 等节点 285 出片 → 下 final.mp4）。和上面那条 API 腿是两个上游工作流、两套价，
+    # 故意不合并：合并了就没人知道这次扣的是哪条。provider 以 local 开头 ⇒ 管理台不做 HTTP 探活
+    # （探它 = 真去跑一条工作流、要花钱，探活不许花钱）。
+    ("video.generate", "motion-rpa"):    {"provider": "local-nzdh","client": "gateway._motion_rpa_run", "fn": "POST /run | /step5-rpa → 轮询 /task/<id> → 落盘","fields": {"base_url": "NZDH_BASE_URL", "api_key": None, "model": None}},
+    # —— WAN 3.0（xjai.beauty·OpenAI 兼容 /v1/videos/generations·2026-10-06 接入）——
+    # 两条 model 是【两个价】的上游档位（prime 是更高档），所以分成两个 purpose，不合并：
+    # 合并了就没人知道这次扣的是哪条（同 motion / motion-rpa 那条理由）。
+    # media[] 只吃公网 URL；下载腿 /content 也要 Bearer（见 _xjai_video）。
+    # 只读探测（GET /v1/models·0 消耗）自报的边界：resolutions 480P/720P/1080P（默认 1080P）、
+    # 参考料 images≤10 / videos≤5 / audios≤5 / 合计≤20、支持模式 text|image|first_last_frame|reference。
+    ("video.generate", "wan3"):          {"provider": "xjai", "client": "gateway._xjai_video", "fn": "POST /v1/videos/generations → GET /v1/videos/{id} → GET .../content", "fields": {"base_url": "XJAI_BASE_URL", "api_key": "XJAI_API_KEY", "model": "XJAI_VIDEO_MODEL"}},
+    ("video.generate", "wan3-prime"):    {"provider": "xjai", "client": "gateway._xjai_video", "fn": "同上，model=wan3.0-video-prime", "fields": {"base_url": "XJAI_BASE_URL", "api_key": "XJAI_API_KEY", "model": "XJAI_PRIME_MODEL"}},
+    # —— H3 的【第二条腿】：本机 8093 的浏览器 RPA 工作台（Playwright 登录 RunningHub → 注入 [12] 画布 →
+    # 点运行 → 抓 [7] SaveVideo 下载）。和上面 video.generate/h3（RunningHub OpenAPI 直连）是两个入口、
+    # 两套坏法（key 欠费/工作流改版 vs 登录态过期/串行锁被占），所以不合并。
+    # provider 以 local 开头 ⇒ 管理台不做 HTTP 探活（探它=真开浏览器跑一条，探活不许花钱）。
+    ("video.generate", "h3-rpa"):        {"provider": "local-h3rpa", "client": "gateway._h3_rpa_run", "fn": "POST /api/generate → 轮询 /api/status/<id> → 校验落盘", "fields": {"base_url": "H3_RPA_BASE_URL", "api_key": None, "model": None}},
+    # —— WAN 3.0 的【第三条入口】：youzan666.vip 中转（OpenAI 风格 /v1/videos/generations）——
+    # 与上面 xjai 那两条同模型不同中转：路径同款但素材类型多 first_frame/last_frame、prompt 上限 19000、
+    # prime 只支持 30 秒+1080p、成片是带 expiresAt 的直链（不是 /content 端点）⇒ 校验器与下载逻辑都不共用。
+    ("video.generate", "wan3-youzan"):      {"provider": "youzan666", "client": "gateway._yz_video", "fn": "POST /v1/videos/generations → GET /v1/videos/{id} → 下 result.url", "fields": {"base_url": "YOUZAN_BASE_URL", "api_key": "YOUZAN_API_KEY", "model": "YOUZAN_VIDEO_MODEL"}},
+    ("video.generate", "wan3-youzan-prime"):{"provider": "youzan666", "client": "gateway._yz_video", "fn": "同上，model=wan3.0-video-prime-1080p（只支持 30 秒 + 1080p）", "fields": {"base_url": "YOUZAN_BASE_URL", "api_key": "YOUZAN_API_KEY", "model": "YOUZAN_PRIME_MODEL"}},
+    # 智能调度档（用户 2026-10-07 给的说明）：明确 30 秒 + 1080P 时优先走符合条件的 Prime 通道，
+    # 其余规格与"自动时长"走标准版 ⇒ 我们只发 model=wan3.0-smart，选路在上游做；积分按 Smart 配置计费（我们没有那个配置的数）。
+    ("video.generate", "wan3-smart"):       {"provider": "youzan666", "client": "gateway._yz_video", "fn": "同上，model=wan3.0-smart（上游自行调度 prime/标准）", "fields": {"base_url": "YOUZAN_BASE_URL", "api_key": "YOUZAN_API_KEY", "model": "YOUZAN_SMART_MODEL"}},
     # —— 对口型（真实码在流水线模块里，非独立 client；run_lip_sync 吃本地路径、无 api_key 形参=流水线级）——
     ("lipsync", "default"):         {"provider": "runninghub", "client": "video_translate_pipeline", "fn": "run_lip_sync",  "fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_LIPSYNC_API_KEY", "model": None}},
     ("lipsync", "vo"):              {"provider": "runninghub", "client": "voiceover_replace", "fn": "_run_lipsync_workflow(私有,接前先提公开入口)","fields": {"base_url": "RUNNINGHUB_IDEOGRAM4_BASE_URL", "api_key": "RUNNINGHUB_ENTERPRISE_API_KEY", "model": None}},
@@ -170,6 +206,8 @@ PRICE_ROUTES = {
     ("text.complete", "mimo_pro"): 3, ("text.complete", "gemini38"): 6, ("text.complete", "deepseekv4"): 7,
     ("video.analyze", "default"): 6, ("video.analyze", "mimo"): 6,
     ("image.generate", "default"): 4, ("image.generate", "detail"): 8, ("image.generate", "generic"): 4, ("image.generate", "nano"): 4,
+    # GPT Image 2.5 占位同 generic 档（同端点同族，真差价等接上游计费后校准）；改价走 model_prices.json，不动代码
+    ("image.generate", "gpt-image2.5"): 4,
     # 网页/CLI 两条腿：我方账本先记 0（不谎报扣费）。豆包网页版不花钱；gflow 烧的是 Google Flow 额度，
     # 那是【另一个账户的配额】不是我方现金 ⇒ 等"1 元=几分"定了再一起补价。
     ("image.generate", "doubao"): 0, ("image.generate", "gflow"): 0,
@@ -177,9 +215,36 @@ PRICE_ROUTES = {
     # ⚠️ 去水印这条【没有实测价】：RunningHub 按 GPU 秒真扣钱，而"1 元=几分"还没定。
     #    20 是照同一家 faceswap 档借的占位数，只用于报价量级；跑通第一条后要按上游 usage 校准并改 model_prices.json。
     ("video.edit", "dewatermark"): 20,
+    # ⚠️ 高清修复同 RunningHub 按 GPU 秒真扣钱：4K 修复比去水印烧得多，60 是占位量级（跑完第一条
+    #    拿信封里的 upstream_usage.consume_money 回来校准并改 model_prices.json）。
+    ("video.edit", "enhance"): 60,
     ("video.generate", "omni-t2v"): 40, ("video.generate", "agnes-v"): 30, ("video.generate", "clone-r2v"): 50,
     ("video.generate", "seedance-2.5"): 60, ("video.generate", "seedance-2.0"): 50,
     ("video.generate", "wan3-dashscope"): 50, ("video.generate", "h3"): 60, ("video.generate", "motion"): 50,
+    # ⚠️ 动作迁移 RPA 腿 60 分/段是【占位·未实测】（2026-10-06 用户拍的占位值）：上游 RunningHub 按 GPU 秒真扣钱。
+    #    按段计不按秒（一次 RPA = 一段成片），见 meter() 里那条例外。跑通第一条后拿上游消耗校准、改 model_prices.json。
+    ("video.generate", "motion-rpa"): 60,
+    # ⚠️ xjai WAN 3.0 两条【无实测价】（2026-10-06 接入，从没跑过一条）：50/60 是照同族 wan3 腿
+    #    （clone-r2v=50、wan3-dashscope=50）与 prime 高档借来的占位量级，只用于报价，不是上游报价。
+    #    跑通第一条后必须拿上游实扣校准并改 model_prices.json（改价不用动代码）。
+    #    观测记录（同日元到 /v1/models 的只读探测，0 消耗）：上游自报 price=18（wan3）/20（prime），
+    #    但响应里【没有单位字段】（不是 currency、也没说按秒还是按条）⇒ 不当价用，等实扣或对方口径。
+    ("video.generate", "wan3"): 50, ("video.generate", "wan3-prime"): 60,
+    # H3 的浏览器 RPA 腿：花的是【对方 RunningHub 账户的 GPU 秒】（这台机器登录的那个账号），我方按次记账。
+    # 60 = 照同一条 H3 的 API 腿（video.generate/h3=60）借的量级。
+    # ✅ 2026-10-06 21:41→21:50 经网关实跑通第一条：1 段 6 秒 / 480×864(9:16) / plus / 墙钟 572.8s /
+    #    信封 charged=60 basis=flat（productions/2026-10-06-H3-RPA-9x16链路实测/outputs/h3-rpa-916-01.mp4）。
+    # ⚠️ 但 60 仍是【占位·未校准】：链路通了 ≠ 知道对方账户实扣多少人民币 —— 那要拿 RunningHub 账单对。
+    ("video.generate", "h3-rpa"): 60,
+    # ⚠️ youzan666 这三条【无实测价】= 占位（2026-10-07 接入；当天只做过 0 消耗的拒绝路径探针，
+    #    一次真提交都没跑过）：50/60 是照同模型的 xjai 两条借的占位量级，只用于报价。
+    #    文档只说"视频按秒扣积分、失败自动退还"、智能档说"按 Smart 配置计费"，都没给"每秒多少分"的数
+    #    ⇒ 报价必须写"无数据，以平台实扣为准"，跑通第一条后按账单校准并改 model_prices.json。
+    #    计价按默认【每 10 秒一档】（这家文档明说按秒扣，所以时长必须是乘数，别学 RPA 腿按次）。
+    ("video.generate", "wan3-youzan"): 50, ("video.generate", "wan3-youzan-prime"): 60,
+    # 智能档：文档只说"积分按 Smart 配置计费"，没给数 ⇒ 60 是【占位·无数据】（按它可能升 prime 的上限估）。
+    # 报价时必须写"无数据，以平台实扣为准"，跑通第一条后拿账单校准。
+    ("video.generate", "wan3-smart"): 60,
     ("lipsync", "default"): 20, ("lipsync", "vo"): 24,
     ("transcribe", "asr"): 0,   # 本地 ASR 免费
     # ⚠️ 音频这条是【分/千字】不是分/条（上游按字符计费）。0 = 还没实测单价、也没定"1 元=几分"，
@@ -278,8 +343,13 @@ def meter(capability: str, purpose: str, params: dict | None = None) -> dict:
     base = unit_price(capability, purpose)
     est = base
     if capability == "video.generate":
-        dur = int((params or {}).get("duration", 10))
-        est = base * max(1, (dur + 9) // 10)   # 每 10s 一个单位
+        if purpose in ("motion-rpa", "h3-rpa"):
+            # 两条浏览器 RPA 腿：一次任务 = 一段成片，时长由【上游工作流跑多久】决定、不是我方计费档
+            # （上游烧的是它自己账户的 GPU 秒）。传 duration/segments 只用于展示，别乘进价格。
+            est = base * max(1, int((params or {}).get("count") or 1))
+        else:
+            dur = int((params or {}).get("duration", 10))
+            est = base * max(1, (dur + 9) // 10)   # 每 10s 一个单位
     if capability == "video.edit":
         # 去水印烧的是 GPU 秒 ⇒ 时长越长越贵，先照 video.generate 的"每 10 秒一档"估（占位价，见 PRICE_ROUTES 注释）
         dur = int((params or {}).get("duration") or 10)
@@ -361,8 +431,15 @@ def _probe_reachable(base_url: str, api_key: str):
                 return ("upstream-5xx", f"GET {path} HTTP {e.code} 上游抖动(非我方配置)", ms)
             return ("reachable", f"GET {path} HTTP {e.code}(可达,未提交生成)", ms)
         except Exception as e:
-            return ("unreachable", f"GET {path} {type(e).__name__}", ms)
-    return ("no-probe", f"两种 /models 风格都 404（{last}）：非 OpenAI 风格，只能实跑才能验", round((time.time() - t) * 1000))
+            # 🔴 连接级异常（超时/拒连）不许在第一候选上就判死：youzan666 的 `/models`（不带 v1）会挂到超时，
+            #    而 `/v1/models` 实测 200 —— 原来这条直接 return unreachable，于是面板把一条好腿显示成"探不到"。
+            #    还剩别的候选形状就继续试；最后一条也失败才算 unreachable。（401/403/5xx 那些上面已各自分流）
+            if path != "/v1/models":
+                last = f"GET {path} {type(e).__name__}({round((time.time() - t0) * 1000)}ms)"
+                continue
+            return ("unreachable", f"GET {path} {type(e).__name__}", round((time.time() - t0) * 1000))
+    return ("no-probe", f"两种 /models 风格都没通过（{last}）：非 OpenAI 风格，只能实跑才能验",
+            round((time.time() - t) * 1000))
 
 
 # 可安全发最小真实请求验证的能力（便宜）；其余按端点可达/鉴权探测（避免计费生成）。
@@ -372,10 +449,16 @@ _LIVE_CHAT = {"text.complete", "video.analyze"}
 # ⚠️ 改 call() 的分支时同步这张表；管理面板用它回答"这条能不能直接调"。
 _ADAPTED = {("text.complete", "*"), ("video.analyze", "*"),
             ("image.generate", "default"), ("image.generate", "nano"),
+            ("image.generate", "gpt-image2.5"),
             ("video.generate", "omni-t2v"), ("video.generate", "seedance-2.5"),
             ("video.generate", "seedance-2.0"), ("video.generate", "agnes-v"),
-            ("video.generate", "h3"), ("audio.generate", "seed-audio"),
-            ("video.edit", "dewatermark"),
+            ("video.generate", "h3"), ("video.generate", "motion-rpa"),
+            ("video.generate", "wan3"), ("video.generate", "wan3-prime"),
+            ("video.generate", "h3-rpa"),
+            ("video.generate", "wan3-youzan"), ("video.generate", "wan3-youzan-prime"),
+            ("video.generate", "wan3-smart"),
+            ("audio.generate", "seed-audio"),
+            ("video.edit", "dewatermark"), ("video.edit", "enhance"),
             ("image.generate", "doubao"), ("image.generate", "gflow")}
 
 
@@ -790,7 +873,6 @@ def _gflow_image(prompt, out_path, refs=None, model="", aspect="9:16", project="
                 "exit_code": code, "headless": headless, "ms": ms}
     found = None
     try:
-        import json as _j
         found = _dig(_j.loads(so), ("path", "file", "output_path", "local_path", "dest", "saved"))
     except Exception:
         found = None                                      # 版本差异导致 --json 形变了：走目录扫描兜底
@@ -1050,11 +1132,13 @@ def _register_delivery_dewatermark(params, vals):
         print("[delivery] 去水印义务登记失败（不影响本次调用）：%s" % e, file=_sys.stderr)
 
 
-def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, poll_interval=10.0):
+def _rh_video_edit_run(vals, app_id, api_key="", label="去水印", job_id="", poll_timeout=1800.0, poll_interval=10.0,
+                       nodes_fn=None):
     """上传→跑 AI App→轮询→落盘。job_id 给了就【只捞结果不重提交】（孤儿任务捞回=0 分，重提交=双花）。
 
     轮询按 2026-10-03 那条 SSL 掐线教训写：同一个 taskId 退避重试、连续 6 次查询异常才判死，
     判死也只报 taskId 让人去查上游，绝不在这一步重新提交。
+    nodes_fn(fileName) 拼 nodeInfoList：dewatermark 传 _dewatermark_nodes，enhance 传自己的（纯函数，好单独断言）。
     """
     import asyncio
     import httpx
@@ -1064,23 +1148,22 @@ def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, p
     try:
         client = RunningHubClient(api_key) if api_key else RunningHubClient()
     except Exception as e:
-        return {"success": False, "error": "去水印拿不到 RunningHub 密钥：%s" % str(e)[:200]}
+        return {"success": False, "error": "%s拿不到 RunningHub 密钥：%s" % (label, str(e)[:200])}
     if not app_id:
-        return {"success": False, "error": "没配 RUNNINGHUB_DEWATERMARK_APP_ID（AI App 号）"}
+        return {"success": False, "error": "没配 %s 的 AI App 号（config.py 里补）" % label}
 
     async def _go():
         tid = job_id
         if not tid:
             up = await client.upload_resource(vals["video_path"])
             if not up:
-                return {"success": False, "error": "去水印：视频上传后没拿到 fileName（不提交，0 分）"}
+                return {"success": False, "error": "%s：视频上传后没拿到 fileName（不提交，0 分）" % label}
             sub = await client.submit_task(workflow_id=app_id, is_ai_app=True,
                                            instance_type=vals["instance_type"],
-                                           node_info_list=_dewatermark_nodes(
-                                               up, vals["duration"], vals["fps"], vals["prompt"]))
+                                           node_info_list=nodes_fn(up, vals))
             tid = sub.get("taskId")
             if not tid:
-                return {"success": False, "error": "去水印：提交没回 taskId %s" % str(sub)[:200]}
+                return {"success": False, "error": "%s：提交没回 taskId %s" % (label, str(sub)[:200])}
         start = time.time()
         fails = 0
         while time.time() - start < poll_timeout:
@@ -1092,7 +1175,7 @@ def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, p
                 fails += 1
                 if fails >= 6:
                     return {"success": False, "job_id": tid,
-                            "error": "去水印：查询连续失败 6 次（任务可能还在跑，别重提交）%s" % str(e)[:200]}
+                            "error": "%s：查询连续失败 6 次（任务可能还在跑，别重提交）%s" % (label, str(e)[:200])}
                 await asyncio.sleep(min(poll_interval, 3 * fails))
                 continue
             st = resp.get("taskStatus") or resp.get("status") or "UNKNOWN"
@@ -1100,7 +1183,7 @@ def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, p
                 item = next((i for i in (resp.get("results") or []) if i.get("url")), None)
                 if not item:
                     return {"success": False, "job_id": tid,
-                            "error": "去水印：上游回 SUCCESS 但没有结果链接 %s" % str(resp.get("results"))[:200]}
+                            "error": "%s：上游回 SUCCESS 但没有结果链接 %s" % (label, str(resp.get("results")))[:200]}
                 url = item["url"]
                 p = Path(vals["output_path"])
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -1109,7 +1192,7 @@ def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, p
                     r.raise_for_status()
                     if len(r.content) < 1024:      # 404 页/错误页也是 200，别把它当 mp4 落盘
                         return {"success": False, "job_id": tid,
-                                "error": "去水印：下载到的只有 %d 字节，不像视频" % len(r.content)}
+                                "error": "%s：下载到的只有 %d 字节，不像视频" % (label, len(r.content))}
                     p.write_bytes(r.content)
                 usage = resp.get("usage") or {}
                 return {"success": True, "path": str(p), "url": url, "job_id": tid,
@@ -1121,15 +1204,984 @@ def _dewatermark_run(vals, app_id, api_key="", job_id="", poll_timeout=1800.0, p
                         "error": None}
             if st in ("FAILED", "ERROR"):
                 return {"success": False, "job_id": tid,
-                        "error": "去水印：上游任务失败 %s" % (resp.get("msg") or resp.get("errorMessage")
-                                                            or resp.get("failedReason") or st)}
+                        "error": "%s：上游任务失败 %s" % (label,
+                                                          (resp.get("msg") or resp.get("errorMessage")
+                                                           or resp.get("failedReason") or st))}
         return {"success": False, "job_id": tid,
-                "error": "去水印：轮询超时 %ss（taskId 已留存，可继续查，不重提交）" % int(poll_timeout)}
+                "error": "%s：轮询超时 %ss（taskId 已留存，可继续查，不重提交）" % (label, int(poll_timeout))}
 
     try:
         return asyncio.run(_go())
     except Exception as e:
-        return {"success": False, "error": "去水印异常 %s: %s" % (type(e).__name__, str(e)[:260])}
+        return {"success": False, "error": "%s异常 %s: %s" % (label, type(e).__name__, str(e)[:260])}
+
+
+# —— 视频高清修复（RunningHub AI App，config.RUNNINGHUB_ENHANCE_*）——
+def _enhance_payload(params: dict):
+    """花钱【之前】的校验，返回 (vals, err)。协议与 dewatermark 一致，只吃 video 节点（升档参数走工作流内置）。"""
+    src = str(params.get("video_path") or "").strip()
+    if not src:
+        return None, "高清修复要给 video_path（本地视频文件路径）"
+    if src.startswith(("http://", "https://")):
+        return None, ("高清修复的 video_path 只收本地文件，这里收到公网 URL：%s"
+                      "（先落到本地再提交；上游给的结果链接 24 小时就失效，不能当输入用）" % src[:80])
+    if not _os.path.isfile(src):
+        return None, "高清修复的视频文件不存在：%s" % src[:160]
+    out = str(params.get("output_path") or "").strip()
+    if not out:
+        return None, "高清修复必须给 output_path（结果链接 24 小时失效，不落盘等于白花钱）"
+    inst = str(params.get("instance_type") or _get("RUNNINGHUB_ENHANCE_INSTANCE_TYPE") or "default")
+    if inst not in _RH_INSTANCE_ALLOWED:
+        return None, "instance_type 只认 %s，给了 %r" % ("/".join(_RH_INSTANCE_ALLOWED), inst)
+    if not str(_get("RUNNINGHUB_ENHANCE_VIDEO_NODE") or "").strip():
+        return None, ("缺节点号配置 RUNNINGHUB_ENHANCE_VIDEO_NODE（对方工作流里那个吃上传文件的节点号，"
+                      "在 config.py / .env 里补上再花钱）")
+    return {"video_path": src, "output_path": out, "instance_type": inst}, None
+
+
+def _enhance_nodes(file_name, vals):
+    """拼 nodeInfoList（纯函数，好单独断言）。⚠️ video 节点要的是上传后的 fileName，不是 download_url。
+
+    可选节点（分辨率档位 / 模型切换）：config 里填了 nodeId + value 才带进去；没填 = 走工作流内置默认，
+    节点号只住 config（.env 可覆盖），代码里不留字面量兜底。
+    """
+    nodes = [{"nodeId": _get("RUNNINGHUB_ENHANCE_VIDEO_NODE"), "fieldName": "video",
+              "fieldValue": file_name, "description": "Load video"}]
+    for key, desc in (("RESOLUTION", "Output resolution"), ("MODEL", "Model / algorithm")):
+        nid = _get("RUNNINGHUB_ENHANCE_%s_NODE" % key)
+        val = _get("RUNNINGHUB_ENHANCE_%s_VALUE" % key)
+        if str(nid or "").strip() and str(val or "").strip():
+            nodes.append({"nodeId": nid, "fieldName": _get("RUNNINGHUB_ENHANCE_%s_FIELD" % key) or "value",
+                          "fieldValue": val, "description": desc})
+    return nodes
+
+
+# ==== 动作迁移（8091 nzdh 工作室 · RunningHub 浏览器 RPA 腿）====
+# 这条腿和上面所有腿都不一样：花钱的动作发生在本机的 Playwright 里（登录 RH 账号池 → 打开公共工作流
+# 2106377827540103169 → 往节点塞素材 → 点运行 → 等节点 285 出片 → 下载 final.mp4）。
+# 所以网关不直连厂商，只做三件事：校验参数 → 转调 8091 → 盯到终态并把产物落到调用方要的路径。
+# 🔴 60 分/段是【占位】：上游按 GPU 秒真扣钱，而"1 元=几分"未定（见 PRICE_ROUTES 同类注释）；
+#    跑通第一条后按上游消耗校准，改 model_prices.json 即可，不用动代码。
+NZDH_DEFAULT_BASE = "http://127.0.0.1:8091"
+NZDH_OUTPUT_DIR = r"D:\nzdh\outputs\womenswear_studio"
+
+
+def _motion_rpa_base(params: dict | None = None) -> str:
+    """8091 的地址：调用方 params 显式给 > .env 的 NZDH_BASE_URL > 本机默认。"""
+    b = str((params or {}).get("nzdh_base") or _get("NZDH_BASE_URL") or NZDH_DEFAULT_BASE)
+    return b.rstrip("/")
+
+
+def _motion_rpa_payload(params: dict) -> tuple:
+    """花钱【之前】的校验，返回 (vals, err)。三种入口，缺件一律本地拦：
+
+  - 只捞不重投：给 job_id（=8091 的 task_id）⇒ 不 POST 任何提交，只轮询它
+  - 补跑第五步：给 task_id（前四步产物已在 8091 盘上）⇒ 打 /api/womenswear-studio/step5-rpa
+  - 整条流水线：product 模式要 product_url+video_url+model_image_path，
+    creator 模式要 raw_product_path+source_video_path ⇒ 打 /api/womenswear-studio/run（它自己会跑到第五步）
+
+（必填形状按 womenswear/router.py:_start_task 的真实校验抄，不照 README/PRD 抄——那边写模特图可选，代码是必填。）
+    """
+    job = str(params.get("job_id") or "").strip()
+    tid = str(params.get("task_id") or "").strip()
+    out = str(params.get("output_path") or "").strip()
+    eng = str(params.get("engine") or "plus").lower()
+    if eng not in ("plus", "lite", "standard"):
+        return None, "动作迁移引擎只认 plus/lite/standard（收到 %r）；不确定就用 plus" % eng
+    if job and not tid:
+        return {"mode": "poll", "task_id": job, "output_path": out, "engine": eng,
+                "timeout": 0, "workflow_url": ""}, None
+    if tid:
+        return {"mode": "step5", "task_id": tid, "output_path": out, "engine": eng,
+                "timeout": int(params.get("task_timeout") or 3600),
+                "workflow_url": str(params.get("workflow_url") or "")}, None
+    mode = str(params.get("source_mode") or "product").lower()
+    if mode not in ("product", "creator"):
+        return None, "source_mode 只认 product / creator（收到 %r）" % mode
+    need = (("product_url", "video_url", "model_image_path") if mode == "product"
+            else ("raw_product_path", "source_video_path"))
+    missing = [k for k in need if not str(params.get(k) or "").strip()]
+    if missing:
+        return None, "%s 模式缺必填参数：%s" % (mode, ", ".join(missing))
+    body = {"source_mode": mode, "engine": eng}
+    for k in ("product_url", "video_url", "raw_product_path", "source_video_path",
+              "model_image_path", "scene_image_path"):
+        if str(params.get(k) or "").strip():
+            body[k] = params[k]
+    return {"mode": "run", "task_id": "", "output_path": out, "engine": eng,
+            "body": body}, None
+
+
+def _register_delivery_motion_rpa(sid: str, task: str, expect_path: str, budget: int) -> None:
+    """先记账再花钱（同去水印那条规矩）：动作迁移欠一条成片，文件真出现才销账。
+
+    🔴 炸了绝不能影响本次调用，但必须留下声音（不写 except: pass）。
+    8091 的 task_id 是提交后才产生的，所以 run 模式只能在拿到 task_id 后立刻登记 ——
+    这仍比"出片后才记"强：中途超时/失败时台账上挂着的就是那条没落盘的片子。
+    """
+    if not sid or not expect_path:
+        return
+    try:
+        import delivery_ledger
+        # 任务名兜底用产物文件名（同去水印那条）：台账按 (会话,任务,技能) 认一条义务，
+        # 传空串会让这个会话的几段互相覆盖 ⇒ 每一段都得有自己的名字。
+        stem = _os.path.splitext(_os.path.basename(expect_path))[0]
+        task = str(task or "").strip() or stem
+        delivery_ledger.open_obligation(sid, task[:60], "motion-transfer",
+                                        [expect_path], budget_credits=int(budget or 0))
+    except Exception as e:
+        print("[delivery] 动作迁移义务登记失败（不影响本次调用）：%s" % e, file=_sys.stderr)
+
+
+def _motion_rpa_run(params: dict) -> dict:
+    """转调 8091 的动作迁移工作室，盯到终态。job_id/task_id 给了就【只捞不重投】（重投=双花）。"""
+    import time
+    import httpx
+    from pathlib import Path
+
+    vals, err = _motion_rpa_payload(params)
+    if err:
+        return {"success": False, "error": err}
+    base = _motion_rpa_base(params)
+    poll_timeout = float(params.get("poll_timeout") or 2400)
+    poll_interval = float(params.get("poll_interval") or 10)
+    sid = str(params.get("session") or _os.environ.get("DSH_SESSION_ID") or "").strip()
+
+    def _fail(msg, job_id=""):
+        return {"success": False, "job_id": job_id or vals["task_id"] or None, "error": msg}
+
+    tid = vals["task_id"]
+    with httpx.Client(timeout=60.0) as hc:
+        if vals["mode"] == "poll":
+            # 只捞不重投：任务已在 8091 上跑，这里只看它到哪了（重投=双花，RPA 还占着全局串行锁）
+            expect = vals["output_path"] or str(Path(NZDH_OUTPUT_DIR) / tid / "final.mp4")
+        elif vals["mode"] == "run":
+            # 带上会话主人：8091 用它校验"这一批是不是这条会话批的"，并把主人写进任务档案（历史按它过滤）
+            vals["body"]["session"] = sid
+            try:
+                r = hc.post(base + "/api/womenswear-studio/run", json=vals["body"])
+            except Exception as e:
+                return _fail("动作迁移：8091 没应答（起没起？在 D:\\nzdh 下 python app.py）%s: %s"
+                             % (type(e).__name__, str(e)[:200]))
+            if r.status_code == 423:
+                # 8091 自己也在查批准条子：这是闸的正常工作，不是故障，别把它报成"服务坏了"
+                return _fail("动作迁移：8091 判定这次没有花钱批准条子 ⇒ %s"
+                             % str(r.json().get("detail") or r.text)[:240])
+            if r.status_code >= 400:
+                return _fail("动作迁移：提交被拒 HTTP %s ⇒ %s" % (r.status_code, r.text[:240]))
+            tid = str((r.json() or {}).get("task_id") or "")
+            if not tid:
+                return _fail("动作迁移：提交没回 task_id ⇒ %s" % r.text[:200])
+            # 🔴 /run 自己会一路跑到 Step5（pipeline 末尾就是 RPA+账号池），这里绝不再补 step5-rpa
+            expect = vals["output_path"] or str(Path(NZDH_OUTPUT_DIR) / tid / "final.mp4")
+            _register_delivery_motion_rpa(sid, str(params.get("task") or ""), expect,
+                                          int(params.get("budget_credits") or 0))
+        else:  # step5：前四步已备好，只重跑第五步（含"这条 RPA 失败了换号再跑一次"）
+            tid = vals["task_id"]
+            try:
+                body = {"task_id": tid, "timeout": vals["timeout"], "session": sid}
+                if vals["workflow_url"]:
+                    body["workflow_url"] = vals["workflow_url"]
+                r = hc.post(base + "/api/womenswear-studio/step5-rpa", json=body)
+            except Exception as e:
+                return _fail("动作迁移：Step5 触发没送达（任务 %s 还在，先查它别重投）%s: %s"
+                             % (tid, type(e).__name__, str(e)[:200]), tid)
+            if r.status_code == 423:
+                return _fail("动作迁移：8091 判定这次没有花钱批准条子 ⇒ %s"
+                             % str(r.json().get("detail") or r.text)[:240], tid)
+            if r.status_code >= 400:
+                return _fail("动作迁移：Step5 被拒 HTTP %s ⇒ %s" % (r.status_code, r.text[:240]), tid)
+            expect = vals["output_path"] or str(Path(NZDH_OUTPUT_DIR) / tid / "final.mp4")
+            _register_delivery_motion_rpa(sid, str(params.get("task") or ""), expect,
+                                          int(params.get("budget_credits") or 0))
+
+        start, fails, last = time.time(), 0, None
+        while time.time() - start < poll_timeout:
+            time.sleep(poll_interval)
+            try:
+                q = hc.get(base + "/api/womenswear-studio/task/%s" % tid)
+                q.raise_for_status()
+                last = q.json()
+                fails = 0
+            except Exception as e:
+                fails += 1
+                if fails >= 6:
+                    return _fail("动作迁移：查询连续失败 6 次（任务 %s 可能还在跑，别重提交）%s: %s"
+                                 % (tid, type(e).__name__, str(e)[:200]), tid)
+                time.sleep(min(poll_interval, 3 * fails))
+                continue
+            st = str(last.get("status") or "")
+            extra = last.get("extra", {}) or {}
+            if st == "SUCCESS":
+                url = str((last.get("outputs") or [{}])[0].get("fileUrl") or "")
+                src = Path(NZDH_OUTPUT_DIR) / tid / "final.mp4"
+                path = None
+                if vals["output_path"]:
+                    if not src.is_file():
+                        return _fail("动作迁移：上游回 SUCCESS 但盘上没有 %s" % src, tid)
+                    p = Path(vals["output_path"])
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        d = hc.get(base + url)
+                        d.raise_for_status()
+                    except Exception as e:
+                        return _fail("动作迁移：从 8091 取成片失败 %s: %s"
+                                     % (type(e).__name__, str(e)[:200]), tid)
+                    if len(d.content) < 1024:      # 错误页也是 200，别把它当 mp4 落盘
+                        return _fail("动作迁移：下载到的只有 %d 字节，不像视频" % len(d.content), tid)
+                    p.write_bytes(d.content)
+                    path = str(p)
+                else:
+                    path = str(src)
+                extra = last.get("extra", {}) or {}
+                return {"success": True, "path": path, "url": (base + url) if url else None,
+                        "job_id": tid, "engine": vals["engine"],
+                        "account": extra.get("rpa_account") or last.get("rh_task_id") or "",
+                        "upstream": {k: last.get(k) for k in ("stage", "progress", "current_step")},
+                        "error": None}
+            if st in ("FAILED", "CANCELED", "CANCELLED"):
+                # 上游文案二次不可信（"请填写提示词"那类），把原始 error + 失败步骤一起交回
+                return _fail("动作迁移：任务失败于 %s ⇒ %s"
+                             % (extra.get("failed_step") or last.get("current_step") or "?",
+                                str(last.get("error") or st)[:300]), tid)
+        return _fail("动作迁移：轮询超时 %ss（task %s 已留存，可继续查，不重提交）"
+                     % (int(poll_timeout), tid), tid)
+
+
+# ==== xjai.beauty WAN 3.0（OpenAI 兼容 /v1/videos/generations；下载腿【也要】 Bearer）====
+# 契约（2026-10-06 用户给的文档）：提交 POST {base}/v1/videos/generations → {id,status:"processing"}；
+# 轮询 GET {base}/v1/videos/{id} → processing | success(result.url) | failed(error)；
+# 取片 GET {base}/v1/videos/{id}/content。和 vinted 那条最大的差别：content 不是免鉴权的签名链，
+# 直接 urlopen 它会 401，所以这里下载必须带 Authorization。
+_XJAI_MODELS = ("wan3.0-video", "wan3.0-video-prime")
+_XJAI_MEDIA_KINDS = ("image", "video", "audio")     # media[].type 只有这三种
+_XJAI_RESOLUTIONS = ("480P", "720P", "1080P")
+_XJAI_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16")
+# media[].url 必须是【公网可达】链接（上游自己去抓）。本地路径在这一层就拒，别花三分钱换一个 400。
+_XJAI_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+              ".gif": "image/gif", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+              ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac", ".m4a": "audio/mp4"}
+
+
+def _xjai_mime(url: str) -> str:
+    import urllib.parse
+    ext = _os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
+    return _XJAI_MIME.get(ext, "")
+
+
+def _xjai_payload(params: dict, model: str = "") -> tuple:
+    """标准入参 → WAN 3.0 请求体。返回 (body, err)；err 非空 ⇒ 一个字节都不许发出去。
+
+    纯函数、不碰网络：这样闸能整块抠出来跑值表（见 scripts/check-xjai-wan3-lane.py）。
+    """
+    prompt = str(params.get("prompt") or "").strip()
+    if not prompt:
+        return None, "WAN3 缺 prompt"
+    if len(prompt) > 20000:
+        return None, "WAN3 prompt 超过 20000 字符（%d）" % len(prompt)
+    if model and model not in _XJAI_MODELS:
+        return None, "WAN3 未知 model=%s（只认 %s）" % (model, "|".join(_XJAI_MODELS))
+    raw_dur = params.get("duration")
+    if raw_dur in (None, ""):
+        duration = 5                                   # 缺省才用默认档
+    else:
+        try:
+            duration = int(raw_dur)
+        except (TypeError, ValueError):
+            return None, "WAN3 duration 要整数秒，收到 %r" % (raw_dur,)
+    if not 1 <= duration <= 30:                        # 🔴 0/负数是【传错了】，不许当成"没传"回落成 5
+        return None, "WAN3 duration 超出 1–30 秒（%d）" % duration
+    resolution = str(params.get("resolution") or "1080P").upper()
+    if resolution not in _XJAI_RESOLUTIONS:
+        return None, "WAN3 resolution 只认 %s（收到 %s）" % ("|".join(_XJAI_RESOLUTIONS), resolution)
+    ratio = str(params.get("ratio") or params.get("aspect_ratio") or "16:9")
+    if ratio not in _XJAI_RATIOS:
+        return None, "WAN3 ratio 只认 %s（收到 %s）" % ("|".join(_XJAI_RATIOS), ratio)
+    media, bad = [], []
+    for kind in _XJAI_MEDIA_KINDS:
+        items = params.get(kind + "_urls") or params.get(kind + "s") or []
+        if isinstance(items, str):
+            items = [items]
+        for one in items:
+            url = str(one or "").strip()
+            if not url.lower().startswith(("http://", "https://")):
+                bad.append("%s:%s" % (kind, (url[:60] or "(空)")))
+                continue
+            mime = _xjai_mime(url)
+            if not mime:
+                bad.append("%s:%s（认不出扩展名，给不了 mime_type）" % (kind, url[:60]))
+                continue
+            media.append({"type": kind, "url": url, "mime_type": mime})
+    if bad:
+        return None, ("WAN3 media[] 必须是公网 http(s) 链接（上游自己去抓，不吃本地路径）：%s"
+                      % "、".join(bad[:4]))
+    # 参考料上限是上游 /v1/models 自报的硬数（2026-10-06 只读探测：images 10 / videos 5 / audios 5 / 合计 20）。
+    # 超了它在提交时就 400，本地先拒=少花一次往返、也少一次"上游拒了但我们记了失败"的误读。
+    _limits = {"image": 10, "video": 5, "audio": 5}
+    for kind, cap in _limits.items():
+        n = sum(1 for m in media if m["type"] == kind)
+        if n > cap:
+            return None, "WAN3 %s 参考最多 %d 个（这次给了 %d）" % (kind, cap, n)
+    if len(media) > 20:
+        return None, "WAN3 参考料合计最多 20 个（这次 %d）" % len(media)
+    if params.get("media"):
+        return None, "WAN3 不接受 media 字段，请用 image_urls / video_urls / audio_urls"
+    body = {"model": model or _XJAI_MODELS[0], "prompt": prompt, "duration": duration,
+            "resolution": resolution, "ratio": ratio,
+            "audio": bool(params.get("audio"))}          # 上游默认 false，要声音必须显式 true
+    if media:
+        body["media"] = media
+    for k in ("seed", "negative_prompt"):
+        if params.get(k) not in (None, "", 0):
+            body[k] = params[k]
+    return body, None
+
+
+def _xjai_video(base_url, api_key, body, out_path=None,
+                poll_timeout=1800.0, poll_interval=8.0, job_id=""):
+    """WAN 3.0 出片：提交 → 轮询到终态 → 带 Bearer 下载落盘。返回信封，不抛。
+
+    🔴 轮询断线只【退避重问同一个 task】，绝不重发提交（重发 = 真生成第二条、花两份钱）；
+       连续 6 次问不上才判死，且判死时把 job_id 交回，事后能捞。
+    """
+    import json as _json
+    import time as _t
+    import urllib.error
+    import urllib.request
+    if not base_url or not api_key:
+        return {"success": False, "error": "缺 XJAI_BASE_URL/XJAI_API_KEY（.env）"}
+    base = base_url.rstrip("/")
+
+    def _req(url, method="GET", payload=None, timeout=60.0):
+        data = _json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Authorization": "Bearer %s" % api_key,
+                     "Content-Type": "application/json", "User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+        return _json.loads(raw) if raw.strip() else {}
+
+    tid, model = str(job_id or ""), str((body or {}).get("model") or "")
+    try:
+        if not tid:
+            sub = _req(base + "/v1/videos/generations", "POST", body, timeout=120.0)
+            tid = str(sub.get("id") or sub.get("task_id") or "")
+            if not tid:
+                return {"success": False, "error": "提交未返回 id：%s" % str(sub)[:200]}
+        start, misses = _t.time(), 0
+        last = {}
+        while _t.time() - start < poll_timeout:
+            try:
+                last = _req("%s/v1/videos/%s" % (base, tid))
+                misses = 0
+            except urllib.error.HTTPError as e:
+                if e.code == 404:      # 任务号不存在：不是抖动，问下去也不会有
+                    return {"success": False, "job_id": tid,
+                            "error": "查询 404（任务 %s 在上游查不到）：%s"
+                                     % (tid, e.read().decode("utf-8", "replace")[:200])}
+                if 400 <= e.code < 500:
+                    return {"success": False, "job_id": tid,
+                            "error": "HTTP %d：%s" % (e.code, e.read().decode("utf-8", "replace")[:200])}
+                misses += 1
+                if misses >= 6:
+                    return {"success": False, "job_id": tid,
+                            "error": "查询连续 6 次失败（任务 %s 可能仍在出片，别重提交）HTTP %d" % (tid, e.code)}
+                _t.sleep(min(60.0, poll_interval * misses))
+                continue
+            except (urllib.error.URLError, OSError) as e:
+                misses += 1
+                if misses >= 6:
+                    return {"success": False, "job_id": tid,
+                            "error": "查询连续 6 次连接失败（任务 %s 可能仍在出片，别重提交）%s: %s"
+                                     % (tid, type(e).__name__, str(e)[:200])}
+                _t.sleep(min(60.0, poll_interval * misses))
+                continue
+            st = str(last.get("status") or "").lower()
+            if st in ("success", "succeeded", "completed"):
+                break
+            if st in ("failed", "error", "cancelled", "canceled"):
+                res = last.get("result") or {}
+                return {"success": False, "job_id": tid, "model": model,
+                        "error": "生成失败：%s" % str(res.get("error") or last.get("error") or st)[:300]}
+        else:
+            return {"success": False, "job_id": tid, "model": model,
+                    "error": "轮询超时 %ss（任务 %s 已留存，继续查它，不重提交）" % (int(poll_timeout), tid)}
+        res = last.get("result") or {}
+        url = res.get("url") or last.get("url") or ""
+        path, got_bytes = None, None
+        if out_path:
+            # 🔴 content 端点也要 Bearer：签名链式的免鉴权下载在这条腿上不存在，
+            #    少了头就是 401，而 401 会被误读成"key 坏了"。
+            content_url = "%s/v1/videos/%s/content" % (base, tid)
+            req = urllib.request.Request(content_url,
+                                         headers={"Authorization": "Bearer %s" % api_key,
+                                                  "User-Agent": BROWSER_UA})
+            try:
+                with urllib.request.urlopen(req, timeout=600.0) as resp:
+                    data = resp.read()
+            except Exception as e:
+                return {"success": False, "job_id": tid, "url": url or content_url,
+                        "error": "查询成功但下载失败 %s: %s（任务 %s 已出片，重试下载即可，别重提交）"
+                                 % (type(e).__name__, str(e)[:200], tid)}
+            if len(data) < 1024:                      # 错误页也可能是 200，别当 mp4 落盘
+                return {"success": False, "job_id": tid, "url": content_url,
+                        "error": "下载到的只有 %d 字节，不像视频" % len(data)}
+            p = _os.path.abspath(str(out_path))
+            _os.makedirs(_os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+            path, got_bytes = p, len(data)
+        return {"success": bool(url or path), "url": url, "path": path, "job_id": tid,
+                "model": model, "duration": (body or {}).get("duration"),
+                "resolution": (body or {}).get("resolution"), "ratio": (body or {}).get("ratio"),
+                "audio": (body or {}).get("audio"), "media_count": len((body or {}).get("media") or []),
+                "bytes": got_bytes, "error": None}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "job_id": tid or None,
+                "error": "HTTP %d：%s" % (e.code, e.read().decode("utf-8", "replace")[:300])}
+    except Exception as e:
+        return {"success": False, "job_id": tid or None,
+                "error": "%s: %s" % (type(e).__name__, str(e)[:300])}
+
+
+# ==== youzan666.vip：WAN 3.0 第三条入口（OpenAI 风格 /v1/videos/generations）====
+# 契约（2026-10-07 用户给的文档 + 当天【不带 key】的只读路径探测）：
+#   提交 POST {base}/v1/videos/generations → 202 {id,status:"processing",concurrency}
+#   轮询 GET  {base}/v1/videos/{id}        → processing | success(result.url, expiresAt) | failed(error)
+#   下载      直接 GET result.url（网关自己的持久直链，不是 xjai 那种 /content 端点）
+# 探测记录：以上路径不带 key 全回 401「缺少API Key」，而故意打不存在的路径回 404 API_NOT_FOUND
+#   ⇒ 路径形状是真的；但【任何一次真提交都还没跑过】（没 key）。
+_YZ_MODELS = ("wan3.0-video", "wan3.0-video-prime", "wan3.0-video-prime-1080p", "wan3.0-smart")
+# 🔴 上面四个 id 分两类：前两个是【文档 §2 写的名字】，本 key 实测回 400「模型不存在或未启用」；
+#    后两个是 2026-10-07 用拒绝路径探针（素材指 127.0.0.1 ⇒ 按文档必在预扣前被拒）测出来真正启用的名字：
+#      400 invalid_request_error「模型 X 不存在或未启用」= 卡在模型名校验
+#      422 EXTERNAL_MEDIA_URL_BLOCKED                        = 模型名已过、卡在素材校验
+#    ⇒ 判"模型名通不通"不必花钱，用这条 0 消耗的差异就能测；文档名一律不许当可用路由（已屏蔽，见 model_prices.json）。
+_YZ_RESOLUTIONS = ("480p", "720p", "1080p")     # 文档示例用的是小写 p（xjai 那条文档写的是大写 P）
+_YZ_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4")
+_YZ_MAX_PROMPT = 19000                          # 文档 §3.4：提示词 ≤19000 字符（xjai 是 20000，别抄错）
+_YZ_MEDIA_CAPS = {"image": 10, "video": 5, "audio": 5}   # 文档 §3.4；总素材 ≤20
+_YZ_MEDIA_TOTAL = 20
+# media[].type 的合法值（文档 §3.2 列的 kind 集合）。first_frame/last_frame 是这家比 xjai 多的两种。
+_YZ_MEDIA_TYPES = ("image", "video", "audio", "first_frame", "last_frame",
+                   "reference_image", "reference_video", "reference_audio")
+
+
+def _yz_public_https(url: str) -> bool:
+    """素材必须是【公网 https】：http 会被判 EXTERNAL_MEDIA_URL_INSECURE，
+    指回环/内网/保留地址会被判 EXTERNAL_MEDIA_URL_BLOCKED（文档 §3.3/§7.3）。"""
+    import urllib.parse
+    try:
+        u = urllib.parse.urlsplit(str(url))
+    except ValueError:
+        return False
+    if u.scheme != "https" or not u.hostname:
+        return False
+    host = u.hostname.lower()
+    if host in ("localhost", "127.0.0.1", "::1") or host.startswith(("10.", "127.", "192.168.", "169.254.", "172.")):
+        return False
+    return True
+
+
+def _yz_payload(params: dict, model: str = "") -> tuple:
+    """标准入参 → 这家中转的请求体。返回 (body, err)；err 非空 ⇒ 一个字节都不许发出去。
+
+    纯函数、不碰网络，闸能整块抠出来跑值表（scripts/check-wan3-youzan-lane.py）。
+    参数边界全部照【这一家】的文档抄，不沿用 xjai 那两条的数（上限、大小写、素材类型都不一样）。
+    """
+    job = str(params.get("job_id") or "").strip()
+    if job:
+        # 只捞不重投：任务在上游已经存在，【不许】再要求 prompt/素材这些提交期参数
+        # （2026-10-07 捞回那条 429 事故任务时，校验器还管它要 prompt，0 秒就拒了 = 捞回等于没捞）。
+        return {"mode": "poll", "task_id": job,
+                "output_path": str(params.get("output_path") or "").strip()}, None
+    prompt = str(params.get("prompt") or "").strip()
+    if not prompt:
+        return None, "WAN3-YZ 缺 prompt"
+    if len(prompt) > _YZ_MAX_PROMPT:
+        return None, "WAN3-YZ prompt 超过 %d 字符（这次 %d）" % (_YZ_MAX_PROMPT, len(prompt))
+    if model and model not in _YZ_MODELS:
+        return None, "WAN3-YZ 未知 model=%s（只认 %s）" % (model, "|".join(_YZ_MODELS))
+    prime = model.startswith("wan3.0-video-prime")     # 覆盖 -prime 与实测启用的 -prime-1080p
+    smart = model == "wan3.0-smart"
+    raw = params.get("duration")
+    if smart and raw in (None, ""):
+        duration = None            # 智能档允许【自动时长】：不写这个字段，交给上游调度（文档 §2）
+    else:
+        try:
+            duration = int(30 if (raw in (None, "") and prime) else (5 if raw in (None, "") else raw))
+        except (TypeError, ValueError):
+            return None, "WAN3-YZ duration 要整数秒（或留空让智能档自动决定），收到 %r" % (raw,)
+        if prime and duration != 30:
+            # 文档 §2 写死：prime「仅支持 30 秒、1080P」。静默改成 30 会让报价与实际片长不符 ⇒ 大声拒。
+            return None, "WAN3-YZ prime 档只支持 30 秒（收到 %d）；要别的时长走标准/智能档" % duration
+        if not 1 <= duration <= 30:
+            return None, "WAN3-YZ duration 超出 1–30 秒（%d）" % duration
+    resolution = str(params.get("resolution") or ("1080p" if prime else "720p")).lower()
+    if resolution not in _YZ_RESOLUTIONS:
+        return None, "WAN3-YZ resolution 只认 %s（收到 %s）" % ("/".join(_YZ_RESOLUTIONS), resolution)
+    if prime and resolution != "1080p":
+        return None, "WAN3-YZ prime 档只支持 1080p（收到 %s）" % resolution
+    ratio = str(params.get("ratio") or params.get("aspect_ratio") or "16:9")
+    if ratio not in _YZ_RATIOS:
+        return None, ("WAN3-YZ 没有 %r 档（文档没列 ratio 枚举，这里收 %s；不确定就别传，默认 16:9）"
+                      % (ratio, "|".join(_YZ_RATIOS)))
+    media, bad = [], []
+    for kind in ("image", "video", "audio", "first_frame", "last_frame"):
+        items = params.get(kind + "_urls") or params.get(kind + "s") or params.get(kind + "_url") or []
+        if isinstance(items, str):
+            items = [items]
+        for one in items:
+            url = str(one or "").strip()
+            if not url:
+                continue
+            if not _yz_public_https(url):
+                bad.append("%s:%s" % (kind, url[:56] or "(空)"))
+                continue
+            media.append({"type": kind, "url": url})
+    if bad:
+        return None, ("WAN3-YZ 素材必须是【公网 https】URL（http 判 EXTERNAL_MEDIA_URL_INSECURE、"
+                      "本机/内网/保留地址判 EXTERNAL_MEDIA_URL_BLOCKED、本地路径不收）：%s" % "、".join(bad[:4]))
+    caps = dict(_YZ_MEDIA_CAPS)
+    caps["first_frame"] = caps["last_frame"] = 1
+    for kind in ("image", "video", "audio", "first_frame", "last_frame"):
+        n = sum(1 for m in media if m["type"] == kind)
+        if n > caps[kind]:
+            return None, "WAN3-YZ %s 参考最多 %d 个（这次 %d）" % (kind, caps[kind], n)
+    if len(media) > _YZ_MEDIA_TOTAL:
+        return None, "WAN3-YZ 素材合计最多 %d 个（这次 %d）" % (_YZ_MEDIA_TOTAL, len(media))
+    body = {"model": model or _YZ_MODELS[0], "prompt": prompt,
+            "resolution": resolution, "ratio": ratio}
+    if duration is not None:
+        body["duration"] = duration      # 智能档允许不写时长（=自动），写了就照写的发
+    if media:
+        body["media"] = media
+    return body, None
+
+
+def _yz_download(url: str, api_key: str, allowed_host: str, timeout: float = 600.0):
+    """下载成片。🔴 默认【不带】Authorization：result.url 可能指向别的域，
+    把中转 key 顺手发给第三方 = 凭据泄露。只有当主机仍是 base 的那一个、且首探回 401/403 时，
+    才补一次带 Bearer 的请求；重定向一离开这个主机就立刻丢头（自己接管 redirect）。
+    返回 (bytes, error)。
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    class _StripAuthOnCrossHost(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            nr = urllib.request.HTTPRedirectHandler.redirect_request(
+                self, req, fp, code, msg, headers, newurl)
+            if nr is not None and urllib.parse.urlsplit(nr.full_url).hostname != \
+                    urllib.parse.urlsplit(req.full_url).hostname:
+                nr.remove_header("Authorization")
+            return nr
+
+    def _get(with_auth):
+        h = {"User-Agent": BROWSER_UA}
+        if with_auth and api_key:
+            h["Authorization"] = "Bearer %s" % api_key
+        opener = urllib.request.build_opener(_StripAuthOnCrossHost)
+        with opener.open(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+            return r.read()
+
+    try:
+        return _get(False), None
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403) or not _yz_same_host(url, allowed_host):
+            return None, "HTTP %d" % e.code
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, str(e)[:160])
+    try:                                    # 只有同域才补 Bearer（跨域那条永远不发）
+        return _get(True), None
+    except Exception as e:
+        return None, "补 Bearer 仍失败 %s: %s" % (type(e).__name__, str(e)[:160])
+
+
+def _yz_same_host(url: str, host: str) -> bool:
+    import urllib.parse
+    return bool(host) and urllib.parse.urlsplit(str(url)).hostname == host
+
+
+def _yz_video(base_url, api_key, body, out_path=None, poll_timeout=1800.0, poll_interval=8.0,
+              job_id="", max_submit_retry=3):
+    """WAN 3.0（youzan666 中转）出片：提交 → 轮询到终态 → 下 result.url 落盘。返回信封，不抛。
+
+    🔴 三条硬规矩（都是这几轮踩出来的）：
+      ① 轮询断线只退避重问【同一个】task，连续 6 次才判死，且绝不重发提交（重发=真生成第二条、花两份钱）；
+      ② 唯一可以重发提交的情形是【429 并发超限】—— 文档说它带 concurrency 信息、任务根本没建，
+         所以重试是安全的；4xx 参数/权限类一律当场停（那是"只有你能修的事"）；
+      ③ 下载不到 1KB 判失败，绝不在盘上留个假 mp4 冒充成片。
+    """
+    import json as _json
+    import time as _t
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    if not base_url or not api_key:
+        return {"success": False, "error": "缺 YOUZAN_BASE_URL/YOUZAN_API_KEY（key 只放 .env）"}
+    base = base_url.rstrip("/")
+    host = urllib.parse.urlsplit(base).hostname or ""
+    model = str((body or {}).get("model") or "")
+
+    def _req(path, method="GET", payload=None, timeout=60.0):
+        data = _json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(base + path, data=data, method=method,
+                                     headers={"Authorization": "Bearer %s" % api_key,
+                                              "Content-Type": "application/json", "User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+        return _json.loads(raw) if raw.strip() else {}
+
+    tid = str(job_id or "")
+    try:
+        if not tid:
+            attempt, sub = 0, {}
+            while True:
+                try:
+                    sub = _req("/v1/videos/generations", "POST", body, timeout=120.0)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < max_submit_retry:
+                        # 并发超限：任务没建成 ⇒ 等一会重发同一条是安全的（不是双花）
+                        attempt += 1
+                        _t.sleep(min(120.0, poll_interval * 4 * attempt))
+                        continue
+                    detail = e.read().decode("utf-8", "replace")[:240]
+                    if 400 <= e.code < 500:
+                        return {"success": False, "error": "HTTP %d（参数/权限类，改参数或开权限再试）：%s"
+                                              % (e.code, detail)}
+                    return {"success": False, "error": "HTTP %d（上游）：%s" % (e.code, detail)}
+            tid = str(sub.get("id") or sub.get("task_id") or "")
+            if not tid:
+                return {"success": False, "error": "提交未返回 id：%s" % str(sub)[:200]}
+        start, misses, last = _t.time(), 0, {}
+        while _t.time() - start < poll_timeout:
+            try:
+                last = _req("/v1/videos/%s" % tid)
+                misses = 0
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:200]
+                if e.code == 404:
+                    return {"success": False, "job_id": tid,
+                            "error": "查询 404（任务 %s 查不到，可能已过期）：%s" % (tid, detail)}
+                # 🔴 429/408/5xx 是【抖动类】，不是"只有你能修的事"：2026-10-07 第一条实测片就栽在这——
+                #    提交成功拿到了真 task id，但轮询撞上这家 ~20 次/分钟的 IP 限流（RATE_LIMIT_MINUTE 那类），
+                #    原来 4xx 一律当场判死 ⇒ 任务还在上游好好跑着，我们却把它报成失败（= 白等 + 可能被重跑=双花）。
+                #    现在：退避后继续问【同一个】任务，6 次问不上才判死，且判死也留 job_id、绝不重提交。
+                if e.code in (408, 429) or e.code >= 500:
+                    misses += 1
+                    if misses >= 6:
+                        return {"success": False, "job_id": tid,
+                                "error": "查询连续 6 次被限流/抖动打断（HTTP %d，任务 %s 很可能仍在出片："
+                                         "拿这个 job_id 继续查，别重提交）" % (e.code, tid)}
+                    _t.sleep(min(120.0, (30.0 if e.code == 429 else poll_interval) * misses))
+                    continue
+                if 400 <= e.code < 500:
+                    return {"success": False, "job_id": tid, "error": "HTTP %d：%s" % (e.code, detail)}
+                misses += 1
+                if misses >= 6:
+                    return {"success": False, "job_id": tid,
+                            "error": "查询连续 6 次失败（任务 %s 可能仍在出片，别重提交）HTTP %d" % (tid, e.code)}
+                _t.sleep(min(60.0, poll_interval * misses))
+                continue
+            except Exception as e:
+                misses += 1
+                if misses >= 6:
+                    return {"success": False, "job_id": tid,
+                            "error": "查询连续 6 次连接失败（任务 %s 可能仍在出片，别重提交）%s: %s"
+                                     % (tid, type(e).__name__, str(e)[:180])}
+                _t.sleep(min(60.0, poll_interval * misses))
+                continue
+            st = str(last.get("status") or "").lower()
+            if st in ("success", "succeeded", "completed"):
+                break
+            if st in ("failed", "error", "cancelled", "canceled"):
+                return {"success": False, "job_id": tid, "model": model,
+                        "error": "生成失败：%s" % str(last.get("error") or (last.get("result") or {}).get("error") or st)[:300]}
+        else:
+            return {"success": False, "job_id": tid, "model": model,
+                    "error": "轮询超时 %ss（任务 %s 已留存，继续查它，不重提交）" % (int(poll_timeout), tid)}
+        res = last.get("result") or {}
+        url = str(res.get("url") or "")
+        if not url:
+            return {"success": False, "job_id": tid, "model": model,
+                    "error": "回 success 但没有 result.url：%s" % str(last)[:200]}
+        data, derr = _yz_download(url, api_key, host)
+        if derr:
+            return {"success": False, "job_id": tid, "url": url, "model": model,
+                    "error": "查询成功但下载失败：%s（任务 %s 已出片，重试下载即可，别重提交）" % (derr, tid)}
+        if len(data) < 1024:
+            return {"success": False, "job_id": tid, "url": url, "model": model,
+                    "error": "下载到的只有 %d 字节，不像视频" % len(data)}
+        path = None
+        if out_path:
+            p = _os.path.abspath(str(out_path))
+            _os.makedirs(_os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+            path = p
+        return {"success": True, "url": url, "path": path, "job_id": tid, "model": model,
+                "duration": (body or {}).get("duration"), "resolution": (body or {}).get("resolution"),
+                "ratio": (body or {}).get("ratio"), "media_count": len((body or {}).get("media") or []),
+                "bytes": len(data), "expires_at": res.get("expiresAt"), "error": None}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "job_id": tid or None,
+                "error": "HTTP %d：%s" % (e.code, e.read().decode("utf-8", "replace")[:280])}
+    except Exception as e:
+        return {"success": False, "job_id": tid or None,
+                "error": "%s: %s" % (type(e).__name__, str(e)[:280])}
+
+
+# ==== H3 导演台·浏览器 RPA 腿（C:\Minimax-H3 工作台 = 本机 8093）====
+# 与上面 video.generate/h3（RunningHub OpenAPI 直连）是两个上游入口、两套失败形状：API 那条靠我方
+# RunningHub key + 工作流号；这条是 Playwright 复用登录态开网页、把参数注入 [12] MiniMaxH3Director 的
+# 画布、点运行、抓 [7] SaveVideo 的预览 cos_url 下载。故意分两条 purpose（同 motion/motion-rpa 那条理由）：
+# 合并了就没人知道这次走的是哪条、坏的是哪条。provider 以 local 开头 ⇒ 管理台不做 HTTP 探活（探它=真开浏览器跑一条）。
+H3_RPA_DEFAULT_BASE = "http://127.0.0.1:8093"
+H3_RPA_OUTPUT_DIR = r"C:\Minimax-H3\outputs"
+_H3_RPA_ENGINES = ("plus", "lite", "ultra")            # 8093 前端 engine 下拉的三项
+_H3_RPA_TASK_TYPES = ("t2v", "i2v", "fl2v", "r2v", "v2v", "rv2v")
+_H3_RPA_MULTIPLE = 32    # 🔴 上游 [12].output.multiple=32 ⇒ 宽高必须是 32 的倍数（画布现值读到的，不是我推的）
+_H3_RPA_MAX_REFS = 3     # README 与 [12] 的 refs 槽位数
+# ratio → 宽高，三档各有证据：16:9 / 3:4 = 这台机器真出过片（C:\Minimax-H3\outputs 实测 864×480、768×1024）；
+# 9:16 = 上游现值 + 同族尺寸实测。两条拼起来才敢竖屏：
+#   ① 8093 回收结构里 [12].output 自己写着 aspectRatio "9:16 (竖屏)" → width 480 / height 864（multiple=32）；
+#   ② 同一条 H3 导演台的【API 腿】在 9:16 上真出过片：productions/2026-10-02-富铁软糖剧情带货短剧/
+#      05_shots/videos/h3-director/SEG-1-01-h3-dir.mp4 = 576×1024（ffprobe 实测）。
+# ⇒ "H3 支不支持 9:16"的答案是支持；但 RPA 这条腿本身还没跑过 9:16 那一条，报价时按未实测说。
+_H3_RPA_RATIOS = {"16:9": (864, 480), "9:16": (480, 864), "3:4": (768, 1024)}
+
+
+def _h3_rpa_base(params: dict | None = None) -> str:
+    """8093 的地址：params 显式给 > .env 的 H3_RPA_BASE_URL > 本机默认。"""
+    b = str((params or {}).get("h3_base") or _get("H3_RPA_BASE_URL") or H3_RPA_DEFAULT_BASE)
+    return b.rstrip("/")
+
+
+def _h3_rpa_payload(params: dict) -> tuple:
+    """花钱【之前】的校验，返回 (vals, err)。两种入口，缺件一律本地拦：
+
+  - 只捞不重投：给 job_id（=8093 的 taskId）⇒ 只 GET /api/status/<id>，一个 POST 都不发
+  - 新任务：`prompt` 或 `segments` 至少给一个 ⇒ POST /api/generate
+
+字段形状照 C:\\Minimax-H3\\README.md 的 job.json + h3_rpa_client.apply_job_inputs 的真实读法抄，
+不照前端猜。参考图走【本地文件上传】（和 xjai 那条相反：那边只吃公网 URL、这边只吃本地路径）。
+    """
+    job = str(params.get("job_id") or "").strip()
+    if job:
+        return {"mode": "poll", "task_id": job, "output_path": str(params.get("output_path") or "").strip(),
+                "engine": str(params.get("engine") or "plus").lower(), "width": 0, "height": 0,
+                "body": {}}, None
+    segs_in = params.get("segments") or []
+    if isinstance(segs_in, dict):
+        segs_in = [segs_in]
+    prompt = str(params.get("prompt") or "").strip()
+    if not segs_in and not prompt:
+        return None, "H3-RPA 要么给 prompt（单段），要么给 segments=[{prompt,durationSec},...]（多段）"
+    eng = str(params.get("engine") or "plus").lower()
+    if eng not in _H3_RPA_ENGINES:
+        return None, "H3-RPA engine 只认 %s（收到 %r）；不确定就用 plus" % ("/".join(_H3_RPA_ENGINES), eng)
+    ttype = str(params.get("task_type") or "").strip().lower()
+    if ttype and ttype not in _H3_RPA_TASK_TYPES:
+        return None, "H3-RPA task_type 只认 %s（收到 %r）；不填由 8093 按素材自动推" % (
+            "/".join(_H3_RPA_TASK_TYPES), ttype)
+    # 分辨率：显式 width/height 优先；否则按 ratio 取档；都没有=上游默认 864×480
+    ratio = str(params.get("ratio") or params.get("aspect_ratio") or "").strip()
+    w, h = params.get("width"), params.get("height")
+    if (w in (None, "")) != (h in (None, "")):
+        return None, ("H3-RPA 的 width/height 要成对给（只给了一个=另一个会静默回落成默认档，"
+                      "那正是「宽 480 高 480」这种怪片的来源）；要么两个都给，要么用 ratio")
+    if (w in (None, "") and h in (None, "")) and ratio:
+        if ratio not in _H3_RPA_RATIOS:
+            return None, "H3-RPA 没有 %r 档；已知的是 %s，或直接传 width/height（必须是 %d 的倍数）" % (
+                ratio, "/".join(sorted(_H3_RPA_RATIOS)), _H3_RPA_MULTIPLE)
+        w, h = _H3_RPA_RATIOS[ratio]
+    try:
+        width = int(864 if w in (None, "") else w)
+        height = int(480 if h in (None, "") else h)
+    except (TypeError, ValueError):
+        return None, "H3-RPA width/height 要整数像素（收到 %r/%r）" % (w, h)
+    if width <= 0 or height <= 0:
+        return None, "H3-RPA width/height 要大于 0（收到 %d×%d）" % (width, height)
+    if width % _H3_RPA_MULTIPLE or height % _H3_RPA_MULTIPLE:
+        return None, ("H3-RPA 按这条工作流自己的对齐步长收尺寸：上游 [12].output.multiple=%d，"
+                      "%d×%d 不是它的倍数（非倍数我们没验证过，不敢当成上游会照单全收）。"
+                      "9:16 用 480×864、16:9 用 864×480、3:4 用 768×1024，或直接传 32 倍数的尺寸"
+                      % (_H3_RPA_MULTIPLE, width, height))
+    try:
+        fps = float(params.get("frame_rate") or 24)
+    except (TypeError, ValueError):
+        return None, "H3-RPA frame_rate 要数字（收到 %r）" % (params.get("frame_rate"),)
+    if fps <= 0:
+        return None, "H3-RPA frame_rate 要大于 0"
+    segments = []
+    for i, s in enumerate(segs_in or [{"prompt": prompt, "durationSec": 5}]):
+        if not isinstance(s, dict):
+            return None, "segments[%d] 要写成 {prompt, durationSec}" % i
+        sp = str(s.get("prompt") or "").strip()
+        if not sp:
+            return None, "segments[%d] 缺 prompt" % i
+        dur = s.get("durationSec", s.get("duration", 5))
+        try:
+            dur = float(dur)
+        except (TypeError, ValueError):
+            return None, "segments[%d].durationSec 要秒数（收到 %r）" % (i, s.get("durationSec"))
+        if dur <= 0:
+            return None, "segments[%d].durationSec 要大于 0（收到 %s）" % (i, dur)
+        seg = {"prompt": sp, "durationSec": dur}
+        if str(s.get("negativePrompt") or s.get("negative_prompt") or "").strip():
+            seg["negativePrompt"] = str(s.get("negativePrompt") or s.get("negative_prompt"))
+        segments.append(seg)
+    refs = params.get("ref_images") or params.get("image_urls") or []
+    if isinstance(refs, str):
+        refs = [refs]
+    if len(refs) > _H3_RPA_MAX_REFS:
+        return None, "H3-RPA 参考图最多 %d 张（给了 %d 张）" % (_H3_RPA_MAX_REFS, len(refs))
+    bad = [str(p)[:60] for p in refs if str(p).lower().startswith(("http://", "https://"))]
+    if bad:
+        return None, ("H3-RPA 的参考图走本地文件上传，不吃公网 URL（上游 [12] 只认盘上的 input）：%s"
+                      % "、".join(bad[:3]))
+    missing = [str(p)[:60] for p in refs if not _os.path.isfile(str(p))]
+    if missing:
+        return None, "H3-RPA 参考图文件不存在：%s" % "、".join(missing[:3])
+    body: dict = {"segments": segments, "width": width, "height": height,
+                  "frame_rate": fps, "engine": eng,
+                  "timeout": int(params.get("task_timeout") or 3600)}
+    if str(params.get("global_prompt") or "").strip():
+        body["global_prompt"] = str(params["global_prompt"])
+    if ttype:
+        body["task_type"] = ttype
+    if refs:
+        body["ref_images"] = [str(p) for p in refs]
+    for key in ("start_image", "end_image"):
+        v = str(params.get(key) or "").strip()
+        if v:
+            if v.lower().startswith(("http://", "https://")):
+                return None, "H3-RPA 的 %s 要本地文件路径（公网 URL 不吃）" % key
+            if not _os.path.isfile(v):
+                return None, "H3-RPA 的 %s 文件不存在：%s" % (key, v[:60])
+            body[key] = v
+    out = str(params.get("output_path") or "").strip()
+    if out:
+        body["output"] = _os.path.abspath(out)      # 8093 直接把 mp4 写到这个路径
+    # 回执里的 ratio 按【实际几何】算，不按请求里写的算：显式给了 width/height 时请求里的 ratio 已经被覆盖，
+    # 拿它回显会报出一个和成片不符的档位（自定义尺寸则回空串=如实说"这档没名字"）。
+    matched = next((k for k, v in _H3_RPA_RATIOS.items() if v == (width, height)), "")
+    return {"mode": "submit", "task_id": "", "output_path": out, "engine": eng,
+            "body": body, "width": width, "height": height, "ratio": matched}, None
+
+
+def _h3_rpa_run(params: dict) -> dict:
+    """转调 8093 的 H3 工作台，盯到终态。给了 job_id 就【只捞不重投】（重跑=双花，还占着浏览器串行锁）。"""
+    import time
+    import httpx
+    from pathlib import Path
+
+    vals, err = _h3_rpa_payload(params)
+    if err:
+        return {"success": False, "error": err}
+    base = _h3_rpa_base(params)
+    poll_timeout = float(params.get("poll_timeout") or 3900)
+    poll_interval = float(params.get("poll_interval") or 10)
+    tid = vals["task_id"]
+
+    def _fail(msg, job_id=""):
+        return {"success": False, "job_id": job_id or tid or None, "error": msg}
+
+    def _delivered(p, note):
+        """落盘才算交付：文件在、字节≥1KB，才允许报成功（顺带按调用方要的路径归位）。"""
+        src = Path(str(p))
+        if not src.is_file():
+            return None
+        if src.stat().st_size < 1024:
+            return _fail("H3-RPA：%s 只有 %d 字节，不像视频" % (src, src.stat().st_size), tid)
+        dest = vals["output_path"]
+        if dest and Path(dest).resolve() != src.resolve():
+            d = Path(dest)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.write_bytes(src.read_bytes())
+            src = d
+        return {"success": True, "path": str(src), "job_id": tid, "engine": vals["engine"],
+                "width": vals["body"].get("width") or None, "height": vals["body"].get("height") or None,
+                "ratio": vals.get("ratio") or None, "bytes": src.stat().st_size,
+                "note": note, "error": None}
+
+    with httpx.Client(timeout=60.0) as hc:
+        if vals["mode"] == "submit":
+            try:
+                r = hc.post(base + "/api/generate", json=vals["body"])
+            except Exception as e:
+                return _fail("H3-RPA：8093 没应答（起没起？在 C:\\Minimax-H3 下 python app.py）%s: %s"
+                             % (type(e).__name__, str(e)[:200]))
+            if r.status_code == 409:
+                return _fail("H3-RPA：8093 回「已有任务在跑」（浏览器 RPA 全局串行锁被占）——"
+                             "这次不排队也不重投；等当前那条跑完，或用它的 taskId 捞")
+            if r.status_code >= 400:
+                return _fail("H3-RPA：提交被拒 HTTP %s ⇒ %s" % (r.status_code, r.text[:240]))
+            try:
+                sub = r.json() or {}
+            except Exception:
+                sub = {}
+            tid = str(sub.get("taskId") or "").strip()
+            if not tid:
+                return _fail("H3-RPA：提交没回 taskId ⇒ %s" % str(sub)[:200])
+        last = {}
+        start, misses = time.time(), 0
+        while time.time() - start < poll_timeout:
+            try:
+                rr = hc.get(base + "/api/status/" + tid)
+                misses = 0
+            except Exception as e:
+                # 只是查询这一步断了：任务还在 8093 里跑 ⇒ 退避后问同一个 id，绝不重发提交
+                misses += 1
+                if misses >= 6:
+                    return _fail("H3-RPA：查询连续 6 次失败（任务 %s 可能还在出片，别重提交）%s: %s"
+                                 % (tid, type(e).__name__, str(e)[:200]))
+                time.sleep(min(60.0, poll_interval * misses))
+                continue
+            if rr.status_code == 404:
+                got = _delivered(vals["body"].get("output") if vals["mode"] == "submit"
+                                 else (vals["output_path"] or ""), "status 查不到但盘上有片")
+                msg = ("H3-RPA：8093 查不到任务 %s（它的任务表只在内存里，进程一重启就丢）" % tid)
+                if got:
+                    got["note"] = msg + " ⇒ 按盘上产物判成功"
+                    return got
+                return _fail(msg + "；先按 %s 里的 mp4 判有没有出片，别直接重跑（=双花）" % H3_RPA_OUTPUT_DIR)
+            if rr.status_code >= 400:
+                if rr.status_code >= 500:
+                    misses += 1
+                    if misses >= 6:
+                        return _fail("H3-RPA：查询连续 6 次 HTTP %s（任务 %s 可能还在跑）" % (rr.status_code, tid))
+                    time.sleep(min(60.0, poll_interval * misses))
+                    continue
+                return _fail("H3-RPA：查询回 HTTP %s ⇒ %s" % (rr.status_code, rr.text[:200]))
+            try:
+                last = rr.json() or {}
+            except Exception:
+                last = {}
+            st = str(last.get("status") or "")
+            if st == "done":
+                got = _delivered(last.get("output") or vals["body"].get("output") or "", None)
+                if not got:
+                    return _fail("H3-RPA：回 done 但盘上没有 %s" % (last.get("output") or "(没给路径)"))
+                got["upstream"] = {k: last.get(k) for k in ("stage", "progress", "outputUrl")}
+                return got
+            if st == "error":
+                # 🔴 判失败之前先看盘（2026-10-06 定下的全局规矩）：H3 工作流末尾有防翻录机关，
+                #    上游任务终态常是 FAILED，但 [7] 已经出片 —— 8093 一般会在内部接住，
+                #    真落到 error 时也可能已经下载完了，所以按盘判一次，不许照着 error 重跑整条。
+                got = _delivered(last.get("output") or vals["body"].get("output") or "",
+                                 "状态是 error 但盘上有成片（机关/收尾报错那类）")
+                if got:
+                    got["upstream"] = {k: last.get(k) for k in ("stage", "progress", "error")}
+                    return got
+                return _fail("H3-RPA：任务失败 ⇒ %s" % str(last.get("error") or st)[:300])
+            time.sleep(poll_interval)
+        return _fail("H3-RPA：轮询超时 %ss（任务 %s 可能还在出片：用 job_id 再捞，别重提交）"
+                     % (int(poll_timeout), tid))
 
 
 def call(capability: str, purpose: str | None = None, **params) -> dict:
@@ -1236,10 +2288,57 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         if err:
             return {"success": False, "error": err}
         _register_delivery_dewatermark(params, vals)
-        return _dewatermark_run(vals, r["model"], api_key=r["api_key"] or "",
-                                job_id=str(params.get("job_id") or ""),
-                                poll_timeout=float(params.get("poll_timeout") or 1800),
-                                poll_interval=float(params.get("poll_interval") or 10))
+        return _rh_video_edit_run(vals, r["model"], api_key=r["api_key"] or "", label="去水印",
+                                  job_id=str(params.get("job_id") or ""),
+                                  poll_timeout=float(params.get("poll_timeout") or 1800),
+                                  poll_interval=float(params.get("poll_interval") or 10),
+                                  nodes_fn=lambda up, v: _dewatermark_nodes(up, v["duration"], v["fps"], v["prompt"]))
+
+    if capability == "video.edit" and r["purpose"] == "enhance":
+        # RunningHub AI App 高清修复（4K 升档）。同一套协议，先本地拦再花钱。
+        vals, err = _enhance_payload(params)
+        if err:
+            return {"success": False, "error": err}
+        return _rh_video_edit_run(vals, r["model"], api_key=r["api_key"] or "", label="高清修复",
+                                  job_id=str(params.get("job_id") or ""),
+                                  poll_timeout=float(params.get("poll_timeout") or 2400),
+                                  poll_interval=float(params.get("poll_interval") or 10),
+                                  nodes_fn=_enhance_nodes)
+
+    if capability == "video.generate" and r["purpose"] == "motion-rpa":
+        # 动作迁移（8091 浏览器 RPA 腿）：本层不直连 RunningHub，转调 nzdh 工作室并盯到终态。
+        return _motion_rpa_run(params)
+
+    if capability == "video.generate" and r["purpose"] == "h3-rpa":
+        # H3 第二条腿（本机 8093 浏览器 RPA）：转调工作台、盯到终态、按盘上产物判成败。
+        # 🔴 批准条子在【网关这一端】消费（不写进 SPEND_APPROVAL_AT_SOURCE）：这条路的必经入口就是
+        #    gateway call，所以闸放在这里就是真闸；8093 自己的网页按钮是给人在浏览器上点的，不在这条轨上。
+        return _h3_rpa_run(params)
+
+    if capability == "video.generate" and r["provider"] == "youzan666":
+        # WAN 3.0 第三条入口（youzan666 中转）：先按【这一家自己的文档】校验参数，不合规直接回错、不发请求。
+        # 凭证只从 route 取（.env 的 YOUZAN_API_KEY）；下载那条默认不带 key（防跨域泄露，见 _yz_download）。
+        body, err = _yz_payload(params, model=r["model"] or "")
+        if err:
+            return {"success": False, "error": err}
+        return _yz_video(r["base_url"], r["api_key"], body,
+                         out_path=params.get("output_path"),
+                         poll_timeout=float(params.get("poll_timeout") or 1800),
+                         # 默认 15 秒一问：这家的 IP 限流约 20 次/分钟，10 秒一问撞上就白折腾
+                         poll_interval=float(params.get("poll_interval") or 15),
+                         job_id=str(params.get("job_id") or ""))
+
+    if capability == "video.generate" and r["provider"] == "xjai":
+        # xjai WAN 3.0：先本地校验参数（duration/resolution/ratio/media 公网 URL），不合规直接回错、
+        # 不发请求；校验通过才提交。凭证只从 route 取（.env 的 XJAI_API_KEY），源码里没明文。
+        body, err = _xjai_payload(params, model=r["model"] or "")
+        if err:
+            return {"success": False, "error": err}
+        return _xjai_video(r["base_url"], r["api_key"], body,
+                           out_path=params.get("output_path"),
+                           poll_timeout=float(params.get("poll_timeout") or 1800),
+                           poll_interval=float(params.get("poll_interval") or 8),
+                           job_id=str(params.get("job_id") or ""))
 
     if capability == "video.analyze":
         return analyze_media(
@@ -1273,6 +2372,46 @@ def call(capability: str, purpose: str | None = None, **params) -> dict:
         if url and params.get("output_path") and url.startswith("http"):
             path = asyncio.run(agnes_img.download_file(url, params["output_path"]))
         return {"success": bool(url), "url": url, "path": path, "raw": data}
+    if capability == "image.generate" and r["purpose"] == "gpt-image2.5":
+        # GPT Image 2.5（Image2 端点 OpenAI 形 /images/generations）：model 走路由字段（config.IMAGE2_IMAGE25_MODEL，
+        # sunburst 默认、flare 提速档），调用方可显式覆盖。上游回的 url 会失效 ⇒ 给了 output_path 就落盘（url/b64 两形都吃）。
+        import asyncio
+        import base64
+        import urllib.request
+        from backend.services import image2_client as i2c  # 这名字在包里是单例【实例】（__init__ 再导出），不是模块
+        if not str(params.get("prompt") or params.get("text_prompt") or "").strip():
+            return {"success": False, "error": "gpt-image2.5 缺 prompt（上游这类拒绝的文案会误导成参数问题，先本地拦）"}
+        model = params.get("model") or r["model"]
+        if not model:
+            return {"success": False, "error": "gpt-image2.5 路由没配 model（config.IMAGE2_IMAGE25_MODEL 空了）"}
+        data = asyncio.run(i2c.text_to_image_sync(
+            prompt=params.get("prompt") or params.get("text_prompt"), model=model,
+            size=params.get("size") or "1024x1024", n=int(params.get("n") or 1)))
+        url = None
+        for d in (data.get("data") or []):
+            url = d.get("url") or d.get("b64_json")
+            if url:
+                break
+        path = None
+        dl_err = None
+        if url and params.get("output_path"):
+            out = str(params["output_path"])
+            try:
+                # ⚠️ 下载也必须带浏览器 UA：图床 CDN 对 Python-urllib 默认 UA 回 403（同 BROWSER_UA 注释那个坑）
+                raw = (urllib.request.urlopen(
+                    urllib.request.Request(url, headers={"User-Agent": BROWSER_UA}), timeout=180).read()
+                    if str(url).startswith("http") else base64.b64decode(url))
+                _os.makedirs(_os.path.dirname(out) or ".", exist_ok=True)
+                with open(out, "wb") as f:
+                    f.write(raw)
+                path = out
+            except Exception as e:
+                # 落盘失败不翻整条：图已生成、url 还在；但必须显式报 download_error，不静默丢交付
+                dl_err = "%s: %s" % (type(e).__name__, str(e)[:200])
+        res = {"success": bool(url), "url": url, "path": path, "model": model}
+        if dl_err:
+            res["download_error"] = dl_err
+        return res
     if capability == "image.generate" and r["purpose"] == "nano":
         # zexapi /v1/videos（同 omni 形），model=nano_banana_pro-2K；复用 omni_client 真码
         from backend.services import omni_client as oc
@@ -1458,6 +2597,402 @@ def ledger() -> Ledger:
     return _ledger
 
 
+# ── 花钱批准闸（2026-10-06 用户定："只要是生成视频相关的，必须算账我确认"）────────────────
+# 为什么必须有：以前"花钱前报价并等同意"只是 AGENTS.md 里的一句**纸面纪律**，
+#   本文件里零命中 approve/consent ⇒ 任何一条会话只要敲 `gateway.py call video.generate …`，
+#   precheck→preauth 照样过、任务照样发起。闸钉在这里（**在预扣之前**），才叫拦得住东西。
+# 免批的只有两类：`text.complete`（写文案）与 `video.analyze`（看图看片）——token 结算、单次几分。
+SPEND_APPROVAL_REQUIRED = ("video.generate", "video.edit", "image.generate", "image.edit")
+SPEND_APPROVALS_PATH = _os.environ.get("GATEWAY_SPEND_APPROVALS") or _os.path.join(
+    _d or _os.getcwd(), ".gateway_spend_approvals.json")
+_APPROVALS_PATH_DEFAULT = _os.path.join(_d or _os.getcwd(), ".gateway_spend_approvals.json")
+SPEND_APPROVAL_TTL = float(_os.environ.get("GATEWAY_SPEND_APPROVAL_TTL") or 24 * 3600)
+
+# ⚠️ 回归闸专用的"免人证"开关（2026-10-08）。它【不是环境变量、也不是 CLI 参数】，只能由进程内的
+#   Python 代码赋值 —— 目的就是让闸能直接构造条子去测"消费侧"，而真实路径永远拿不到它。
+#   双保险：即便有代码把它置 True，也只有当条子写到【非默认】文件（闸自己的 scratch 账本）时才生效，
+#   所以它物理上签不出生产 `.gateway_spend_approvals.json` 里的条子。
+ALLOW_GRANT_WITHOUT_ATTEST = False
+
+
+def needs_spend_approval(capability: str) -> bool:
+    """这条能力要不要"人给的条子"。清单是唯一源（闸与文档都从这里读）。"""
+    return capability in SPEND_APPROVAL_REQUIRED
+
+
+# 🔴 例外形状：有些腿的**花钱动作发生在另一个进程里**（动作迁移 = 8091 nzdh 工作室自己开浏览器跑 RPA，
+# 网关只是转调）。这类腿把条子的【消费点】放在真正干活的那一端（8091 → 8100 的 /api/spend/guard），
+# 网关这边就不再重复扣一次 —— 同一次生成扣两段，等于逼用户批两遍，那是自造的假账。
+# 豁免只认下面列出的 purpose；闸（scripts/check-motion-rpa-lane.py）钉死"8091 侧确实调了 guard"，
+# 就是为了防止这张表变成一条绕过批准的后门。加一条 purpose 进来必须同时在那一端加调用。
+SPEND_APPROVAL_AT_SOURCE = (("video.generate", "motion-rpa"),)
+
+
+def approval_consumed_at_source(capability: str, purpose: str) -> bool:
+    return (capability, purpose) in SPEND_APPROVAL_AT_SOURCE
+
+
+def guard_spend_from_source(capability: str, purpose: str, account: str = "local",
+                            count: int = 1, session: str = "") -> dict:
+    """给"真正干活的那一端"用的批准闸入口（例：8091 在发起 RPA 前来问一次）。
+
+    ⚠️ 预计扣分由**网关按价目自己算**，调用方不许自带价格 —— 否则 8091 传个 credits=0 就等于放行。
+    没有条子 ⇒ check_spend_approval 原样回 approval_required + 报价 + live_grants，段数不动。
+    """
+    if not needs_spend_approval(capability):
+        return {"ok": True, "reason": "not-required", "grant": None,
+                "error": "能力 %s 不在花钱清单里，无需条子" % capability}
+    cnt = max(1, int(count or 1))
+    credits = meter(capability, purpose, {"count": cnt})["credits_estimate"]
+    out = check_spend_approval(capability, purpose, account, count=cnt,
+                               credits=credits, session=str(session or ""))
+    out["credits"] = credits
+    out["count"] = cnt
+    return out
+
+
+def spend_approvals() -> dict:
+    """批准条子的只读视图（8100 面板 / 右栏台用；CLI 的 `approvals` 打的是同一份 _approvals_load）。"""
+    now = _time.time()
+    rows = []
+    for g in _approvals_load().get("grants", []):
+        rows.append({"id": g.get("id", ""), "capability": g.get("capability", ""),
+                     "purpose": g.get("purpose", "*"), "account": g.get("account", "local"),
+                     "session": g.get("session", ""), "scope": g.get("scope", ""),
+                     "segments_used": int(g.get("used", 0)), "segments": int(g.get("count", 0)),
+                     "credits_used": int(g.get("used_credits", 0)), "credits": int(g.get("credits", 0)),
+                     "expires_in": round(float(g.get("expires", 0)) - now),
+                     "live": float(g.get("expires", 0)) > now})
+    return {"path": SPEND_APPROVALS_PATH, "count_live": sum(1 for r in rows if r["live"]),
+            "grants": rows}
+
+
+def _approvals_load() -> dict:
+    try:
+        with open(SPEND_APPROVALS_PATH, encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {"grants": []}
+    except (OSError, ValueError):
+        return {"grants": []}
+
+
+# ============================================================ 人证（2026-10-08 两易其稿）
+# 目标：把"人点了头"变成【机制上】必须发生的事。走过的两条弯路都记在这里，别再走回去：
+#   ① 弹窗 + 回敲 6 位码 —— 被用户否掉（"太麻烦了换个方式"、"也不要输入口令了"）；
+#   ② 只弹系统 MessageBox 点【是】—— 🔴 实测【不可信】：没有任何人参与时 MessageBoxW 会自己返回
+#      IDYES，回归闸 G1/G2/G5 两次抓到它凭空签出条子（假条子落在闸的 scratch 账本，生产没被污染）。
+#      同一类毛病还有 MB_TIMEOUT 在这台机器上不生效。⇒ 系统弹窗这条路整个废掉，不留兜底。
+# 现在的形状：pending（待批）+ 一次性码 + DSH 内核审批卡
+#   agent 跑 `approve` ⇒ 只建一张【pending】，里面写好报价和一个 6 位码；此时【还没有任何批准额度】。
+#   人在 DSH 对话里看到品牌审批卡（logo + 口号 + 报价 + 那个码），点【允许一次】
+#     ⇒ 插件把码回交核销（consume_spend_approval）⇒ 才转成可用条子。
+#   核销失败/码错/没卡可点 ⇒ pending 过期，一律 0 额度。
+# 🔴 码【绝不从任何只读 HTTP 口吐出】（`spend_pending()` 供插件渲染用，但它走的是插件侧、
+#    且这条 json agent 自己也读得到 —— 真正的门槛是"码必须出现在人眼看到的卡上并由人交回来"，
+#    所以插件渲染路径是唯一给码的地方，agent 读文件只能读到 pending、读不到"人已点"）。
+_APPROVE_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTWXYZ2346789"   # 去掉易混字形 I O L V 0 1 5
+SPEND_PENDING_TTL = float(_os.environ.get("GATEWAY_SPEND_PENDING_TTL") or 2 * 3600)   # 2 小时：15 分钟实测把人逼成"追着计时器点"，2026-10-08 放宽
+
+
+def gen_approve_code(n: int = 6) -> str:
+    """一次性核销码（secrets 不可预测；字符集去掉人眼容易混的字形）。"""
+    import secrets as _sec
+    return "".join(_sec.choice(_APPROVE_CODE_ALPHABET) for _ in range(n))
+
+
+def record_approval_denial(reason: str, capability: str = "", purpose: str = "",
+                           account: str = "", scope: str = "",
+                           session: str = "") -> dict:
+    """被拒的人签留痕（和条子同一个文件，`approvals` 读得到）。"""
+    data = _approvals_load()
+    d = {"at": _time.time(), "reason": reason, "capability": capability, "purpose": purpose,
+         "account": account, "session": session, "scope": scope}
+    data["denials"] = (data.get("denials") or [])[-99:] + [d]
+    _approvals_save(data)
+    return d
+
+
+def _pending_save(data: dict) -> None:
+    data["pending"] = [x for x in data.get("pending", [])
+                       if float(x.get("expires", 0)) > _time.time()]
+
+
+def create_spend_pending(capability: str, purpose: str = "*", account: str = "local",
+                         count: int = 1, credits: int = 0, scope: str = "",
+                         session: str = "", ttl: float | None = None) -> dict:
+    """建一张【待批】。这一步不给任何额度 —— 它只是把报价和码立起来等人点。"""
+    now = _time.time()
+    data = _approvals_load()
+    _pending_save(data)
+    p = {"id": "pend_" + _uuid.uuid4().hex[:8], "capability": capability, "purpose": purpose or "*",
+         "account": account, "count": int(count), "credits": int(credits), "scope": scope,
+         "session": session or "", "code": gen_approve_code(), "status": "pending",
+         "created": now, "expires": now + float(ttl or SPEND_PENDING_TTL),
+         "quote": build_quote_summary(capability, purpose, account, int(count), int(credits),
+                                      scope, session)}
+    data["pending"] = (data.get("pending") or []) + [p]
+    _approvals_save(data)
+    return p
+
+
+def spend_pending(with_code: bool = False) -> list:
+    """待批清单（审批卡渲染用）。🔴 默认【不吐码】—— 只有插件渲染那一条路显式要码。"""
+    now = _time.time()
+    out = []
+    for p in _approvals_load().get("pending", []):
+        if float(p.get("expires", 0)) <= now or p.get("status") != "pending":
+            continue
+        row = {k: v for k, v in p.items() if k != "code"}
+        if with_code:
+            row["code"] = p.get("code", "")
+        out.append(row)
+    return out
+
+
+def consume_spend_approval(pending_id: str, code: str, session: str = "") -> dict:
+    """核销：码对得上才把 pending 转成可用条子。码错/过期/已消费/换了会话 ⇒ 拒并留痕。"""
+    data = _approvals_load()
+    p = next((x for x in data.get("pending", []) if x.get("id") == pending_id), None)
+    if p is None:
+        record_approval_denial("pending-not-found", "", "", "", "", session)
+        return {"ok": False, "reason": "pending-not-found"}
+    if float(p.get("expires", 0)) <= _time.time():
+        record_approval_denial("pending-expired", p.get("capability", ""), p.get("purpose", ""),
+                               p.get("account", ""), p.get("scope", ""), session)
+        return {"ok": False, "reason": "pending-expired"}
+    if p.get("status") != "pending":
+        record_approval_denial("pending-already-" + str(p.get("status")), p.get("capability", ""),
+                               p.get("purpose", ""), p.get("account", ""), p.get("scope", ""), session)
+        return {"ok": False, "reason": "pending-not-pending"}
+    if (p.get("session") or "") != (session or ""):
+        record_approval_denial("pending-session-mismatch", p.get("capability", ""),
+                               p.get("purpose", ""), p.get("account", ""), p.get("scope", ""), session)
+        return {"ok": False, "reason": "pending-session-mismatch"}
+    import hmac as _hmac
+    if not _hmac.compare_digest(str(code or "").strip().upper(), str(p.get("code") or "")):
+        record_approval_denial("code-mismatch", p.get("capability", ""), p.get("purpose", ""),
+                               p.get("account", ""), p.get("scope", ""), session)
+        return {"ok": False, "reason": "code-mismatch"}
+    p["status"] = "approved"
+    p["consumed_at"] = _time.time()
+    data["pending"] = [x for x in data.get("pending", []) if x.get("id") != pending_id]  # 核销即出列
+    _approvals_save(data)
+    g = grant_spend_approval(p["capability"], p["purpose"], p["account"], p["count"], p["credits"],
+                             p["scope"], None, p.get("session", ""),
+                             attest={"ok": True, "method": "dsh-card-click",
+                                     "at": _time.time(), "pending": pending_id})
+    return {"ok": True, "grant": g}
+
+
+def consume_by_click(pending_id: str) -> dict:
+    """批准页/审批卡的【唯一】核销入口：码由服务端自己取，调用方只给 pending_id。
+    人证 = "这次点击发生在人眼看到的那张卡上"，不是"知道那个码"（码本来就随页面源码回到浏览器）。
+    所以这里不接收 code 参数 —— 少一个入口就少一种伪造法。"""
+    p = next((x for x in _approvals_load().get("pending", [])
+              if x.get("id") == pending_id and x.get("status") == "pending"), None)
+    if p is None:
+        return {"ok": False, "reason": "pending-not-found"}
+    return consume_spend_approval(pending_id, p.get("code", ""), p.get("session", ""))
+
+
+def deny_pending(pending_id: str, reason: str = "denied-on-page") -> dict:
+    """人在卡上点【这次不跑】：留痕 + 把 pending 撤掉（不能过会儿又拿它核销）。"""
+    data = _approvals_load()
+    p = next((x for x in data.get("pending", []) if x.get("id") == pending_id), None)
+    if p is None:
+        return {"ok": False, "reason": "pending-not-found"}
+    record_approval_denial(reason, p.get("capability", ""), p.get("purpose", ""),
+                           p.get("account", ""), p.get("scope", ""), p.get("session", ""))
+    data["pending"] = [x for x in data.get("pending", []) if x.get("id") != pending_id]
+    _approvals_save(data)
+    return {"ok": True, "reason": reason}
+
+
+def build_quote_summary(capability: str, purpose: str, account: str, count: int,
+                        credits: int, scope: str, session: str = "") -> str:
+    """报价正文（终端与审批卡共用一份，数字一律现算，不让人对着空气点头）。"""
+    try:
+        unit = unit_price(capability, purpose)
+    except Exception:
+        unit = "?"
+    try:
+        bal = ledger().balance(account)
+    except Exception:
+        bal = "?"
+    return ("路由：%s/%s\n账户：%s\n单价：%s 分/段\n段数：%s\n预计扣分：%s\n当前余额：%s\n会话：%s\n方案：%s"
+            % (capability, purpose, account, unit, count, credits, bal, session or "-",
+               scope or "（没写 scope！）"))
+
+
+
+def _approvals_save(data: dict) -> None:
+    # ⚠️ 写这份 json 的规矩：先 `_approvals_load()` 拿到完整 dict、原地改要改的那块、再存。
+    #    不许 `_approvals_save({"grants": ...})` 这种"只带一个键"的写法 —— 那是整份重写，
+    #    会把 pending（待批）和 denials（拒绝留痕）一起抹掉（2026-10-08 真踩过，见 check_spend_approval）。
+    tmp = SPEND_APPROVALS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+    _os.replace(tmp, SPEND_APPROVALS_PATH)
+
+
+def approval_allows(g: dict, capability: str, purpose: str, account: str,
+                    now: float, want_count: int, want_credits: int,
+                    session: str = "") -> bool:
+    """单条批准对这次请求够不够（纯函数，真值表好抠出来跑）。
+
+    六个条件全成立才算数：没过期 ∧ 能力对上 ∧ purpose 对上（"*"=该能力全放行）
+    ∧ 账户对上 ∧ **剩余额度同时够段数和分数** ∧ 会话绑得上。
+    ⚠️ 段数和分数都要卡：只卡分数时，一张"总 150 分"的条子能被拆成 30 段 5 分的花法，而人批准的是"3 段"。
+    🔴 会话绑（2026-10-06 补）：签条子时写了 `session` 的，只有同一条会话能用；
+       不写 = 通用条子（谁都能用）。为什么必须有：另一会话为"video-enhance 封面"签的 2 段条子，
+       被我一次不相干的端点探测吃掉 1 段 ⇒ 额度是按能力/purpose 匹配的，**不按计划隔离就是互相偷花**。
+    """
+    if not g or g.get("expires", 0) <= now:
+        return False
+    if g.get("capability") != capability:
+        return False
+    if g.get("purpose") not in ("*", purpose):
+        return False
+    if g.get("account") not in ("*", account):
+        return False
+    owner = str(g.get("session") or "")
+    if owner and owner != str(session or ""):
+        return False
+    return (int(g.get("count", 0)) - int(g.get("used", 0)) >= max(1, int(want_count))
+            and int(g.get("credits", 0)) - int(g.get("used_credits", 0)) >= int(want_credits))
+
+
+def check_spend_approval(capability: str, purpose: str, account: str,
+                         count: int = 1, credits: int = 0, session: str = "") -> dict:
+    """找一张能覆盖这次请求的条子；找到就当场记账（used/used_credits 增加）并返回它。
+    找不到 ⇒ `{ok:false, reason:"approval_required", quote:{...}}`——**不建 hold、不扣费、不发 HTTP**。"""
+    if not needs_spend_approval(capability):
+        return {"ok": True, "reason": "not-required", "grant": None}
+    now = _time.time()
+    data = _approvals_load()
+    grants = [g for g in data.get("grants", []) if g.get("expires", 0) > now]
+    for g in grants:
+        if approval_allows(g, capability, purpose, account, now, count, credits, session):
+            g["used"] = int(g.get("used", 0)) + int(count)
+            g["used_credits"] = int(g.get("used_credits", 0)) + int(credits)
+            g["last_used"] = now
+            # 🔴 必须原地改 data 再存：这里以前写的是 `_approvals_save({"grants": ...})`，
+            #    等于整份重写 json ⇒ 把 pending（待批）和 denials（拒绝留痕）两个键一起抹掉。
+            #    实测过一次：人刚建的待批被另一条会话消费旧条子的动作擦掉，批准页从此看不到东西。
+            data["grants"] = grants + [x for x in data.get("grants", [])
+                                       if not x.get("expires", 0) > now]
+            _approvals_save(data)
+            return {"ok": True, "reason": "approved", "grant": g["id"], "scope": g.get("scope", ""),
+                    "remaining": int(g["count"]) - int(g["used"]),
+                    "remaining_credits": int(g["credits"]) - int(g["used_credits"])}
+    return {"ok": False, "reason": "approval_required",
+            "quote": {"capability": capability, "purpose": purpose, "account": account,
+                      "count": count, "credits": credits,
+                      "unit_price": unit_price(capability, purpose),
+                      "balance_after": ledger().balance(account)},
+            "live_grants": [{"id": g["id"], "capability": g["capability"], "purpose": g["purpose"],
+                             "left": int(g["count"]) - int(g["used"]),
+                             "credits_left": int(g["credits"]) - int(g["used_credits"]),
+                             "expires_in": round(g["expires"] - now)} for g in grants],
+            "error": ("approval_required：这是「生成视频相关」的按条计费能力（%s/%s，预计 %d 分 / %d 段）。"
+                      "没有覆盖本次请求的人批准条子 ⇒ 已拒绝，0 分未扣、任务未发起。"
+                      "要跑：先把上面这份报价发给用户、拿到明确同意，然后【由用户本人在真终端里】签一张批准条子。"
+                      "签条子需要弹窗点【是】+ 回敲屏幕上那 6 位确认码；命令文本不在本回复里给（旧版这里印着现成命令，"
+                      "等于把伪造的说明书交给调用方 —— 2026-10-08 删掉）。"
+                      % (capability, purpose, credits, count))}
+
+
+def grant_spend_approval(capability: str, purpose: str = "*", account: str = "local",
+                         count: int = 1, credits: int = 0, scope: str = "",
+                         ttl: float | None = None, session: str = "",
+                         attest: dict | None = None) -> dict:
+    """写一张批准条子。
+
+    🔴 `attest` = human_attest() 的成功返回。CLI `approve` 那条路【必须】带它（见 _cli 里的 approve 分支），
+       不带就回 `ok:false, reason:"no-attestation"` —— 也就是"人没在这台机器上点过、敲过 ⇒ 签不出"。
+       留 `attest=None` 这个形参只为回归闸能直接构造条子（闸测的是消费侧，不是人证侧）；
+       生产代码里任何新调用点不传 attest 都当 bug 看待（`grants` 里会有 `attest` 字段，`approvals` 可查谁签的）。
+
+    ⚠️ 说清它拦得住什么、拦不住什么（别把它当"密码学级的人在场证明"）：
+      拦得住 ①**默认路径**：没有条子 ⇒ 预扣都不建，任务绝不发起（0 分）；
+              ②**超范围**：条子写死能力/purpose/账户/段数/分数上限/过期，换路由、加段数、花超额度、过期一律拒；
+              ③**留痕**：每张条子带 `scope`（用户批准的那句方案原文）、`attest`（人证方式与时间）与时间戳，`approvals` 可查、可 revoke；
+                 被拒的人签单独落 `denials`，能查出"谁试着自己批"。
+      拦不住 装了 UI 自动化（OCR 那张弹窗 + 控鼠标键盘）的 agent —— 抬到那个代价、并留痕，不是做不到-proof。
+    """
+    if (needs_spend_approval(capability) and not (attest and attest.get("ok"))
+            and not (ALLOW_GRANT_WITHOUT_ATTEST
+                     and SPEND_APPROVALS_PATH != _APPROVALS_PATH_DEFAULT)):
+        return {"ok": False, "reason": "no-attestation",
+                 "error": ("no-attestation：花钱批准必须由本人在终端签（弹窗点【是】+ 回敲确认码）。"
+                           "这条调用没有通过人证 ⇒ 未签条子。")}
+    now = _time.time()
+    data = _approvals_load()
+    g = {"id": "ok_" + _uuid.uuid4().hex[:8], "capability": capability, "purpose": purpose or "*",
+         "session": session or "",
+         "account": account, "count": int(count), "used": 0, "credits": int(credits),
+         "used_credits": 0, "scope": scope, "created": now,
+         "attest": {"method": (attest or {}).get("method", "gate-selftest"),
+                    "at": (attest or {}).get("at", now),
+                    "pending": (attest or {}).get("pending", "")},
+         "expires": now + float(ttl or SPEND_APPROVAL_TTL)}
+    data["grants"] = [x for x in data.get("grants", []) if x.get("expires", 0) > now] + [g]
+    _approvals_save(data)
+    return g
+
+
+def revoke_spend_approval(gid: str) -> dict:
+    data = _approvals_load()
+    keep = [g for g in data.get("grants", []) if g.get("id") != gid]
+    data["grants"] = keep
+    _approvals_save(data)
+    return {"revoked": gid, "left": len(keep)}
+
+
+def unit_price_ceiling(capability: str) -> int:
+    """某能力下的最高单价（分/段）。给"路由还没钉死"的腿用：宁可往高报，也不要猜个低价把人糊过去。"""
+    vals = [v for (c, _p), v in PRICE_ROUTES.items() if c == capability and isinstance(v, int)]
+    return max(vals) if vals else 0
+
+
+class SpendApprovalRequired(RuntimeError):
+    """没有批准条子 ⇒ 调用方（8090/8100）负责把它转成人看得见的 4xx，绝不落到发起。"""
+
+
+def spend_guard(capability: str, purpose: str = "*", account: str = "local",
+                 count: int = 1, label: str = "", session: str = "") -> None:
+    """【绕开网关的腿】统一调这一个守卫：没有批准条子就 raise（8090 侧转成 423）。
+    为什么要有它：8090 的出片腿直连厂商、不经 `invoke()`，网关里的闸天然盖不到 ⇒ 让它们调**同一个函数**、
+    认**同一张条子**，不另造一套机制（造了就会有两套批准簿，早晚对不上）。
+    purpose="*" 表示"这条腿具体打哪个路由我还没逐个核实" ⇒ 只认人签的**通吃条子**，
+    单价按该能力的【上限】报（宁可高报也不猜低）。
+    """
+    if not needs_spend_approval(capability):
+        return
+    credits = unit_price(capability, purpose) if purpose != "*" else unit_price_ceiling(capability)
+    gate = check_spend_approval(capability, purpose, account, count=count,
+                                credits=credits * max(1, count), session=session)
+    if not gate["ok"]:
+        raise SpendApprovalRequired(gate["error"] + ("" if not label else "  [%s]" % label))
+
+
+def refund_spend_approval(grant_id, count: int = 1, credits: int = 0) -> dict:
+    """退段：调用失败（上游拒、参数错、落盘失败）⇒ 这次没真消耗，批准额度必须还回去。
+    不这么做的话，"上游抖 3 次"就把人批准的额度吃光，而实际 0 消耗
+    （2026-10-06 我自己踩的：gflow 因版本漂移一个请求都没发出去，条子却从 3 段掉到 2 段）。"""
+    if not grant_id:
+        return {"refunded": None}
+    data = _approvals_load()
+    for g in data.get("grants", []):
+        if g.get("id") == grant_id:
+            g["used"] = max(0, int(g.get("used", 0)) - int(count))
+            g["used_credits"] = max(0, int(g.get("used_credits", 0)) - int(credits))
+            g.setdefault("notes", []).append("失败退段 %s 段/%s 分" % (count, credits))
+            break
+    _approvals_save(data)
+    return {"refunded": grant_id}
+
+
 def invoke(capability: str, purpose: str | None = None, account: str = "local",
            params: dict | None = None) -> dict:
     """skill 经 tool-jobs 调的总入口：resolve→估价→precheck/preauth→call→commit/rollback→信封。
@@ -1466,7 +3001,35 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
     account = account or "local"
     r = resolve(capability, purpose)
     est = meter(capability, r["purpose"], params)["credits_estimate"]
+    # 🔴 花钱批准闸钉在**预扣之前**（顺序错了就等于"先扣了再问"）：生成视频相关的能力，
+    #    没有覆盖本次请求的人批准条子 ⇒ 直接回 approval_required，不建 hold、不发 HTTP。
+    #    唯一例外 = SPEND_APPROVAL_AT_SOURCE 里那些"花钱在别的进程"的腿：条子由那一端消费，这里不重复扣。
+    if needs_spend_approval(capability) and not approval_consumed_at_source(capability, r["purpose"]):
+        # 🔴 段数=【批准单位】，两种形状都得吃：调用方常按上游签名传 segments=[{...},...]（列表），
+        #    原来这里直接 int(params.get("segments"))，列表一进来就 TypeError 把整次调用炸在闸里
+        #    （2026-10-06 跑 H3 RPA 9:16 实测第一条时撞上：0 消耗，因为炸点在预扣之前，但闸自己成了故障点）。
+        _raw_cnt = params.get("segments") if params.get("segments") is not None else params.get("count")
+        try:
+            _cnt = max(1, len(_raw_cnt) if isinstance(_raw_cnt, (list, tuple)) else int(_raw_cnt or 1))
+        except (TypeError, ValueError):
+            _cnt = 1          # 认不出的形状按 1 段算：闸宁可少算段数，也不许自己成为故障点（真正的上限是 credits）
+        gate = check_spend_approval(capability, r["purpose"], account,
+                                    count=_cnt, credits=est, session=str(params.get("session") or ""))
+        if not gate["ok"]:
+            return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": None,
+                    "credits": {"estimated": est, "charged": 0,
+                                "balance_after": ledger().balance(account)},
+                    "error": gate["error"], "approval": {k: gate[k] for k in ("reason", "quote", "live_grants")}}
+    else:
+        _cnt, gate = 1, {"grant": None}
+
+    def _refund_approval():
+        """失败就把批准段数退回去（0 消耗不该吃额度）。"""
+        if gate.get("grant"):
+            refund_spend_approval(gate["grant"], _cnt, est)
+
     if not ledger().precheck(account, est):
+        _refund_approval()          # 没发起成功 ⇒ 退段
         return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": None,
                 "credits": {"estimated": est, "charged": 0, "balance_after": ledger().balance(account)},
                 "error": "积分不足，请去 weeksir.com 充值后重试"}
@@ -1476,6 +3039,7 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
         # 适配器返回业务失败（success:False / 带 error）也算失败 → 回滚，不扣费
         if isinstance(result, dict) and (result.get("success") is False or result.get("error")):
             ledger().rollback(hold["hold_id"])
+            _refund_approval()      # 上游/适配器判失败 ⇒ 这次没消耗，退段（gflow 版本漂移那次就是栽在这）
             return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": result,
                     "credits": {"estimated": est, "charged": 0, "hold_id": hold["hold_id"],
                                 "balance_after": ledger().balance(account)},
@@ -1489,13 +3053,31 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
                 "error": None}
     except Exception as e:
         ledger().rollback(hold["hold_id"])
+        _refund_approval()          # 抛异常同样退段
         return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": None,
                 "credits": {"estimated": est, "charged": 0, "hold_id": hold["hold_id"],
                             "balance_after": ledger().balance(account)},
                 "error": f"{type(e).__name__}: {e}"}
 
 
+def _cprint(*a, **k):
+    """CLI 的安全打印：按【输出流编码】先试、编不了就 errors=replace。
+    2026-10-06 实测：`gateway.py call image.generate doubao` 被批准闸正确拒了，但拒绝消息里带一个 `⇒`，
+    GBK 控制台上 print 直接抛 UnicodeEncodeError ⇒ 人只看到 traceback，看不到"缺条子"与报价。
+    🔴 不用 sys.stdout.reconfigure（那条路实测会造"零输出 + 退出码 0"的静默假绿）。"""
+    stream = k.get("file") or _sys.stdout
+    enc = getattr(stream, "encoding", None) or "ascii"
+    sep = k.get("sep", " ")
+    s = sep.join(str(x) for x in a) + k.get("end", "\n")
+    try:
+        s.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        s = s.encode(enc, "replace").decode(enc, "replace")
+    stream.write(s)
+
+
 def _cli(argv):
+    print = _cprint          # 本函数内所有证词走安全打印（见 _cprint 的事故说明）
     cmd = argv[0] if argv else "caps"
     if cmd == "caps":
         for cap in CAPABILITIES:
@@ -1599,10 +3181,125 @@ def _cli(argv):
             env = {"ok": False, "capability": cap, "purpose": pur, "result": None,
                    "credits": {"estimated": 0, "charged": 0, "balance_after": None}, "error": str(e)}
         print(json.dumps(env, ensure_ascii=False, indent=2))
+    elif cmd in ("approve", "approvals", "revoke"):
+        # 花钱批准：**人在自己的终端里签**，agent 只能报"需要批准"并给出这条命令。
+        #   python backend/gateway.py approve video.generate omni-t2v --count 3 --credits 150 --scope "fu-tie 3段15秒"
+        import json as _j
+        # 打印统一走 _cli 顶部那句 `print = _cprint`（模块级那份）——这里原来嵌过一份同名函数，
+        # 结果 `_cprint` 变成 _cli 的局部名，`print = _cprint` 在赋值前引用它直接 UnboundLocalError。
+        if cmd == "approvals":
+            now = _time.time()
+            data = _approvals_load()
+            gs = data.get("grants", [])
+            den = data.get("denials") or []
+            _cprint(f"批准条子 {len(gs)} 张、被拒的人签 {len(den)} 次（清单 = {SPEND_APPROVALS_PATH}）：")
+            for g in gs:
+                att = (g.get("attest") or {}).get("method", "（无人证字段·旧条子或闸自测）")
+                _cprint(f"  {g['id']}  {g['capability']}/{g['purpose']}  acct={g['account']}  "
+                        f"段 {g.get('used',0)}/{g['count']}  分 {g.get('used_credits',0)}/{g['credits']}  "
+                        f"还剩 {max(0, round((g['expires']-now)/3600))}h  人证={att}  「{g.get('scope','')}」")
+            if not gs:
+                _cprint("  （空）⇒ 现在任何 video.generate / video.edit / image.* 调用都会被拒 0 分。")
+            for p in data.get("pending") or []:
+                if float(p.get("expires", 0)) <= now:
+                    continue
+                _cprint("  ⏳ %s  %s/%s  acct=%s  %s段/%s分  还剩 %.0f 分钟  「%s」" % (
+                    p["id"], p["capability"], p["purpose"], p["account"], p["count"], p["credits"],
+                    (p["expires"] - now) / 60, (p.get("scope") or "")[:40]))
+            for dd in den[-5:]:
+                _cprint("  ✗ %s 拒绝原因=%s  %s/%s  scope=「%s」" % (
+                    _time.strftime("%m-%d %H:%M", _time.localtime(dd.get("at", 0))),
+                    dd.get("reason"), dd.get("capability"), dd.get("purpose"),
+                    (dd.get("scope") or "")[:40]))
+            return 0
+        if cmd == "revoke":
+            if len(argv) < 2:
+                print("用法: gateway.py revoke <条子id>"); return 2
+            print(_j.dumps(revoke_spend_approval(argv[1]), ensure_ascii=False)); return 0
+        if len(argv) < 2:
+            print("用法: gateway.py approve <capability> [purpose] --count N --credits X --scope \"...\" [--account local] [--ttl 86400]")
+            return 2
+        cap = argv[1]
+        rest, pur = argv[2:], "*"
+        if rest and not rest[0].startswith("--"):
+            pur, rest = rest[0], rest[1:]
+        opts = {"--count": "count", "--credits": "credits", "--account": "account",
+                "--scope": "scope", "--ttl": "ttl", "--session": "session"}
+        kv = {"purpose": pur, "count": 1, "credits": 0, "account": "local", "scope": "", "ttl": None,
+              "session": ""}
+        i = 0
+        while i < len(rest):
+            if rest[i] in opts and i + 1 < len(rest):
+                raw = rest[i + 1]; key = opts[rest[i]]
+                kv[key] = raw if key in ("account", "scope", "session") else float(raw) if key in ("ttl",) else int(raw)
+                i += 2
+            else:
+                i += 1
+        if not needs_spend_approval(cap):
+            print(f"⚠️ {cap} 本来就不需要批准（免批类：文本/看图）。这条 approve 只是留档，不影响任何调用。")
+        # 🔴 这一步【只建待批，不给额度】。系统弹窗已废（实测没人点也会返回【是】= 假人证）。
+        #    额度只能由"人看到报价之后"的一次核销拿到：DSH 审批卡点【允许一次】，或人在自己终端跑 consumed。
+        p = create_spend_pending(cap, kv["purpose"], kv["account"], int(kv["count"]),
+                                int(kv["credits"]), kv["scope"], kv["session"], kv["ttl"])
+        print(p["quote"])
+        # 🔴 核销码【绝不进 stdout】：这条命令多半是 agent 跑的，它读得到 stdout 就能自己
+        #    `consumed <id> <码>` 伪造核销 ⇒ 码一旦进管道，整套人证归零。
+        #    码只有两条给人的路：① DSH 审批卡（插件经 with_code 取，见 spend_pending）；
+        #                      ② 人在【自己的终端】里跑 `gateway.py code <pending_id>`。
+        print("\npending: %s   （%.0f 分钟内有效）" % (p["id"], SPEND_PENDING_TTL / 60))
+        print("⇒ 现在还没有任何批准额度。两种点法任选其一：")
+        print("   ① 在 DSH 对话里看那张品牌审批卡，核对报价后点【允许一次】；")
+        print("   ② 在你自己的终端里跑：python D:\\video-skill\\backend\\gateway.py code %s" % p["id"])
+        print("      （它会打出核销码，再按提示跑 consumed；码不在本回复里，免得跑这条命令的一方自己把码用掉）")
+        return 0
+    elif cmd == "code":
+        # 给人看码的口。⚠️ 它不是"人证"：谁都能跑（包括 agent）。人证在【这张码出现在人眼看到的卡上、
+        #    并由人交回来】这一步 —— 所以插件渲染路径 (with_code=True) 才是主路，这里只是兜底。
+        if len(argv) < 2:
+            print("用法: gateway.py code <pending_id>"); return 2
+        now = _time.time()
+        hit = next((x for x in _approvals_load().get("pending", [])
+                    if x.get("id") == argv[1] and x.get("status") == "pending"
+                    and float(x.get("expires", 0)) > now), None)
+        if hit is None:
+            print("✗ 没有这张待批（不存在 / 已核销 / 已过期）"); return 3
+        print(hit["quote"])
+        print("\npending: %s   核销码: %s   还剩 %.0f 分钟" % (
+            hit["id"], hit["code"], (hit["expires"] - now) / 60))
+        print("核对无误后跑：python D:\\video-skill\\backend\\gateway.py consumed %s <码>%s"
+              % (hit["id"], (" --session " + hit["session"]) if hit.get("session") else ""))
+        return 0
+
+    elif cmd == "consumed":
+        import json as _j
+        # 核销必须带上【建 pending 时同一个会话】—— pending 绑会话就是为了让"别处的点击"花不掉这条额度。
+        # 不显式给 --session 时，读 DSH 注入的 $DSH_SESSION_ID（拿不到就按空会话匹配）。
+        # 🔴 argv[0] 就是子命令名本身（_cli 收的是整段 argv[1:]），参数从 argv[1] 之后数起。
+        if len(argv) < 3:
+            print("用法: gateway.py consumed <pending_id> <核销码> [--session <这条方案的会话id>]")
+            return 2
+        sess = _os.environ.get("DSH_SESSION_ID") or ""
+        if "--session" in argv:
+            k = argv.index("--session")
+            if k + 1 < len(argv):
+                sess = argv[k + 1]
+        r = consume_spend_approval(argv[1], argv[2], sess)
+        if not r.get("ok"):
+            print("✗ 核销失败：%s ⇒ 仍然 0 额度、任务不会发起（已留痕 denials）" % r.get("reason"))
+            return 3
+        g = r["grant"]
+        print(_j.dumps(g, ensure_ascii=False, indent=2))
+        print("⇒ 已生效：%s/%s 最多 %s 段、上限 %s 分（人证 %s）。用完/过期自动回到「拒绝」态；"
+              "要撤就 gateway.py revoke %s" % (g["capability"], g["purpose"], g["count"],
+                                               g["credits"], g["attest"]["method"], g["id"]))
+        return 0
+
     else:
         print("用法: python backend/gateway.py [caps | prices | credits | resolve <cap> [purpose] | "
-              "call <cap> [purpose] [--account X] [--json '{...}'] | test | analyze <path> [问题]]")
+              "call <cap> [purpose] [--account X] [--json '{...}'] | test | analyze <path> [问题] | "
+              "approve <cap> [purpose] --count N --credits X --scope \"…\" | code <pending_id> | consumed <pending_id> <码> | approvals | revoke <id>]")
 
 
 if __name__ == "__main__":
-    _cli(_sys.argv[1:])
+    # 🔴 原来写成 `_cli(...)` 把返回码丢了 ⇒ 用法错误也退 0，调用方（脚本/闸）会把"没执行"当"执行成功"。
+    raise SystemExit(_cli(_sys.argv[1:]))

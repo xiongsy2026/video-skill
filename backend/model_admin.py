@@ -9,6 +9,9 @@
     GET  /api/model/resolve?capability=&purpose=  脱敏摘要 + 积分预估
     POST /api/model/call {capability,purpose,account,params} → gateway.invoke（预扣/回滚/信封）
     GET  /api/model/health                      各 route 真探活
+    GET  /api/spend/approvals                   人批准的条子有哪几张、各还剩几段（只读）
+    POST /api/spend/guard {capability,purpose,account,count,session}
+                                                花钱批准闸的 HTTP 入口：只【消耗】批准、永不创建批准；只听环回
   命令行轨不变：`python backend/gateway.py call <cap> [purpose] --account X --json '{...}'`。
   ⚠️ 无鉴权：只给本机自用；若要从客户机/公网调用，先加 token + 挪到服务端（见 docs/ADR-model-gateway.md）。
 
@@ -127,6 +130,27 @@ def model_call(body: dict) -> tuple:
     except gateway.RouteError as e:
         return 400, {"error": str(e)}
     return 200, env
+
+
+def spend_guard(body: dict) -> tuple:
+    """花钱批准闸的 HTTP 入口：给"真正干活的那一端"（现在是 8091 动作迁移工作室）在发起前来问一次。
+
+    形状和 model_call 一样（异常不外抛、路由错归 400），但语义相反的一层要注意：
+    这个口【只会消耗批准】，永远没有"创建条子"的端点 —— 那等于让机器自己替用户点头。
+    预计扣分由网关按价目算，调用方自带价格一律不理（防 credits=0 放行）。
+    """
+    cap = str(body.get("capability") or "")
+    if not cap:
+        return 400, {"ok": False, "error": "body 缺 capability"}
+    try:
+        out = gateway.guard_spend_from_source(
+            cap, str(body.get("purpose") or ""), str(body.get("account") or "local"),
+            int(body.get("count") or 1), str(body.get("session") or ""))
+    except gateway.RouteError as e:
+        return 400, {"ok": False, "error": str(e)}
+    except Exception as e:
+        return 400, {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+    return 200, out
 
 
 # ---- 价目 / 默认路由 / 积分流水（model_prices.json + 本地账本，改价不用动代码）----
@@ -510,6 +534,105 @@ boot();
 """
 
 
+# ── 花钱批准页（2026-10-08）──────────────────────────────────────────────
+# 为什么要有它：人证这一步原来要人在终端里敲命令，产品负责人连着否了三次
+#   （"太麻烦了换个方式"、"也不要输入口令了"、"我不是说了不要powershell"、"客户那里懂这个"）。
+#   ⇒ 客户和运营都只会点按钮，所以批准必须是【一张看得懂的卡 + 一个按钮】，零命令行、零口令。
+# 为什么点它算人证：按钮的点击发生在人眼看到的这张页面上；agent 只能提请（建 pending），
+#   它没有鼠标。⚠️ 诚实边界：码会随 /api/spend/pending 回到页面源码里，所以"码"不是防伪手段，
+#   防伪手段是【这次点击】；终局形态是把它做成 DSH 内核审批卡（approval/decided 只有 UI 的
+#   onClick 能 resolve，且没有应答者时内核 fail-closed）。
+APPROVAL_PAGE = r"""<!doctype html><html lang=zh><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>花钱批准 · WeekSir</title>
+<style>
+:root{--bg:#0a0d12;--panel:#12171f;--line:#222b38;--fg:#e8edf5;--mut:#8b98ab;
+--ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb454;--brand:#4d8dff}
+@media (prefers-color-scheme:light){:root{--bg:#f6f8fb;--panel:#fff;--line:#e2e8f0;
+--fg:#12171f;--mut:#5b6b82}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:28px 18px 80px}
+header{display:flex;align-items:center;gap:14px;padding-bottom:18px;border-bottom:1px solid var(--line);margin-bottom:22px}
+header img{height:34px;width:auto;object-fit:contain}
+.slogan{color:var(--mut);font-size:13px;border-left:1px solid var(--line);padding-left:14px}
+h1{font-size:17px;margin:0 0 4px;font-weight:600}
+.sub{color:var(--mut);font-size:13px;margin:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin:0 0 14px}
+.card.busy{opacity:.55}
+.route{font-size:16px;font-weight:600}
+.route span{color:var(--mut);font-weight:400;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:14px 0}
+.kv .k{color:var(--mut);font-size:12px}
+.kv .v{font-size:15px;font-weight:600}
+.v.money{color:var(--warn)}
+.scope{background:rgba(77,141,255,.08);border:1px solid rgba(77,141,255,.25);border-radius:10px;padding:10px 12px;color:#cfe0ff;font-size:13px}
+.acts{display:flex;gap:10px;margin-top:16px}
+button{flex:1;padding:11px 14px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font-size:14px;cursor:pointer}
+button.ok{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+button.ok:hover{filter:brightness(1.1)}
+button.no:hover{border-color:var(--bad);color:var(--bad)}
+.done{color:var(--ok);font-size:13px;margin-top:10px}
+.err{color:var(--bad);font-size:13px;margin-top:10px}
+.empty{text-align:center;color:var(--mut);padding:52px 0}
+.empty b{display:block;color:var(--fg);font-size:16px;margin-bottom:6px}
+.foot{color:var(--mut);font-size:12px;margin-top:26px;text-align:center}
+</style>
+<div class=wrap>
+<header>
+  <img src="/assets/weeksir-logo.png" alt="WeekSir">
+  <div><h1>花钱批准</h1><p class=sub>Agent 想调用一次会扣积分的生成任务</p></div>
+  <div class=slogan>专注电商AI落地</div>
+</header>
+<div id=list></div>
+<p class=foot>本页只听 127.0.0.1 · 每 3 秒自动刷新 · 15 分钟不点自动作废</p>
+</div>
+<script>
+const E=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function card(p){
+  const d=document.createElement('div');d.className='card';d.dataset.id=p.id;
+  const left=Math.max(0,Math.round(p.left_seconds/60));
+  d.innerHTML=`<div class=route>${E(p.capability)} / ${E(p.purpose)} <span>· ${E(p.account)}</span></div>
+  <div class=grid>
+    <div class=kv><div class=k>要跑几段</div><div class=v>${E(p.count)} 段</div></div>
+    <div class=kv><div class=k>最多扣多少分</div><div class="v money">${E(p.credits)} 分</div></div>
+    <div class=kv><div class=k>多久内有效</div><div class=v>${left} 分钟</div></div>
+  </div>
+  <div class=scope>这次要做的：${E(p.scope)||'（没写）'}</div>
+  <div class=acts><button class=ok>批准，开始跑</button><button class=no>这次不跑</button></div>
+  <div class=msg></div>`;
+  d.querySelector('.ok').onclick=()=>act(d,'/api/spend/approve',p.id,'已批准');
+  d.querySelector('.no').onclick=()=>act(d,'/api/spend/deny',p.id,'已拒绝');
+  return d;}
+async function act(d,url,id,word){
+  d.classList.add('busy');d.querySelectorAll('button').forEach(b=>b.disabled=true);
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pending_id:id})});
+    const j=await r.json();
+    d.querySelector('.msg').className=j.ok?'done':'err';
+    d.querySelector('.msg').textContent=j.ok?word+' ✓ 任务可以开始了':('没生效：'+(j.reason||j.error||'未知'));
+    if(!j.ok)d.classList.remove('busy');
+  }catch(e){d.classList.remove('busy');d.querySelectorAll('button').forEach(b=>b.disabled=false);
+    d.querySelector('.msg').className='err';d.querySelector('.msg').textContent='8100 没回话：'+e;}
+}
+async function load(){
+  let rows=[];
+  try{rows=(await (await fetch('/api/spend/pending')).json()).pending||[];}
+  catch(e){document.getElementById('list').innerHTML='<div class=card><div class=err>判定口 8100 没回话（不是"没有待批"）：'+E(e)+'</div></div>';return;}
+  const box=document.getElementById('list');
+  if(!rows.length){
+    if(box.dataset.last==='empty'&&box.children.length)return;   // 空态不重绘，免得闪
+    box.innerHTML='<div class=empty><b>现在没有等你批的任务</b>Agent 提请批准时会立刻出现在这里</div>';
+    box.dataset.last='empty';return;}
+  box.dataset.last='rows';box.innerHTML='';
+  rows.forEach(p=>box.appendChild(card(p)));}
+load();setInterval(load,3000);
+</script>
+</body></html>
+"""
+
+
 def delivery_pending_view(sid):
     """交付欠账的读视图（右栏 / 收工拦截 / 回归闸共用同一个口径，不开第二个口）。
 
@@ -552,6 +675,14 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(b)
+
+    def _not_loopback(self):
+        """花钱相关的动作口一律只认环回；不是环回就 403 并回 True（调用方直接 return）。"""
+        if str(self.client_address[0] or "") not in ("127.0.0.1", "::1", "localhost"):
+            self._send(403, json.dumps({"ok": False, "error": "FORBIDDEN：花钱批准的动作口只听环回请求"},
+                                       ensure_ascii=False))
+            return True
+        return False
 
     def _send_file(self, data, ctype):   # 二进制：不能带 charset，否则 hypit collect 的 content-type 判定会脏
         total = len(data)
@@ -637,6 +768,30 @@ class H(BaseHTTPRequestHandler):
             self._send(code, json.dumps(payload, ensure_ascii=False))
         elif u.path == "/api/model/prices":
             self._send(200, json.dumps(prices_view(), ensure_ascii=False))
+        elif u.path == "/api/spend/approvals":
+            # 只读：现在有哪几张"人批准的条子"、各还剩几段。没有创建条子的 GET/POST 口（见 spend_guard）。
+            self._send(200, json.dumps(gateway.spend_approvals(), ensure_ascii=False))
+        elif u.path in ("/approval", "/approval/"):
+            self._send(200, APPROVAL_PAGE, "text/html")
+        elif u.path == "/api/spend/pending":
+            # 给批准页渲染用：只读、无副作用、【不含核销码】（核销走 consume_by_click，码由服务端自取）。
+            # path/count_raw 是诊断字段：查"批准页看不到待批"用 —— 两个进程读的不是同一份 json 时一眼可见。
+            rows = [{"id": p["id"], "capability": p["capability"], "purpose": p["purpose"],
+                     "account": p["account"], "count": p["count"], "credits": p["credits"],
+                     "scope": p.get("scope", ""), "session": p.get("session", ""),
+                     "left_seconds": max(0, round(float(p["expires"]) - time.time()))}
+                    for p in gateway.spend_pending()]
+            self._send(200, json.dumps({"pending": rows,
+                                        "path": gateway.SPEND_APPROVALS_PATH,
+                                        "count_raw": len(gateway._approvals_load().get("pending") or [])},
+                                       ensure_ascii=False), cors=True)
+        elif u.path == "/assets/weeksir-logo.png":
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
+                                       "weeksir-logo.png"), "rb") as f:
+                    self._send_file(f.read(), "image/png")
+            except OSError:
+                self._send(404, json.dumps({"error": {"code": "NOT_FOUND"}}))
         elif u.path == "/api/model/credits":
             q = parse_qs(u.query)
             lim = int((q.get("limit") or ["30"])[0] or 30)
@@ -711,7 +866,10 @@ class H(BaseHTTPRequestHandler):
                     target = p; break
             if not target or not _os.path.isfile(target) or ".." in rel:
                 self._send(404, json.dumps({"error": "文件不存在或越界"}), cors=True); return
-            ext = _os.path.splitext(target)[1].lower()
+            ext = _os.path.splitext(target)[1].lower().lstrip(".")
+            # 🔴 键是"png/mp4"这种【不带点】的扩展名：以前拿 ".mp4" 去查这张表永远查不中，
+            #    于是所有看板直链都回 application/octet-stream —— 视频在浏览器里变成"下载"而不是"播放"，
+            #    图片也不内联显示（交付三件套里的"直链"这一件其实是坏的）。
             ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
                      "webp": "image/webp", "mp4": "video/mp4", "json": "application/json"}.get(ext, "application/octet-stream")
             with open(target, "rb") as f:
@@ -808,6 +966,39 @@ class H(BaseHTTPRequestHandler):
                 return
             code, payload = hypit_bridge.handle_export(body if isinstance(body, dict) else {})
             self._send(code, json.dumps(payload, ensure_ascii=False), cors=True)
+        elif u.path == "/api/spend/guard":
+            # 只环回：消耗批准这件事不该由局域网里别的机器替本机用户做。
+            if str(self.client_address[0] or "") not in ("127.0.0.1", "::1", "localhost"):
+                self._send(403, json.dumps({"ok": False, "error": "FORBIDDEN：/api/spend/guard 只听环回请求"},
+                                           ensure_ascii=False))
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e}, ensure_ascii=False))
+                return
+            code, payload = spend_guard(body if isinstance(body, dict) else {})
+            self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path in ("/api/spend/approve", "/api/spend/deny"):
+            # 花钱批准页的两个动作口。🔴 只听环回（和 /api/spend/guard 同一条理由：批准/拒绝
+            # 是本机用户的事，不该由局域网里别的机器替他点）。这里【没有】创建 pending 的口 ——
+            # 提请由 agent 跑 gateway.py approve 完成，它只能建待批、拿不到额度。
+            if self._not_loopback():
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e}, ensure_ascii=False))
+                return
+            pid = str((body or {}).get("pending_id") or "")
+            if not pid:
+                self._send(400, json.dumps({"ok": False, "error": "缺 pending_id"}, ensure_ascii=False))
+                return
+            if u.path.endswith("deny"):
+                r = gateway.deny_pending(pid)
+            else:
+                r = gateway.consume_by_click(pid)     # 码由服务端自己取，页面不需要知道
+            self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
         elif u.path == "/api/model/call":
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
