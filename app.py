@@ -16,12 +16,54 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import httpx
 
 from config import settings
+
+
+class _SafeTextStream:
+    """stdout/stderr 安全写入包装（2026-10-09 事故：TVC Step3 RPA 里一条 `✓`(U+2713) print
+    在 GBK 控制台抛 UnicodeEncodeError，被外层 except 接住 ⇒ Phase2 直接标 failed）。
+
+    纪律同 echo()：按【输出流自己的编码】先试编码、失败再 errors='replace'。
+    ⚠️ 绝不用 `sys.stdout.reconfigure`（闸里已钉死）；pythonw 下底层流可能为 None ⇒ 静默丢掉。
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, s):
+        try:
+            stream = self._stream
+            if stream is None:
+                return 0
+            enc = getattr(stream, "encoding", None) or "ascii"
+            try:
+                s.encode(enc)
+            except (UnicodeEncodeError, LookupError):
+                s = s.encode(enc, "replace").decode(enc, "replace")
+            return stream.write(s)
+        except Exception:
+            return 0
+
+    def flush(self):
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if sys.stdout is not None:
+    sys.stdout = _SafeTextStream(sys.stdout)
+if sys.stderr is not None:
+    sys.stderr = _SafeTextStream(sys.stderr)
 
 # ── 全局任务状态 ──
 tasks: dict = {}
@@ -33,6 +75,31 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # ── 输出目录 ──
 OUTPUT_DIR = Path(settings.OUTPUT_DIR)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def echo(msg="", err=False):
+    """🔴 把【动态文本】写到 stdout/stderr 的唯一出口（2026-10-06 事故：8090 控制台是 GBK，
+    子进程回传的日志里一个 `✓`(U+2713) 就让 `print(f"[SR-...] {msg}")` 抛 UnicodeEncodeError，
+    被外层 except 接住 ⇒ **已经把 Phase1 跑完的任务被标成 failed**，钱花了、产物在盘上、状态却是死的。
+
+    纪律：按【输出流自己的编码】先试编码、失败再 errors='replace'。
+    ⚠️ 绝不用 `sys.stdout.reconfigure`：那条路实测会造"零输出 + 退出码 0"的静默假绿（闸里已钉死这条）。
+    ⚠️ pythonw（无控制台）下 sys.stdout 可能是 None ⇒ 静默丢掉，绝不能让它把业务流程带崩。
+    """
+    try:
+        stream = sys.stderr if err else sys.stdout
+        if stream is None:
+            return
+        s = str(msg)
+        enc = getattr(stream, "encoding", None) or "ascii"
+        try:
+            s.encode(enc)
+        except (UnicodeEncodeError, LookupError):
+            s = s.encode(enc, "replace").decode(enc, "replace")
+        stream.write(s + "\n")
+        stream.flush()
+    except Exception:
+        pass                      # 日志写不出去 = 只是看不见，不是任务坏了
 
 
 @asynccontextmanager
@@ -66,6 +133,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="爆款复刻工作流", lifespan=lifespan)
+
+# ── 花钱批准闸的接入口（2026-10-06 用户定："只要是生成视频相关的，必须算账我确认"）──────
+# 8090 的生成腿【直连厂商、不经 gateway.invoke()】⇒ 网关里那道闸盖不到这里，所以在 handler 入口调同一个守卫。
+# purpose 给实路由（单价从价目表读）；还没核实清的就给 "*" ⇒ 只认人签的通吃条子、按该能力上限报（宁可高报不猜低）。
+def _spend_or_423(capability: str, purpose: str = "*", label: str = "") -> None:
+    from backend import gateway as _gw
+
+    try:
+        _gw.spend_guard(capability, purpose, "local", 1, label)
+    except _gw.SpendApprovalRequired as _e:
+        raise HTTPException(423, str(_e))
+
+
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
@@ -306,6 +386,68 @@ async def health_check_models():
         else:
             results.append(item)
     return {"success": True, "models": results}
+
+
+# ==================== Framewright 工作台 ====================
+
+class FramewrightIntakeRequest(BaseModel):
+    brief: str = ""
+    assets: List[str] = []
+    extra: str = ""
+
+
+class FramewrightCompileRequest(BaseModel):
+    project_slug: str = "project"
+    unit_slug: str = "unit"
+    stage: str = "video_prompt"          # storyboard | keyframes | video_prompt
+    target: str = "seedance_2_5"         # 视频: seedance_2_0/seedance_2_5/minimax_h3；图片: midjourney_v8_2/gpt_image_2_5
+    director_mode: str = "auteur"        # auteur | apprentice | screenwriter
+    materials: str = ""
+    spine: str = ""
+    answers: str = ""
+
+
+@app.get("/api/framewright/status")
+async def framewright_status():
+    """Framewright 工作台状态：skill 安装、规范版本、注册路由。"""
+    from backend.services import framewright_workbench as fw
+    return {"success": True, **fw.get_status()}
+
+
+@app.post("/api/framewright/intake")
+async def framewright_intake(req: FramewrightIntakeRequest):
+    """Step 1-2：Unified Director Intake（复述 + 制作解读 + 决策问题）。"""
+    from backend.services import framewright_workbench as fw
+    if not req.brief.strip():
+        raise HTTPException(400, "请填写场景/剧本片段/视觉简述")
+    return await fw.run_intake(req.brief, req.assets, req.extra)
+
+
+@app.post("/api/framewright/compile")
+async def framewright_compile(req: FramewrightCompileRequest):
+    """Step 3-4：编译单个阶段 → 保存 .txt → 官方校验 → 交付 handoff。"""
+    from backend.services import framewright_workbench as fw
+    if not req.materials.strip():
+        raise HTTPException(400, "请填写已批准的素材/Production Spine")
+    return await fw.run_compile(
+        project_slug=req.project_slug,
+        unit_slug=req.unit_slug,
+        stage=req.stage,
+        target=req.target,
+        director_mode=req.director_mode,
+        materials=req.materials,
+        spine=req.spine,
+        answers=req.answers,
+    )
+
+
+@app.get("/framewright", response_class=HTMLResponse)
+async def framewright_page():
+    """Framewright 电影化编译工作台 - 二级页面"""
+    html_path = Path(settings.FRONTEND_DIR) / "framewright.html"
+    if not html_path.exists():
+        raise HTTPException(404, "Framewright 工作台页面未找到")
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1886,7 +2028,7 @@ except Exception as e:
             if line:
                 msg = line.decode("utf-8", errors="replace").rstrip()
                 _log(msg)
-                print(f"[{task_id}] {msg}", flush=True)
+                echo(f"[{task_id}] {msg}")        # 父进程侧统一走 echo()（见 echo 的docstring）
                 # 提前提取 run_dir（即使 phase 失败也能用于 retry）
                 if "[Phase1] 运行目录:" in msg and not task.get("run_dir"):
                     try:
@@ -2408,7 +2550,7 @@ except Exception as e:
                 if line:
                     msg = line.decode("utf-8", errors="replace").rstrip()
                     task["logs"].append(msg)
-                    print(f"[{task_id}/shot{shot_num:02d}] {msg}", flush=True)
+                    echo(f"[{task_id}/shot{shot_num:02d}] {msg}")
                 if process.stdout.at_eof():
                     break
                 if asyncio.get_event_loop().time() - start_time > timeout_sec:
@@ -2509,7 +2651,7 @@ class OriginalPipelineRequest(BaseModel):
 async def replica_run_original(req: OriginalPipelineRequest):
     """启动首尾帧无限拼接·原创管线（一气呵成，无审核点）
 
-    流程：GPT5.5 脚本 → Image2 关键帧 → H3 双帧并发生成 → ffmpeg 拼接
+    流程：gpt-6.1-sol 脚本 → Image2 关键帧 → H3 双帧并发生成 → ffmpeg 拼接
     """
     if not req.product_name or not req.product_name.strip():
         raise HTTPException(status_code=400, detail="必须提供产品名称")
@@ -2524,7 +2666,7 @@ async def replica_run_original(req: OriginalPipelineRequest):
     replica_original_tasks[task_id] = {
         "status": "running",
         "phase": "original_before_script",
-        "step_name": "Step1: GPT5.5 推理分镜脚本",
+        "step_name": "Step1: gpt-6.1-sol 推理分镜脚本",
         "progress": 0,
         "run_dir": None,
         "result": None,
@@ -2604,7 +2746,7 @@ except Exception as e:
                 # 根据 log 内容更新进度状态
                 if "[Step1]" in line_str:
                     task["phase"] = "original_after_script"
-                    task["step_name"] = "Step1: GPT5.5 推理分镜脚本"
+                    task["step_name"] = "Step1: gpt-6.1-sol 推理分镜脚本"
                 elif "[Step3]" in line_str:
                     task["phase"] = "original_after_keyframes"
                     task["step_name"] = "Step3: Image2 生成关键帧"
@@ -2690,7 +2832,7 @@ async def replica_run_original_director(req: OriginalDirectorPipelineRequest):
       - segment_duration 支持 1-15 任意整数秒（不再限制 5/10/15）
       - Step5 用 H3 Director 一次任务生成完整视频（无 ffmpeg 拼接，无转场）
 
-    流程：GPT5.5 脚本 → Image2 关键帧 → H3 Director 一次生成
+    流程：gpt-6.1-sol 脚本 → Image2 关键帧 → H3 Director 一次生成
     """
     if not req.product_name or not req.product_name.strip():
         raise HTTPException(status_code=400, detail="必须提供产品名称")
@@ -2705,7 +2847,7 @@ async def replica_run_original_director(req: OriginalDirectorPipelineRequest):
     replica_original_director_tasks[task_id] = {
         "status": "running",
         "phase": "original_director_before_script",
-        "step_name": "Step1: GPT5.5 推理分镜脚本",
+        "step_name": "Step1: gpt-6.1-sol 推理分镜脚本",
         "progress": 0,
         "run_dir": None,
         "result": None,
@@ -2783,7 +2925,7 @@ except Exception as e:
                 task["logs"].append(line_str)
                 if "[Step1]" in line_str:
                     task["phase"] = "original_director_after_script"
-                    task["step_name"] = "Step1: GPT5.5 推理分镜脚本"
+                    task["step_name"] = "Step1: gpt-6.1-sol 推理分镜脚本"
                 elif "[Step3]" in line_str:
                     task["phase"] = "original_director_after_keyframes"
                     task["step_name"] = "Step3: Image2 生成关键帧"
@@ -3401,6 +3543,59 @@ def _sr_sync_to_store(task_id: str, **extra):
         pass
 
 
+# 盘上产物 → 任务应有的状态。键=phase_state.json 里那一档，值=(状态, 必须存在的产物字段)
+_SR_DISK_STATES = {"after_step1": ("awaiting_review", "poster"),
+                   "after_step3": ("awaiting_review", "poster"),
+                   "after_step4": ("completed", "video"),
+                   "after_step5": ("completed", "video")}
+
+
+def _sr_state_from_disk(task: dict):
+    """按**盘上真实产物**判这条 sr 任务该是什么状态；不成立回 None（那就维持原判）。
+
+    为什么要有它：状态原来只信内存/DB 那个 `status` 字段，于是"活干完了、收尾时出了别的意外"
+    会被永久标成 failed。2026-10-06 实测那次：父进程 GBK 回显抛 UnicodeEncodeError ⇒ 外层 except
+    标 failed，而 Phase1 早已把分镜 JSON、故事板海报落到盘上、`phase_state.json` 都写成 after_step3 了
+    ⇒ 待审页看不到、"通过"点不动（钱和时间都花了）。
+
+    两处要从盘上取，不能只读 task 字段：
+      run_dir —— 崩在回显时还没来得及写回任务；子进程第一行就打"运行目录: …"，`_log()` 已落进日志，就从那儿找。
+      phase   —— 任务字段里的 phase 还是入口值 `phase_1`；真值在子进程自己写的 `phase_state.json` 里。
+    🔴 只纠 `failed`：`RUNNING` 不动（产物可能是上一轮的、或子进程真在跑），拿它翻案会把在跑的活标成跑完。
+    """
+    if str((task or {}).get("status") or "").lower() != "failed":
+        return None
+    run_dir = str((task or {}).get("run_dir") or "")
+    if not run_dir:
+        for lg in (task or {}).get("logs") or []:
+            m = re.search(r"运行目录[:：]\s*([A-Za-z]:[^\"'\s]+)", str(lg))
+            if m and Path(m.group(1)).is_dir():
+                run_dir = m.group(1)
+                break
+    rd = Path(run_dir) if run_dir else None
+    if not (rd and rd.is_dir()):
+        return None
+    phase = str((task or {}).get("phase") or "")
+    ps = rd / "phase_state.json"
+    if ps.is_file():
+        try:
+            phase = str(json.loads(ps.read_text(encoding="utf-8")).get("phase") or phase)
+        except Exception:
+            pass
+    want = _SR_DISK_STATES.get(phase)
+    if not want:
+        return None
+    status, key = want
+    try:
+        from structural_replica_workflow import _collect_review_images
+        review = _collect_review_images(rd, phase)
+    except Exception:
+        return None
+    if not (review or {}).get(key):
+        return None
+    return status, review, run_dir, phase
+
+
 def _sr_ensure_in_memory(task_id: str) -> bool:
     """确保 sr 任务在内存字典中。如果不在，从 task_store 恢复。
 
@@ -3454,29 +3649,15 @@ def _sr_ensure_in_memory(task_id: str) -> bool:
             except Exception:
                 pass
 
-    # 状态修正：phase=after_step3 且磁盘有 poster → awaiting_review
-    # （服务重启时 task_store 里的 status 可能被误标为 failed，但产物已生成）
-    cur_phase = sr_phased_tasks[task_id]["phase"]
-    if cur_phase in ("after_step3", "after_step1") and run_dir:
-        from structural_replica_workflow import _collect_review_images
-        try:
-            review = _collect_review_images(Path(run_dir), cur_phase)
-            if review and review.get("poster"):
-                sr_phased_tasks[task_id]["status"] = "awaiting_review"
-                if not sr_phased_tasks[task_id].get("review"):
-                    sr_phased_tasks[task_id]["review"] = review
-        except Exception:
-            pass
-    elif cur_phase in ("after_step4", "after_step5", "completed") and run_dir:
-        from structural_replica_workflow import _collect_review_images
-        try:
-            review = _collect_review_images(Path(run_dir), cur_phase)
-            if review and review.get("video"):
-                sr_phased_tasks[task_id]["status"] = "completed"
-                if not sr_phased_tasks[task_id].get("review"):
-                    sr_phased_tasks[task_id]["review"] = review
-        except Exception:
-            pass
+    # 状态修正：盘上产物说了算（服务重启/日志炸掉都可能把已跑完的任务误标 failed）。
+    # 🔴 规则只在 `_sr_state_from_disk` 里写一次——这里原来是第二份手写副本（`sr_status` 里还有第三份），
+    #    三份各自的 phase 名单不一样，改一处漏两处。现在三处都读同一个函数。
+    fix = _sr_state_from_disk(sr_phased_tasks[task_id])
+    if fix:
+        status, review, run_dir, phase = fix
+        sr_phased_tasks[task_id].update({"status": status, "run_dir": run_dir, "phase": phase})
+        if not sr_phased_tasks[task_id].get("review"):
+            sr_phased_tasks[task_id]["review"] = review
     return True
 
 
@@ -3579,7 +3760,7 @@ except Exception as e:
             if line:
                 msg = line.decode("utf-8", errors="replace").rstrip()
                 _log(msg)
-                print(f"[SR-{task_id}] {msg}", flush=True)
+                echo(f"[SR-{task_id}] {msg}")     # 🔴 走 echo()：一个 ✓ 不许把跑完的任务判死
             # Windows asyncio 下 at_eof() 不一定可靠：进程已退出但 pipe EOF 可能不触发
             # → 用 returncode is not None 作为兜底信号，防止任务永久卡 RUNNING
             if process.stdout.at_eof() or process.returncode is not None:
@@ -3593,7 +3774,7 @@ except Exception as e:
                         break
                     msg = rest.decode("utf-8", errors="replace").rstrip()
                     _log(msg)
-                    print(f"[SR-{task_id}] {msg}", flush=True)
+                    echo(f"[SR-{task_id}] {msg}")  # 同上：排空缓冲那一段也不能被编码炸断
                 if process.returncode is not None and process.returncode != 0:
                     _log(f"[{phase}] 子进程退出 code={process.returncode}")
                 break
@@ -3778,7 +3959,22 @@ async def sr_status(task_id: str):
     """查询结构性复刻任务状态（内存优先，task_store 兜底）"""
     from backend.services import task_store
     if task_id in sr_phased_tasks:
-        return sr_phased_tasks[task_id]
+        task = sr_phased_tasks[task_id]
+        # 🔴 判 failed 之前先问盘上的产物：Phase1 跑完 = 海报已经在盘上，那这条任务该是"待审"，
+        #    不是"失败"。（2026-10-06：父进程 GBK 打印抛 UnicodeEncodeError ⇒ 外层 except 把它标成
+        #    failed，钱与时间都花了、故事板也在盘上，人却看不到待审页、更点不了"通过"。）
+        if str(task.get("status")) == "failed":
+            fix = _sr_state_from_disk(task)
+            if fix:
+                want, review, run_dir, phase = fix
+                task.update({"status": want, "review": review, "error": None,
+                             "run_dir": run_dir, "phase": phase,
+                             "step_name": "等待审核故事板海报" if want == "awaiting_review" else "视频生成完成",
+                             "progress": 50 if want == "awaiting_review" else 100})
+                task["logs"] = (task.get("logs") or []) + [
+                    f"状态已按盘上产物纠正为 {want}（原判 failed 是日志写出炸的，不是流程失败）"]
+                _sr_sync_to_store(task_id)
+        return task
     # task_store 兜底（服务重启后内存清空）
     t = task_store.get(task_id)
     if t:
@@ -3794,19 +3990,22 @@ async def sr_status(task_id: str):
         run_dir = t.get("work_dir", "")
         status = str(t.get("status", "")).lower()
 
-        # 如果 phase=after_step3（产物已生成），从磁盘扫描 review，
-        # 并把状态调整为 awaiting_review（服务重启误标 failed 的任务可恢复审核）
+        # 同一套纠正规则（内存里/不在内存都走 `_sr_state_from_disk`，别抄第二份）：
+        # 服务重启把状态标丢、或崩在回显没写回 run_dir 的老任务，都靠盘上产物恢复到"待审/已完成"
+        fix = _sr_state_from_disk({"status": status, "phase": phase, "run_dir": run_dir,
+                                   "logs": [lg.get("msg", "") if isinstance(lg, dict) else lg for lg in logs]})
         review = None
-        if phase in ("after_step3", "after_step1", "after_step4", "after_step5") and run_dir:
-            from structural_replica_workflow import _collect_review_images
+        if fix:
+            status, review, run_dir, phase = fix
+            # 纠回待审/已完成后，那句"服务重启，任务标记为失败"就是历史噪音了：
+            # 留着它会让人以为这条片子出了问题，其实产物好好的在盘上、下一步就是点"通过"。
+            err_text = None
             try:
-                review = _collect_review_images(Path(run_dir), phase)
+                task_store.update(task_id, error="")
             except Exception:
-                review = None
-            if phase in ("after_step3", "after_step1") and review and review.get("poster"):
-                status = "awaiting_review"
-            elif phase in ("after_step4", "after_step5", "completed") and review and review.get("video"):
-                status = "completed"
+                pass
+        else:
+            err_text = t.get("error", "") or None
 
         return {
             "status": status,
@@ -3814,7 +4013,7 @@ async def sr_status(task_id: str):
             "step_name": t.get("stage", ""),
             "progress": t.get("progress", 0),
             "run_dir": run_dir,
-            "error": t.get("error", "") or None,
+            "error": err_text,
             "logs": [lg.get("msg", "") for lg in logs],
             "review": review,
             "result": None,
@@ -3958,7 +4157,16 @@ async def sr_history():
             pass
 
     # 按创建时间倒序（新任务在前）
-    history.sort(key=lambda h: h.get("created_at", "") or h.get("task_id", ""), reverse=True)
+    # 排序键必须同型：created_at 是数字、缺它时回落到 task_id 字符串 ⇒ 混类型一比就 TypeError
+    # （2026-10-06 实测 /api/structural-replica/history 直接 500，历史页整页打不开）。
+    def _hist_key(h):
+        try:
+            ts = int(float(str(h.get("created_at") or 0)))
+        except (TypeError, ValueError):
+            ts = 0
+        return (ts, str(h.get("task_id") or ""))
+
+    history.sort(key=_hist_key, reverse=True)
     return {"history": history}
 
 
@@ -4516,7 +4724,7 @@ async def short_drama_match(req: ShortDramaMatchRequest):
 
 
 # ─────────────────────────────────────
-# 一键产品 TVC（3步：GPT5.5提示词 → image2 4K故事板 → RPA SD2成片）
+# 一键产品 TVC（3步：gpt-6.1-sol提示词 → image2 4K故事板 → RPA SD2成片）
 # ─────────────────────────────────────
 
 class TVCPipelineRequest(BaseModel):
@@ -6298,7 +6506,13 @@ def _concat_h3_segments(segment_paths: list[str], output_path: str, target_durat
 
 @app.post("/api/h3-studio/generate")
 async def h3_studio_generate(req: H3StudioRequest):
-    """启动海螺 H3 Studio 视频生成任务"""
+    """启动海螺 H3 Studio 视频生成任务。
+
+    🔴 这条腿【绕开网关】直连厂商 ⇒ 网关里那道批准闸盖不到它，所以在入口调同一个守卫、认同一张条子。
+       没条子 ⇒ 423 拒绝，任务不提交、0 分不动（实测过）。
+    """
+    _spend_or_423("video.generate", "h3", "h3-studio 出片")
+
     if req.channel not in ("runninghub", "manxue"):
         raise HTTPException(400, "channel 必须是 runninghub 或 manxue")
     if req.mode not in ("reference", "first_last_frame"):
@@ -7430,7 +7644,11 @@ async def one_shot_events():
             try:
                 running = task_store.list_running()
                 # 只看 one-shot 类任务
-                running = [t for t in running if t.get("task_type") == "one_shot"]
+                # 🔴 2026-10-08 bug 修复：原来写死字面量 "one_shot"，而写入侧的常量是
+                #    backend/services/oneshot_video.py:30 TASK_TYPE = "one_shot_video" ⇒ 永不匹配，
+                #    这个 SSE 对 one-shot 是死路径（running_count 恒 0），SKILL.md 里"或听 SSE"因此一直在骗人。
+                #    改成引用同一个常量（不再抄字符串），两边再改名也不会脱钩。
+                running = [t for t in running if t.get("task_type") == oneshot_video.TASK_TYPE]
                 tasks_payload = []
                 for t in running:
                     tid = t.get("task_id", "")
@@ -8584,7 +8802,7 @@ except Exception as e:
             if line:
                 msg = line.decode("utf-8", errors="replace").rstrip()
                 _log(msg)
-                print(f"[RM-{task_id}] {msg}", flush=True)
+                echo(f"[RM-{task_id}] {msg}")
             if process.stdout.at_eof():
                 break
             if asyncio.get_event_loop().time() - start_time > timeout_sec:
@@ -8824,6 +9042,10 @@ class OneShotReplicaGenerateRequest(BaseModel):
 @app.post("/api/one-shot-replica/generate")
 async def oneshot_replica_generate(req: OneShotReplicaGenerateRequest):
     """基于反推结果调 Seedance 生成视频（异步，复用同 task_id）"""
+    # 🔴 花钱批准闸：这条腿直连 Seedance（不经 gateway.invoke）⇒ 入口先要条子。
+    #    purpose 给 "*"：具体打 seedance-2.0 还是 2.5 我没在 seedance_runner 里核实死，
+    #    不猜路由 ⇒ 只认人签的通吃条子，报价按 video.generate 的上限（宁可高报不猜低）。
+    _spend_or_423("video.generate", "*", "one-shot-replica 出片")
     t = oneshot_replica_tasks.get(req.task_id)
     if not t:
         raise HTTPException(404, "反推任务不存在")
@@ -9764,6 +9986,9 @@ class ReplicaWan3SubmitRequest(BaseModel):
 @app.post("/api/replica-wan3/submit")
 async def replica_wan3_submit(req: ReplicaWan3SubmitRequest):
     """提交 wan3.0 复刻任务到 RunningHub（异步执行）"""
+    # 🔴 花钱批准闸（RunningHub 按 GPU 秒真扣钱）：purpose 给 "*" —— 网关里的 wan3 路由是 dashscope 那条，
+    #    与这条走的 RunningHub 不是同一个上游，**不拿不相干的路由单价糊报价**，所以只认通吃条子、按上限报。
+    _spend_or_423("video.generate", "*", "replica-wan3 复刻出片")
     from backend.services.replica_wan3 import submit_replica, poll_until_done, validate_config
 
     err = validate_config()
@@ -10097,7 +10322,12 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
       - 若提供 trim_start/trim_end：只复刻该区间（最短 1s，不限最长）
       - 区间或原片超过 15s：按 15s 切段生成后自动拼接
     """
-    from backend.services.super_clone_wan3 import run_pipeline, validate_input, validate_trim, _ffprobe_duration, _cfg
+    from backend.services.super_clone_wan3 import run_pipeline, validate_input, validate_trim, _ffprobe_duration, _cfg, engine_lock_error
+    # 🔴 引擎锁放在【建任务记录之前】：否则要等 _runner 抛出来才标 FAILED，
+    #    人看到的是一串已经排队的任务，而不是一句「这条线没有第二个引擎」。
+    _lock = engine_lock_error(req.engine)
+    if _lock:
+        raise HTTPException(400, _lock)
 
     # 入口校验：视频存在 + 能探测时长
     err = validate_input(req.video_path)
@@ -10770,6 +11000,9 @@ class HookExtendSubmitRequest(BaseModel):
 @app.post("/api/hook-extend/submit")
 async def hook_extend_submit(req: HookExtendSubmitRequest):
     """提交钩子延展任务"""
+    # 🔴 花钱批准闸：hook_extend.run_pipeline 里 Step3 调 `omni_client.submit_omni_task`（omni_flash-10s）⇒ 真花钱，
+    #    路由对得上网关的 omni-t2v，所以 purpose 给实路由、单价从价目表读。
+    _spend_or_423("video.generate", "omni-t2v", "hook-extend 钩子延展")
     from backend.services import hook_extend
 
     task_id = f"hook_extend_{uuid.uuid4().hex[:8]}"
@@ -10901,6 +11134,10 @@ class AgnesImageSubmitRequest(BaseModel):
 
 @app.post("/api/agnes-image/submit")
 async def agnes_image_submit(req: AgnesImageSubmitRequest):
+    # 🔴 花钱批准闸：这条直接 `agnes_image_client.create_image` 出图（按条计费、绕开网关）。
+    #    purpose=default 是有据的：config.AGNES_IMAGE_MODEL = agnes-image-2.5-flash，
+    #    与网关 image.generate/default 解析出的模型同名 ⇒ 单价能报实数（4 分/张），不用退到上限。
+    _spend_or_423("image.generate", "default", "agnes-image 出图")
     prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(400, "prompt 不能为空")

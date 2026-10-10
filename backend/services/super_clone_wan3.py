@@ -32,6 +32,25 @@ from backend.services.runninghub_client import rh_video_guard
 
 
 # ── 配置（懒读，便于覆盖）──
+# ── 引擎白名单（2026-10-10 用户裁定：现在唯一的 wan3.0 只有一个）─────────────────
+# 🔴 判据只在这一份。runner / run_pipeline / 8090 提交口三处都问 engine_lock_error()，
+#    谁在别处再抄一份名单，scripts/check-engine-single-source.py 的 I 组会红。
+# 为什么必须落到码上：此前 run_pipeline(engine=...) 没有白名单、runner 的 --engine 没有 choices
+#    ⇒ engine=h3 能一路走到 step2_h3_execute（RunningHub 导演台），只被 rh_video_guard 挡着，
+#      合同 / 表单 / 引擎单一源闸全都看不见这条分叉。
+LANE_ENGINES = ("wan3",)
+LANE_ENGINE_SPEND = "video.generate/wan3-prime"   # 与合同 spend、表单 engine_lock 同源（I 组核三方）
+
+
+def engine_lock_error(engine) -> str:
+    """纯判据：返回拒因；空串 = 放行。抽成函数是为了让闸能整块抠出来跑值表。"""
+    e = str(engine or "").strip()
+    if e in LANE_ENGINES:
+        return ""
+    return ("engine=%r 不在本线白名单 %s 内 ⇒ 拒（0 消耗、不动盘）。"
+            "wan3.0 的唯一实现是网关 lane %s（provider yz-prime）；"
+            "要换引擎 = 换 skill、重新报价，不是在这里传参切换。" % (e, "/".join(LANE_ENGINES), LANE_ENGINE_SPEND))
+
 def _cfg() -> Dict[str, Any]:
     return {
         "mimo_fps": float(getattr(settings, "REPLICA_WAN3_MIMO_FPS", 4.0)),
@@ -3294,7 +3313,25 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
     """
     from backend import skill_contract as _skc
     seg_dir = Path(seg_dir)
+    # 🔴 素材必须【真看过】（2026-10-10 用户裁定：提交前 agent 要分析所有素材做意图匹配）。
+    #    判据不认 agent 自述、只认网关台账：每条 video.analyze 跑完由网关自己记账，
+    #    这里按内容 sha8 对账 ⇒ 没看过就提交不出去。放在写任何物证之前 ⇒ 拒的时候盘上是干净的。
+    from backend import gateway as _gw
+    _sid = _gw._session_of({})
+    _mats = [str(x) for x in (seg_product_paths or []) if str(x or "").strip()]
+    _missing = _gw.analysis_coverage_problems(_mats, _gw.media_analysis_rows(), _sid)
+    if _missing:
+        raise RuntimeError(
+            "素材没看过 ⇒ 不提交（0 消耗）。缺 %d 项：%s" % (len(_missing), "；".join(_missing)[:400])
+            + "。先跑 python D:" + chr(92) + "video-skill" + chr(92) + "backend" + chr(92)
+            + "gateway.py call video.analyze <路径> —— 看图免批但不免账（单价现读 prices），要花的分先算进报价。")
     seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "material_analysis.json").write_text(json.dumps({
+        "session": _sid or "未知",
+        "materials": [_gw.file_identity(p) for p in _mats],
+        "missing": _missing,
+        "ledger_rows": len(_gw.media_analysis_rows()),
+    }, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def _l(msg: str) -> None:
         if log:
@@ -3325,7 +3362,8 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
     try:
         _skc.write_receipt(
             "super-clone", str(seg_dir),
-            steps={"compile-prompt": str(seg_dir / "prompt.txt"),
+            steps={"material-analysis": str(seg_dir / "material_analysis.json"),
+                   "compile-prompt": str(seg_dir / "prompt.txt"),
                    "storyboard": str(sb),
                    "compile-bound": str(seg_dir / "prompt_meta.json"),
                    "negative-lock": str(seg_dir / "prompt.txt"),
@@ -3335,7 +3373,8 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             inputs=[str(ref_video)] + [str(x) for x in seg_product_paths],
             # 手段申报进【回执行】：合同给某步写死了 `手段=` 白名单，不在名单里或根本没申报 ⇒ check_receipt 拒。
             # （原来这行没写，impl 被错传给了 verify_or_raise —— 那个函数没这个参数，直接 TypeError。）
-            impl={"negative-lock": "compiler-negative-lock"},
+            impl={"negative-lock": "compiler-negative-lock",
+                  "material-analysis": "gateway:video.analyze"},
             models={"compile-prompt": cell, "compile-bound": cell})
     except Exception as _re:                              # noqa: BLE001
         _l("⚠️ 回执写入失败（下一步核验会因此拒绝提交，不是上游问题）：%s" % _re)
@@ -3418,6 +3457,11 @@ async def run_pipeline(
             "trim_range": dict,            # {"start": float, "end": float} 或 None
         }
     """
+    # 🔴 第一道：引擎锁。放在建目录/读素材/调任何模型之前 ⇒ 拒的时候 0 消耗、盘上不留半成品。
+    _lock = engine_lock_error(engine)
+    if _lock:
+        raise RuntimeError(_lock)
+
     def log(msg: str) -> None:
         if on_log:
             on_log(msg)
