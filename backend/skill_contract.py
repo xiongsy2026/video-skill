@@ -233,6 +233,30 @@ def contract_for(skill: str) -> dict:
         return parse_contract(f.read())
 
 
+def skill_for_spend(capability: str, purpose: str) -> str:
+    """由【花钱那一刀】反查这条 spend 属于哪条合同 ⇒ 报价消息能自带"要走哪几步、每步授权什么手段"。
+
+    🔴 为什么要挂在网关上而不是靠 agent 记得跑 `contract_tables.py`（2026-10-10 现网）：
+       三条会话的报价都没带计划表 —— 可跳过的步骤等于不存在的步骤。approve 自己把表打出来，
+       agent 复制那条报价就一定带上，人不至于只看价格就点头。
+    匹配 `contract.spend`（形如 `video.generate/wan3-prime`）：精确命中优先，只写能力名的当兜底；
+    命中 0 条或多条 ⇒ 回空串（调用方据此不提表，绝不编一张别人的表）。
+    """
+    cap = str(capability or "").strip()
+    want = "%s/%s" % (cap, str(purpose or "").strip())
+    exact, loose = [], []
+    for lane in sorted(LANE_DIRS):
+        sp = str((contract_for(lane) or {}).get("spend") or "").strip()
+        if not sp:
+            continue
+        if sp == want:
+            exact.append(lane)
+        elif sp == cap:
+            loose.append(lane)
+    hit = exact or loose
+    return hit[0] if len(hit) == 1 else ""
+
+
 def ctx() -> dict:
     raw = os.environ.get(CTX_ENV) or ""
     try:

@@ -883,8 +883,21 @@ def _gflow_image(prompt, out_path, refs=None, model="", aspect="9:16", project="
     before = set(glob.glob(_os.path.join(out_dir, "*.png")))
     t = time.time()
     env = {"GFLOW_CLI_HEADLESS": "true" if headless else "false"}
+    # 🔴 传输层决定"会不会弹浏览器窗"：ui_automation 必须有头（gflow 自己写明 reCAPTCHA 对无头直接 403），
+    #    sapisidhash 是 cookie+httpx、抓指纹那次硬编码 headless ⇒ 不弹。默认走后者（config.GFLOW_TRANSPORT）。
+    transport = str(_get("GFLOW_TRANSPORT") or "ui_automation").strip()
+    if transport and transport != "ui_automation":
+        env["GFLOW_CLI_TRANSPORT"] = transport
+        env["GFLOW_CLI_EXPERIMENTAL_TRANSPORTS"] = "1"   # 不打开的话 CLI 的 Choice 列表里没这个值
+        env["GFLOW_CLI_HEADLESS"] = "true"                # 这条传输本来就不需要可见窗口
     with _BROWSER_LOCK:
-        code, so, se, why = _run_cli(exe, ["auth", "status"], 30.0, env=env)      # 先验登录态，别白跑一条生成
+        # gflow 自己说这条只读检查"慢网可能要 ~45s" ⇒ 30s 会把【探测超时】误报成【没登录】
+        #（2026-10-10 实测踩到：auth status 手工跑退 0，适配器却拿到 code=None）。
+        code, so, se, why = _run_cli(exe, ["auth", "status"], 75.0, env=env)      # 先验登录态，别白跑一条生成
+        if code is None:
+            return {"success": False,
+                    "error": "gflow 登录探测没回话（%s）⇒ 不算没登录，也不发起生成。"
+                             "先确认到 Google 的网络通不通，再重试同一条。" % (why or "超时")}
         if code != 0:
             return {"success": False, "error": "gflow 没登录（auth status 退 %s）：跑 gflow auth login：%s"
                                                 % (code, _tail(se, so))}
@@ -902,7 +915,11 @@ def _gflow_image(prompt, out_path, refs=None, model="", aspect="9:16", project="
                 "exit_code": code, "headless": headless, "ms": ms}
     found = None
     try:
-        found = _dig(_j.loads(so), ("path", "file", "output_path", "local_path", "dest", "saved"))
+        # 🔴 这里原来写的是 `_j.loads(...)` —— `_j` 只是本文件里【别的功能】的函数内别名，
+        #    在这个函数里从来没绑过 ⇒ NameError 被下面的 `except Exception` 静默吃掉，
+        #    于是 gflow 的 `--json` 路径【从来没被用过】，每次都在走"扫目录取最新 png"的兜底
+        #    （同目录多会话并发时会拿错文件）。模块级别名是 `_json`。
+        found = _dig(_json.loads(so), ("path", "file", "output_path", "local_path", "dest", "saved"))
     except Exception:
         found = None                                      # 版本差异导致 --json 形变了：走目录扫描兜底
     if not (found and _os.path.isfile(str(found))):
@@ -3269,7 +3286,11 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
         return {"ok": True, "capability": capability, "purpose": r["purpose"], "result": result,
                 "credits": {"estimated": est, "charged": charged, "tokens": tokens, "basis": basis,
                             "hold_id": hold["hold_id"],
-                            "balance_after": done.get("balance_after", ledger().balance(account))},
+                            # 🔴 这里原来写的是 `done.get(...)` —— `done` 在本函数里从来没赋值过（10-01 起，
+                            #    commit 9ace7d7），所以【每一次成功的调用】都会在返回那一刻 NameError，
+                            #    被外层 except 吞成 ok:false + 回滚预扣 + 退段 ⇒ 成功看起来和失败一模一样。
+                            #    账本上只留 "preauth 紧跟 rollback"，和真 502 无法区分（今天就被误导过一次）。
+                            "balance_after": ledger().balance(account)},
                 "error": None}
     except Exception as e:
         ledger().rollback(hold["hold_id"])
@@ -3760,6 +3781,21 @@ def _cli(argv):
         p = create_spend_pending(cap, kv["purpose"], kv["account"], int(kv["count"]),
                                 int(kv["credits"]), kv["scope"], kv["session"], kv["ttl"])
         print(p["quote"])
+        # 🔴 报价必须【自带】那张计划表（2026-10-09 定的"花钱那一刀前后各一张表"）。
+        #    以前靠 agent 记得跑 contract_tables.py —— 现网证伪：可跳过的步骤等于不存在的步骤，
+        #    三条会话的报价都没带表。表由 approve 打出来，人复制这条报价就一定会看到。
+        try:
+            from backend import skill_contract as _sc    # repo 根已由 bootstrap 加入 sys.path
+            _lane = _sc.skill_for_spend(cap, kv["purpose"])
+            if _lane:
+                print("\n" + _sc.plan_table(_lane))
+            else:
+                print("\n⚠️ 没有一条 skill 合同的 spend 等于 %s/%s ⇒ 出不了计划表。"
+                      "这一档【没有合同约束】：表缺了就不要点头，先让它把 contract: 段补上。"
+                      % (cap, kv["purpose"]))
+        except Exception as _e:                           # noqa: BLE001
+            print("⚠️ 计划表没带出来（%s: %s）⇒ 视同【没有表】，不要当成已经给人看过了。"
+                  % (type(_e).__name__, str(_e)[:120]))
         # 🔴 核销码【绝不进 stdout】：这条命令多半是 agent 跑的，它读得到 stdout 就能自己
         #    `consumed <id> <码>` 伪造核销 ⇒ 码一旦进管道，整套人证归零。
         #    码只有两条给人的路：① DSH 审批卡（插件经 with_code 取，见 spend_pending）；

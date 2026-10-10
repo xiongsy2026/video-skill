@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -34,12 +36,21 @@ if ROOT not in sys.path:
 os.chdir(ROOT)  # 让 config 的 env_file=".env" 与启动目录无关（作为服务常驻时更稳）
 
 import config  # noqa: E402
-from backend import gateway, hypit_bridge  # noqa: E402
+from backend import gateway, hypit_bridge, skill_form_page  # noqa: E402
 
 ENV_PATH = os.environ.get("MODEL_ADMIN_ENV", os.path.join(ROOT, ".env"))
 HEALTH_URL = os.environ.get("MODEL_ADMIN_HEALTH", "http://127.0.0.1:8090/api/health/models")
 TASK_NAME = "WeeksirModelAdmin"
 SECRET = re.compile(r"_(?:API_?KEY|TOKEN|SECRET)(?:_OLD)?$")
+
+# 🔴 `/api/film/file` 的唯一白名单（内联 + 下载都读这两行）。闸 scripts/check-film-download.py
+#    以这里为权威源，客户端（super-clone-ui 交付卡）那份【必须 ⊆ 这份】—— 两份各抄一遍，
+#    迟早变成"按钮点出 404"。json 只许内联不许下载：它是看板读数据用的，
+#    而 productions/<task>/outputs/sr_*/phase_state.json 里存过明文厂商 key。
+FILM_INLINE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                     "webp": "image/webp", "mp4": "video/mp4", "mov": "video/quicktime",
+                     "webm": "video/webm", "json": "application/json"}
+FILM_DOWNLOADABLE = tuple(k for k in FILM_INLINE_TYPES if k != "json")
 
 
 def _fresh():
@@ -130,6 +141,40 @@ def model_call(body: dict) -> tuple:
     except gateway.RouteError as e:
         return 400, {"error": str(e)}
     return 200, env
+
+
+def media_upload(body: dict) -> tuple:
+    """POST /api/media/upload —— 把 productions/ 里的一个素材传到供应商公网口，拿 fileName + download_url。
+
+    🔴 这条口【读本机文件并送到第三方】，判据要比起"读文件"更严：
+       只放 productions/ 根内（realpath 判定，不信"字符串里没有 .."）、只放媒体扩展名
+       （FILM_DOWNLOADABLE 已经把 json 排除在外 —— phase_state.json 里存过明文厂商 key）、
+       体积上限由网关判、响应里永不出现 key。
+       不计费、不建预扣 ⇒ 不需要批准条子；代价是任何本机进程都能用它占我们 RH 账号的存储，
+       发客户前必须和 /api/hypit/cli 那批一起做只读化 + 鉴权（见 docs/ADR-model-gateway.md）。
+    """
+    f = str(body.get("file") or "")
+    if not f:
+        return 400, {"ok": False, "error": "body 缺 file（本地素材的绝对路径）"}
+    proots = [os.environ.get("DSH_PROD_ROOT")
+              or os.path.join(os.environ.get("DSH_WORKSPACE") or r"C:\dsh", "productions")]
+    p = os.path.realpath(f)
+    if not any(p.startswith(os.path.realpath(r) + os.sep) for r in proots):
+        return 403, {"ok": False, "error": "FORBIDDEN：只允许 productions/ 根内的文件（realpath 判定）"}
+    ext = os.path.splitext(p)[1].lower().lstrip(".")
+    if ext not in FILM_DOWNLOADABLE:
+        return 400, {"ok": False, "error": "只允许这些扩展名: %s" % ", ".join(sorted(FILM_DOWNLOADABLE))}
+    if not os.path.isfile(p):
+        return 404, {"ok": False, "error": "文件不存在"}
+    try:
+        out = gateway.upload_media(p,
+                                   provider=str(body.get("provider") or "runninghub"),
+                                   key_hint=str(body.get("key_hint") or ""),
+                                   account=str(body.get("account") or "local"))
+    except Exception as e:                                    # noqa: BLE001
+        # 网关自己炸了要说清是网关炸，不许伪装成"上游拒绝"
+        return 500, {"ok": False, "error": "media_upload 异常 %s: %s" % (type(e).__name__, str(e)[:200])}
+    return (200 if out.get("ok") else 502), out
 
 
 def spend_guard(body: dict) -> tuple:
@@ -544,12 +589,9 @@ boot();
 #   onClick 能 resolve，且没有应答者时内核 fail-closed）。
 APPROVAL_PAGE = r"""<!doctype html><html lang=zh><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>花钱批准 · WeekSir</title>
+<title>视频生成批准 · WeekSir</title>
 <style>
-:root{--bg:#0a0d12;--panel:#12171f;--line:#222b38;--fg:#e8edf5;--mut:#8b98ab;
---ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb454;--brand:#4d8dff}
-@media (prefers-color-scheme:light){:root{--bg:#f6f8fb;--panel:#fff;--line:#e2e8f0;
---fg:#12171f;--mut:#5b6b82}}
+""" + skill_form_page.WS_TOKENS + r"""
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 .wrap{max-width:760px;margin:0 auto;padding:28px 18px 80px}
@@ -566,10 +608,10 @@ h1{font-size:17px;margin:0 0 4px;font-weight:600}
 .kv .k{color:var(--mut);font-size:12px}
 .kv .v{font-size:15px;font-weight:600}
 .v.money{color:var(--warn)}
-.scope{background:rgba(77,141,255,.08);border:1px solid rgba(77,141,255,.25);border-radius:10px;padding:10px 12px;color:#cfe0ff;font-size:13px}
+.scope{background:color-mix(in srgb, var(--brand) 9%, transparent);border:1px solid color-mix(in srgb, var(--brand) 32%, transparent);border-radius:10px;padding:10px 12px;color:var(--fg);font-size:13px}
 .acts{display:flex;gap:10px;margin-top:16px}
 button{flex:1;padding:11px 14px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font-size:14px;cursor:pointer}
-button.ok{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+button.ok{background:var(--brand);border-color:var(--brand);color:var(--on-brand);font-weight:600}
 button.ok:hover{filter:brightness(1.1)}
 button.no:hover{border-color:var(--bad);color:var(--bad)}
 .done{color:var(--ok);font-size:13px;margin-top:10px}
@@ -581,7 +623,7 @@ button.no:hover{border-color:var(--bad);color:var(--bad)}
 <div class=wrap>
 <header>
   <img src="/assets/weeksir-logo.png" alt="WeekSir">
-  <div><h1>花钱批准</h1><p class=sub>Agent 想调用一次会扣积分的生成任务</p></div>
+  <div><h1>视频生成批准</h1></div>
   <div class=slogan>专注电商AI落地</div>
 </header>
 <div id=list></div>
@@ -633,6 +675,1091 @@ load();setInterval(load,3000);
 """
 
 
+# ── 技能表单字段表（2026-10-08，docs/ADR-one-shot-inchat-form.md）──────────────────────
+# 唯一源 = 工作区 `.dsh/skills/<id>/SKILL.md` 的 frontmatter `form:` 段。
+# 这里只做【解析 + 投递】：DSH 前端读不到 .dsh/skills 目录（只有 sessions.list / skills.remote.list，
+# 都不含 SKILL.md 正文），所以由 8100 把它读出来给渲染器 —— 但字段表本身不在这里第二份维护。
+SKILLS_DIR = os.environ.get("WEEKSIR_SKILLS_DIR") or r"C:\dsh\.dsh\skills"
+_FORM_TYPES = ("text", "textarea", "select", "number", "images", "video", "audio", "locked")
+_FORM_MEDIA = ("images", "video", "audio")   # 走文件、不走文本的三种（一条表里允许各出现多次）
+_FORM_MAX_DEFAULT = {"images": 7, "video": 1, "audio": 1}
+# 纯中文文件名洗完是空的，要用兜底词拼名字。🔴 兜底词必须按槽类型给：视频槽兜成 `01-image.mp4`
+# 会让人以为传错了文件（2026-10-09 真页面上就这么显示过），音频槽同理不能叫 image。
+_FORM_FALLBACK_WORD = {"images": "image", "video": "video", "audio": "audio"}
+
+
+def _range_spec(raw: str):
+    """字段表第 5 列在 number/images/video 上复用来写区间（select 拿它写分号选项）：
+       `10-90` ⇒ (10, 90)｜`7` ⇒ (None, 7)｜空 ⇒ (None, None)。
+       媒体字段没写就退到 _FORM_MAX_DEFAULT —— 张数上限只能是【字段表里那一处】，
+       不在渲染器里再写第二份（两份必然漂，漂了就变成"客户能选第 8 张、服务端拒"）。"""
+    s = (raw or "").strip()
+    m = re.match(r"^(\d+)\s*-\s*(\d+)$", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    if re.match(r"^\d+$", s):
+        return None, int(s)
+    return None, None
+
+
+def parse_skill_form(text: str) -> list:
+    """从一段 SKILL.md 里抠出 `form:` 段，解析成字段数组。行格式：
+       key|type|label|必填|选项|引擎参数   （第 4 列 yes/no，第 6 列是后端真实入参名）
+    刻意不用 yaml：少一个依赖、少一种解析漂移。解析不出来就返回空数组（表单不显示，不影响聊天照跑）。
+    """
+    lines = (text or "").splitlines()
+    try:
+        a = lines.index("---")
+        fm = lines[a + 1:]
+        for i, ln in enumerate(fm):
+            if ln.strip() == "---":
+                fm = fm[:i]
+                break
+    except ValueError:
+        return []
+    try:
+        s = next(i for i, ln in enumerate(fm) if ln.startswith("form:"))
+    except StopIteration:
+        return []
+    out = []
+    for ln in fm[s + 1:]:
+        if ln.strip() and not ln.startswith((" ", "\t")):
+            break                        # 缩进块结束
+        if "|" not in ln:
+            continue
+        cols = [c.strip() for c in ln.strip().split("|")]
+        if len(cols) < 6 or not cols[0] or cols[1] not in _FORM_TYPES:
+            continue
+        ftype = cols[1]
+        lo, hi = (None, None) if ftype == "select" else _range_spec(cols[4])
+        if ftype in _FORM_MEDIA and hi is None:
+            hi = _FORM_MAX_DEFAULT[ftype]
+        rec = {"key": cols[0], "type": ftype, "label": cols[2],
+               "required": cols[3] == "yes",
+               "options": [o.strip() for o in cols[4].split(";") if o.strip()]
+                          if ftype == "select" else [],
+               "param": cols[5], "min": lo, "max": hi}
+        if ftype == "locked":
+            # 🔒 只读行没有引擎入参可写（它是"给客户看清楚不让他改的东西"），
+            # 所以第 5 列在这里当【显示值】用；param 留空并由 submit/必填校验一并跳过。
+            rec["value"] = cols[4]
+            rec["param"] = ""
+        # 第 7 列（可选）= 这个槽自己的体积上限。为什么必须有：引擎各自的上限不一样 ——
+        # 反推的 handler 硬拦"视频 >15MB（MiMo 限制）"，而通用上限是 200MB；
+        # 没有这一列，表单就会让客户选一个【必被引擎拒】的文件（按钮黄了、提交红了）。
+        # 🔴 第 7 列起是【可选尾巴】，每格要么是体积（`15MB`），要么是 `k=v`，顺序无关、不写就没有。
+        #    （不各占一个固定位置：位置列加到十几列后没人记得住第几列是什么，老线一改就全漂。）
+        #      15MB                这个槽自己的体积上限 —— 引擎各自不同（反推的 handler 硬拦 15MB，
+        #                          通用上限是 200MB），不写就会让客户选一个【必被引擎拒】的文件
+        #      group=素材          分组标题（同组按出现顺序排；一条都不写=退回按类型自动分组，老线不变）
+        #      hint=…              格下面的说明；媒体槽则当槽内占位文案
+        #      show=voice_mode=timbre_swap,rewrite_voice   条件显隐（只有列出的值才显示）
+        #      mark=选填 · 换人时必给   角标文案（不写=按必填回退成「必填」）
+        #      note=…              locked 行 🔒 后面那半句灰字
+        for extra in cols[6:]:
+            extra = extra.strip()
+            if not extra:
+                continue
+            mb = re.match(r"^(\d+(?:\.\d+)?)\s*([KMG]?B)?$", extra, re.I)
+            if mb:
+                mult = {"B": 1, "KB": 1024, "MB": 1048576, "GB": 1073741824}[
+                    (mb.group(2) or "B").upper()]
+                rec["max_bytes"] = int(float(mb.group(1)) * mult)
+                continue
+            if "=" not in extra:
+                continue
+            k, v = extra.split("=", 1)
+            k, v = k.strip().lower(), v.strip()
+            if k == "group" and v:
+                rec["group"] = v
+            elif k == "hint" and v:
+                rec["hint"] = v
+            elif k == "mark" and v:
+                rec["marker"] = v
+            elif k == "note" and v:
+                rec["note"] = v
+            elif k == "show" and "=" in v:
+                fk, fv = v.split("=", 1)
+                want = [x.strip() for x in fv.split(",") if x.strip()]
+                if fk.strip() and want:
+                    rec["show_if"] = {"key": fk.strip(), "values": want}
+        out.append(rec)
+    return out
+
+
+def _field_hidden(fd: dict, values: dict) -> bool:
+    """这一档现在该不该藏这个字段。判据只认字段表里那一条 `show=键=值1,值2`。
+
+    select 提交的是"value label"整串 ⇒ 取第一个 token 当值比（和 form_submit 收值同一套口径，
+    两边算法不一致就会出现"前端藏起来了、后端还说必填没填"那种最难查的坏法）。"""
+    cond = fd.get("show_if")
+    if not cond:
+        return False
+    cur = str((values or {}).get(cond["key"]) or "").strip().split(" ")[0]
+    return cur not in cond["values"]
+
+
+def skill_forms_view() -> dict:
+    """扫工作区所有 skill，返回带表单字段的那几张。只读、无副作用。"""
+    forms = {}
+    try:
+        for name in sorted(os.listdir(SKILLS_DIR)):
+            p = os.path.join(SKILLS_DIR, name, "SKILL.md")
+            if not os.path.isfile(p):
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    fields = parse_skill_form(f.read())
+            except OSError:
+                continue
+            if fields:
+                forms[name] = fields
+    except OSError as e:
+        return {"ok": False, "error": "读不到技能目录 %s：%s" % (SKILLS_DIR, str(e)[:120]), "forms": {}}
+    return {"ok": True, "dir": SKILLS_DIR, "forms": forms}
+
+
+# ── 对话内表单：门控 + 载荷（2026-10-08 用户定的挂点判据）────────────────────────
+# 🔴 挂点 = 【明确意图之后】。这个产品的一条总纪律是"新会话一条 UI 都不许出现，只有用户显式点了
+#    skill 才挂东西"（工作区 AGENTS.md『右栏 UI 铁律』）。表单同理：信号源就是意图登记簿
+#    （hypit_bridge.intent_map()，两个源合并 + TTL 已经在那一份里），不在这里第二份实现。
+# 意图档 ≠ 技能目录名：`one-shot-video` 登记的是 product-video 档（只起排他作用），所以映射写在
+#    各 SKILL.md 的 frontmatter `intent:` 键上 —— 加了新 skill 不用改这里的代码。
+# 🔴 提交【不经过输入框】：用户明确否过"把表单挂在对话框上"（会压住 composer），也否过
+#    "脚本往共享输入框里写字"。所以提交只落一份会话级载荷，agent 下一轮读它、按 param 名原样入参。
+WORKSPACE_DIR = os.environ.get("DSH_WORKSPACE") or r"C:\dsh"
+FORM_PAYLOAD_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "form_payload.json")
+FORM_PREFILL_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "form_prefill.json")
+FORM_UPLOAD_DIR = os.path.join(WORKSPACE_DIR, ".dsh", "form-uploads")
+FORM_MAX_FILES = 7                    # 与 SKILL.md 里"商品图 1~7 张"同口径
+FORM_MAX_FILE_BYTES = 8 * 1024 * 1024
+FORM_MAX_VIDEO_BYTES = 200 * 1024 * 1024   # 爆款/参考视频：引擎收的是本地路径，不上公网，给到 200MB
+FORM_IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+FORM_VIDEO_EXT = {"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm"}
+FORM_AUDIO_EXT = {"audio/mpeg": "mp3", "audio/wav": "wav", "audio/x-wav": "wav",
+                  "audio/mp4": "m4a", "audio/aac": "aac", "audio/ogg": "ogg", "audio/flac": "flac"}
+FORM_MAX_AUDIO_BYTES = 20 * 1024 * 1024     # 音色参考只有 1–15 秒，20MB 远够用；给的是防误传整轨的兜底
+
+
+def _form_ext_map(ftype: str) -> dict:
+    """槽类型 → 允许的 MIME 表。🔴 唯一一处：原来这五个地方各写一遍 `video ? VIDEO : IMAGE` 三元，
+    加第三种媒体类型就得改五处，漏一处就是"页面让你选、服务端偷偷按图片收"。"""
+    return FORM_VIDEO_EXT if ftype == "video" else (FORM_AUDIO_EXT if ftype == "audio" else FORM_IMAGE_EXT)
+
+
+def _form_max_bytes(ftype: str) -> int:
+    return FORM_MAX_VIDEO_BYTES if ftype == "video" else (
+        FORM_MAX_AUDIO_BYTES if ftype == "audio" else FORM_MAX_FILE_BYTES)
+
+
+def parse_skill_intent(text: str) -> str:
+    """frontmatter 里的 `intent: <档>`；没有就返回空串（= 这个 skill 的表单永远不会被挂出来）。"""
+    lines = (text or "").splitlines()
+    try:
+        a = lines.index("---")
+    except ValueError:
+        return ""
+    for ln in lines[a + 1:]:
+        if ln.strip() == "---":
+            break
+        if ln.startswith("intent:"):
+            return ln.split(":", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def skill_form_index() -> dict:
+    """{意图档: {"skill": 目录名, "fields": [...]}}。唯一源还是各 SKILL.md，这里只是把两张表对起来。"""
+    out = {}
+    view = skill_forms_view()
+    forms = view.get("forms") or {}
+    for name, fields in forms.items():
+        try:
+            with open(os.path.join(SKILLS_DIR, name, "SKILL.md"), encoding="utf-8",
+                      errors="replace") as f:
+                intent = parse_skill_intent(f.read())
+        except OSError:
+            intent = ""
+        if intent:
+            out[intent] = {"skill": name, "fields": fields}
+    return out
+
+
+def _form_payloads() -> dict:
+    try:
+        with open(FORM_PAYLOAD_PATH, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _form_payload_live(data: dict, sid: str) -> dict:
+    """按意图同一个 TTL 判活（登记过期 ⇒ 填过的参数也不再算数，别拿几天前的表去入参）。"""
+    rec = data.get(sid)
+    if not isinstance(rec, dict):
+        return {}
+    if time.time() - float(rec.get("ts") or 0) > hypit_bridge.INTENT_TTL_SEC:
+        return {}
+    return rec
+
+
+def _form_prefills() -> dict:
+    try:
+        with open(FORM_PREFILL_PATH, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _form_prefill_live(data: dict, sid: str, skill: str) -> dict:
+    """回填按【同一条意图 TTL】判活，并且【技能换了就作废】—— 换 skill 再登记时，
+    上一条线回填的参数对新线基本是错的（同 AGENTS.md『换产品线 = 再登记一次覆盖』）。"""
+    rec = data.get(sid)
+    if not isinstance(rec, dict) or rec.get("skill") != skill:
+        return {}
+    if time.time() - float(rec.get("ts") or 0) > hypit_bridge.INTENT_TTL_SEC:
+        return {}
+    return rec
+
+
+def _form_media_exts(ftype: str) -> tuple:
+    """这个槽类型允许的扩展名（带点、小写）。派生自唯一源 `_form_ext_map`，不在别处再抄名单。"""
+    return tuple("." + str(v).lstrip(".").lower() for v in _form_ext_map(ftype).values())
+
+
+def _form_slot_filled(f: dict, defaults: dict, media: dict) -> bool:
+    """这一格现在算不算【有值】。
+
+    🔴 两份 key 空间不一样，用错就变成"明明回填了却报没填"：
+       文字格的值在 `defaults` 里、键是 field 的 **key**；
+       素材格的路径在 `media` 里、键是 `_form_prefill_paths` 写的**引擎参数名 param**
+       （两个键都认一下，因为 param 缺省就等于 key，而别的写入方可能按 key 落）。
+    隐藏格（写了 `show=` 且当前值不命中）不参与：提交时本来就不收它，拿它卡必填会把人永久锁在入口外。
+    """
+    if _field_hidden(f, defaults):
+        return True
+    k = str(f.get("key") or "")
+    if f.get("type") in _FORM_MEDIA:
+        m = media or {}
+        return bool(m.get(str(f.get("param") or k)) or m.get(k))
+    return bool(str((defaults or {}).get(k) or "").strip())
+
+
+def form_unfilled_required(fields, defaults, media) -> list:
+    """必填格里【到现在还没值】的那些（回填值或回填素材都算有值）。
+    判据抽成纯函数 ⇒ 闸直接跑值表，不靠人在场。locked 行天生无入参，不参与。"""
+    out = []
+    for f in fields or []:
+        if f.get("type") == "locked" or not f.get("required"):
+            continue
+        if not str(f.get("key") or ""):
+            continue
+        if not _form_slot_filled(f, defaults, media):
+            out.append(str(f["key"]))
+    return out
+
+
+def _form_referenced_paths(media) -> set:
+    got = set()
+    for v in (media or {}).values():
+        for one in (v if isinstance(v, (list, tuple)) else [v]):
+            got.add(os.path.realpath(str(one)))
+    return got
+
+
+def form_loose_materials(roots, media) -> list:
+    """素材根里【已经躺着文件、但这次回填没引用】的那些（诊断用）。
+
+    roots 传这条任务的 `inputs/` **和** `src/`：只扫 inputs/ 抓不到现网那次事故（2026-10-10 ef1ba285
+    —— 原片下载后留在 `src/`，`inputs/` 空着，于是表单上"原片"那一格永远空，客户看到的还是
+    一张要他自己补素材的表）。
+    🔴 不扫 `outputs/` 与 `frames/`：那是派生物。把抽帧图当"客户给的素材"会天天误拦入口。
+    """
+    got = _form_referenced_paths(media)
+    exts = tuple(sorted({e for t in _FORM_MEDIA for e in _form_media_exts(t)}))
+    out, seen = [], set()
+    for root in (roots or []):
+        root = str(root or "").strip()
+        if not root or not os.path.isdir(root):
+            continue
+        for dp, _dn, fn in os.walk(root):
+            for f in sorted(fn):
+                p = os.path.realpath(os.path.join(dp, f))
+                if f.lower().endswith(exts) and p not in got and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+    return out
+
+
+def form_slot_material_candidates(fields, defaults, media, roots) -> dict:
+    """{必填还没值的素材格: [盘上【类型对得上】却没被这一格引用的文件]}。
+
+    按类型配是这条判据不变成"天天误拦"的关键：`product_images` 空着、而 src/ 里只有一条视频 ⇒
+    不命中（视频填不进图片槽），不拒。命中了才说明"你手上正好有这一格要的料，却没挂上去"。
+    """
+    cand = {}
+    loose = form_loose_materials(roots, media)
+    if not loose:
+        return cand
+    items = [(os.path.splitext(p)[1].lower(), p) for p in loose]
+    for f in fields or []:
+        if f.get("type") not in _FORM_MEDIA or not f.get("required"):
+            continue
+        if not str(f.get("key") or "") or _form_slot_filled(f, defaults, media):
+            continue
+        exts = set(_form_media_exts(f["type"]))
+        hit = [p for (e, p) in items if e in exts]
+        if hit:
+            cand[str(f["key"])] = hit
+    return cand
+
+
+def form_prefill_gap(fields, defaults, media, roots) -> list:
+    """🔴 判据（不是诊断）：这些必填素材格【盘上就有对得上类型的料】却没回填 ⇒ 入口该拒。
+
+    为什么合成留在服务端：runner 和 `intent.py` 都要用同一个结论，谁也不许自己再解析字段表
+    （两处各写一遍"哪些格算素材格"就是第二份判据，漂了的形状是"脚本说行、入口说不行"）。
+    空表 = 放行 —— 客户手上确实没有的素材留空是对的，不该拦。
+    """
+    return sorted(form_slot_material_candidates(fields, defaults, media, roots))
+
+
+def form_gate_view(sid: str) -> dict:
+    """GET /api/skills/form?session= —— 一次回齐"该不该挂、挂哪个、字段表、是否已提交"。"""
+    sid = str(sid or "").strip()
+    if not sid:
+        return {"ok": False, "error": "缺 session", "show": False}
+    rec = (hypit_bridge.intent_map() or {}).get(sid)
+    intent = str((rec or {}).get("skill") or "").strip()
+    if not intent:
+        return {"ok": True, "show": False, "reason": "no-intent", "session": sid}
+    hit = skill_form_index().get(intent)
+    if not hit:
+        return {"ok": True, "show": False, "reason": "intent-has-no-form",
+                "session": sid, "intent": intent}
+    payload = _form_payload_live(_form_payloads(), sid)
+    same = bool(payload) and payload.get("skill") == hit["skill"]
+    pre = {} if same else _form_prefill_live(_form_prefills(), sid, hit["skill"])
+    out = {"ok": True, "show": True, "session": sid, "intent": intent,
+           "skill": hit["skill"], "fields": _form_fields_wire(hit["fields"]),
+           "params": (payload.get("params") or {}) if same else {},
+           "submitted": same,
+           "task": str((rec or {}).get("task") or ""),
+           # 🔴 素材根只由服务端下发：intent.py 以前自己拼 `.dsh/form-uploads/agent/<param>`，
+           #    那是第二份路径规则（而且是跨会话共享的那一份 ⇒ 同名互相覆盖）。
+           "task_dir": _form_task_dir(sid),
+           "upload_root": _form_sid_dir(sid)}
+    if pre:
+        # 🔴 回填只进 defaults，绝不进 submitted ⇒ 客户仍需自己点【提交这张表】。
+        out["defaults"] = pre.get("defaults") or {}
+        out["default_files"] = pre.get("media") or {}
+        out["prefill_dropped"] = pre.get("dropped") or []
+        # 回填依据：页面上挂在「AI 已填 · 可改」的悬停里。客户要能分清哪些是自己填的、
+        # 哪些是 agent 猜的 —— 分不清的话，填错的归因会全落到我们头上（2026-10-09 产品的要求）。
+        out["prefill_notes"] = pre.get("notes") or {}
+    # 🔴 回填覆盖率（2026-10-10 现网：agent 只回填了声音档一格，原片明明已经下载却让客户自己再选）：
+    #    unfilled_required = 到现在还没值的必填格；loose_materials = 素材根里躺着、却没被引用的文件；
+    #    prefill_gap = 两者的【合成判据】（必填素材格缺值 + 根里有闲料）。
+    #    runner 与 intent.py 都只读结论，不许自己再解析字段表 ⇒ 判据只在这一份。
+    _def = out.get("defaults") or {}
+    _med = out.get("default_files") or {}
+    # 素材根 = inputs/（回填唯一认的根）+ src/（agent 自己下载/派生的地方）。
+    # 加上 src/ 是为了抓"原片已下载却留在 src、表上原片永远空"那一次事故；
+    # outputs/、frames/ 故意不扫 —— 派生物当客户素材判会天天误拦。
+    _roots = [out["upload_root"]] if out.get("upload_root") else []
+    if out.get("task_dir"):
+        _roots.append(os.path.join(out["task_dir"], "src"))
+    out["unfilled_required"] = form_unfilled_required(hit["fields"], _def, _med)
+    out["loose_materials"] = form_loose_materials(_roots, _med)
+    out["prefill_gap"] = form_prefill_gap(hit["fields"], _def, _med, _roots)
+    return out
+
+
+def _form_safe_name(name: str, i: int, ext: str, fallback: str = "image", sha8: str = "") -> str:
+    """落盘文件名：`序号-sha8前8-ascii名.扩展名`。
+
+    🔴 为什么把 sha8 塞进文件名（2026-10-10 用户认的口径）：这台机器多会话并发，"同名不同内容"
+    已经咬过两次（deliver_pack 早就是比内容哈希、不认文件名）。sha8 进名字 = 撞名当场看得见，
+    而不是等到交付贴图才发现拿错图。
+
+    只留 ASCII，防止把 `..`/分隔符/奇奇怪怪的字符带进我们写死的目录。
+
+    扩展名要【整段剥掉】再拼回我们认的那一种。以前用的是"删掉最后一个点"，
+    于是 "a.mp4" 变成 "amp4" 再拼 ".mp4" ⇒ `01-amp4.mp4`，"p.png" 变 `01-ppng.png`；
+    文件名和人对不上，重试与清理都认不出是同一张（图片/视频都中招）。
+
+    纯中文名（"爆款样本.mp4"）洗完是空的 ⇒ 用 fallback 兜底。兜底词要按【槽的类型】给：
+    视频槽兜成 `01-image.mp4` 会让人以为传错了文件（2026-10-09 真页面上就这么显示的）。
+    """
+    keep = re.sub(r"[^A-Za-z0-9._-]", "", str(name or ""))
+    keep = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", keep)
+    keep = (keep[:40] or fallback).strip("._-") or fallback
+    tag = ("%s-" % sha8[:8]) if re.fullmatch(r"[0-9a-f]{6,8}", str(sha8 or "")) else ""
+    return "%02d-%s%s.%s" % (i + 1, tag, keep, ext)
+
+
+def _form_task_dir(sid: str) -> str:
+    """这条会话的任务目录（唯一源 = 意图记录里的 `task_dir`，由 scripts/intent.py 登记时建）。
+
+    🔴 为什么素材要落在 productions/<task>/inputs 而不是 .dsh/form-uploads：
+      ① 一个任务一个根 ⇒ 两条会话回填同名文件不再互相覆盖（原来 agent/<param> 是全局共享的）；
+      ② 素材与 BRIEF/TIMELINE/outputs 同根，人一眼看得清这条片子用过哪些图；
+      ③ 守卫的界从"全局一根"收成"每任务一根"⇒ 跨任务读文件反而更不可能。
+    拿不到 task_dir（老会话、没登记任务名的线）⇒ 返回空串，调用方退回 .dsh/form-uploads/<hash>。
+    """
+    try:
+        rec = (hypit_bridge.intent_map() or {}).get(str(sid)) or {}
+    except Exception:
+        return ""
+    d = str(rec.get("task_dir") or "").strip()
+    if not d:
+        return ""
+    root = os.path.realpath(WORKSPACE_DIR)
+    p = os.path.realpath(d)
+    return p if p.startswith(root + os.sep) and os.path.isdir(p) else ""
+
+
+def _form_sid_dir(sid: str) -> str:
+    """这条会话【唯一】的素材根。有任务目录就用 `<task>/inputs`，否则退回会话哈希目录。
+    所有写入与所有 realpath 守卫都必须走这里 —— 判点写第二处就会漂成"存进去的读不出来"。"""
+    t = _form_task_dir(sid)
+    if t:
+        return os.path.join(t, "inputs")
+    # 会话 id 本身是 uuid 形状，但它是【外部输入】⇒ 不进目录名，只进哈希。
+    h = hashlib.sha256(str(sid).encode("utf-8")).hexdigest()[:12]
+    return os.path.join(FORM_UPLOAD_DIR, h)
+
+
+def _form_fields_wire(fields):
+    """给门控答复用的字段表：把【服务端真正的允许集】原样下发（accept / max_bytes）。
+
+    🔴 为什么必须下发而不是让前端自己写：前端要判"这一格算不算填完"来决定提交按钮是灰是黄，
+    而 MIME 与体积上限的权威判据在 `_form_store_files` 里。前端自己抄一份 ⇒ 一定会漂，
+    漂了就变成"按钮是黄的、提交却被服务端拒"（客户看到的是我们的 bug，不是他的错）。
+    """
+    out = []
+    for f in fields:
+        d = dict(f)
+        if f["type"] in _FORM_MEDIA:
+            d["accept"] = sorted(_form_ext_map(f["type"]).keys())
+            d["max_bytes"] = f.get("max_bytes") or _form_max_bytes(f["type"])
+            d["max"] = f.get("max") or _FORM_MAX_DEFAULT[f["type"]]
+        out.append(d)
+    return out
+
+
+def form_media_file(sid, param, name):
+    """表单上传目录的【只读】回显口（缩略图/预览用）。
+
+    🔴 参数为什么是 param 而不是字段 key：门控回给前端的 `default_files` 是按【引擎 param】键的
+       （那就是最终入参形状），而落盘子目录是按【字段 key】。两头对不上过一次的后果是
+       "HTTP 200 但图出不来" —— 最难查的那种坏法。这里做一次映射，两边各留各的语义。
+    三道闸：只听环回（路由层）+ realpath 必须落在【这条会话的素材根】内 + 扩展名必须命中该槽允许集。
+    """
+    root = os.path.realpath(_form_sid_dir(sid))
+    intent = str(((hypit_bridge.intent_map() or {}).get(sid) or {}).get("skill") or "").strip()
+    fields = ((skill_form_index().get(intent) or {}).get("fields") or [])
+    fd = next((f for f in fields if f.get("param") == param), None)
+    if fd is None:
+        return None, None, "这个 param 不在字段表里"
+    exts = _form_ext_map(fd["type"])
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", str(name or ""))
+    slot = re.sub(r"[^A-Za-z0-9._-]", "", str(fd["key"]))[:24] or "slot"
+    p = os.path.realpath(os.path.join(_form_sid_dir(sid), slot, safe))
+    if not p.startswith(root + os.sep) or not os.path.isfile(p):
+        # 【遗留兜底】2026-10-10 之前 agent 回填复制进的是全局共享的 `.dsh/form-uploads/agent/<param>/`
+        # （跨会话同名会互相覆盖，已废）。新规矩：intent.py 复制进 `<本会话素材根>/<字段名>/`，
+        # 与客户端上传同一套布局 ⇒ 上面那条主路径直接命中，不需要这一支。留着只为让改规矩之前
+        # 回填过的会话还能看图，不迁移历史文件。
+        alt = os.path.realpath(os.path.join(FORM_UPLOAD_DIR, "agent", str(param), safe))
+        if (alt.startswith(os.path.realpath(FORM_UPLOAD_DIR) + os.sep) and os.path.isfile(alt)):
+            p = alt
+        else:
+            return None, None, "文件不在这条会话的素材目录里（或不在这个槽的目录里）"
+    ext = os.path.splitext(p)[1].lstrip(".").lower()
+    if ext not in set(exts.values()):
+        return None, None, "这个槽不收 .%s" % ext
+    if os.path.getsize(p) > (fd.get("max_bytes") or _form_max_bytes(fd["type"])):
+        return None, None, "文件超过这个槽的体积上限"
+    try:
+        with open(p, "rb") as fh:
+            by_ext = {v: k for k, v in exts.items()}     # 反查：扩展名 → mime（写成 mime→扩展名那份是入盘用的）
+            return fh.read(), by_ext[ext], ""
+    except OSError as e:
+        return None, None, str(e)[:80]
+
+
+def _form_store_files(sid, fields, files):
+    """把表单的【文件槽】落盘 ⇒ (｛引擎param: 路径或路径数组｝, 错误串)。
+
+    🔴 一张表可以有多个文件槽（super-clone 要"产品图 1-10 + 面部图 + 场景图"三种），所以文件项
+       必须带 `field`；只有【单个】槽时允许省略（现渲染器就是省略的）。多槽而没标 field ⇒ 拒，
+       不猜放哪一格 —— 猜 = 把客户的脸图当产品图塞进引擎。
+    单值还是数组也按字段表判：`video` 且上限 1 ⇒ 字符串（引擎收 `video_path`），其余 ⇒ 数组
+       （`product_image_paths` / `video_paths`）。每个槽自己一个子目录，免得两个槽同名互相覆盖。
+    """
+    media = [f for f in fields if f["type"] in _FORM_MEDIA]
+    files = files if isinstance(files, list) else []
+    if not files:
+        return {}, ""
+    if not media:
+        return {}, "这个技能的表单没有文件字段"
+    buckets = {}
+    for it in files:
+        it = it if isinstance(it, dict) else {}
+        fk = str(it.get("field") or "").strip()
+        if not fk and len(media) == 1:
+            fk = media[0]["key"]
+        fd = next((f for f in media if f["key"] == fk), None)
+        if fd is None:
+            return {}, ("这张表有多个文件槽，每个文件要写明 field（不猜放哪一格）"
+                        if not fk else "文件槽不在字段表里：%s" % fk[:40])
+        buckets.setdefault(fd["key"], []).append(it)
+    out = {}
+    for fk, items in buckets.items():
+        fd = next(f for f in media if f["key"] == fk)
+        cap = fd.get("max") or _FORM_MAX_DEFAULT[fd["type"]]
+        if len(items) > cap:
+            return {}, "%s 最多 %d 个" % (fd["label"], cap)
+        is_video = fd["type"] == "video"
+        ext_map = _form_ext_map(fd["type"])
+        cap_bytes = fd.get("max_bytes") or _form_max_bytes(fd["type"])
+        slot = os.path.join(_form_sid_dir(sid), re.sub(r"[^A-Za-z0-9._-]", "", fk)[:24] or "slot")
+        try:
+            os.makedirs(slot, exist_ok=True)
+        except OSError as e:
+            return {}, "建上传目录失败：%s" % str(e)[:80]
+        paths = []
+        root_real = os.path.realpath(_form_sid_dir(sid))
+        for i, item in enumerate(items):
+            fn_in = str(item.get("name") or "")
+            # 🔴 两种形状都要收：客户在表单里新选的走 base64；agent 回填过的文件已经在上传目录里，
+            #    页面只把 path 原样带回来（让它重编码一次等于把同一张图存两份，还会把"AI 已填"变成"未知来源"）。
+            #    path 是外部输入 ⇒ 与 _form_prefill_paths 同一道闸：realpath 必须落在 FORM_UPLOAD_DIR 内。
+            if item.get("path") and not item.get("data"):
+                p = os.path.realpath(str(item.get("path") or ""))
+                allow = set(ext_map.values())
+                if not p.startswith(root_real + os.sep) or not os.path.isfile(p):
+                    return {}, "%s 第 %d 个文件不在表单上传目录里（不接任意路径）" % (fd["label"], i + 1)
+                if os.path.splitext(p)[1].lstrip(".").lower() not in allow:
+                    return {}, "%s 第 %d 个的扩展名不被这个槽接受" % (fd["label"], i + 1)
+                if os.path.getsize(p) > cap_bytes:
+                    return {}, "%s 第 %d 个超过 %dMB" % (fd["label"], i + 1, cap_bytes // 1048576)
+                paths.append(p)
+                continue
+            mime = str(item.get("type") or "").split(";")[0].strip().lower()
+            ext = ext_map.get(mime)
+            if not ext:
+                return {}, "%s：只收 %s，收到 %s" % (
+                    fd["label"], "/".join(sorted(set(ext_map.values()))), mime[:30])
+            try:
+                blob = base64.b64decode(str((item or {}).get("data") or ""), validate=True)
+            except Exception:
+                return {}, "%s 第 %d 个不是合法 base64" % (fd["label"], i + 1)
+            if not blob or len(blob) > cap_bytes:
+                # 上限文案按量级给单位：写死 MB 会让 1KB 的槽显示"超过 0MB"（客户看不出下限在哪）
+                cap_txt = ("%.1fMB" % (cap_bytes / 1048576.0)) if cap_bytes >= 1048576 \
+                    else "%dKB" % max(1, cap_bytes // 1024)
+                return {}, "%s 第 %d 个为空或超过 %s" % (fd["label"], i + 1, cap_txt)
+            fn = os.path.join(slot, _form_safe_name(str(item.get("name") or ""), i, ext,
+                                                    _FORM_FALLBACK_WORD.get(fd["type"], "image"),
+                                                    hashlib.sha256(blob).hexdigest()[:8]))
+            try:
+                with open(fn, "wb") as f:
+                    f.write(blob)
+            except OSError as e:
+                return {}, "存文件失败：%s" % str(e)[:80]
+            paths.append(fn)
+        out[fd["param"]] = (paths[0] if (is_video and cap == 1) else paths)
+    return out, ""
+
+
+def form_submit(body: dict) -> dict:
+    """POST /api/skills/form —— 校验后写会话级载荷。返回的 params 就是引擎入参形状。"""
+    body = body if isinstance(body, dict) else {}
+    sid = str(body.get("session") or "").strip()
+    skill = str(body.get("skill") or "").strip()
+    if not sid or not skill:
+        return {"ok": False, "error": "缺 session 或 skill"}
+    rec = (hypit_bridge.intent_map() or {}).get(sid)
+    intent = str((rec or {}).get("skill") or "").strip()
+    hit = skill_form_index().get(intent)
+    if not hit or hit["skill"] != skill:
+        # 🔴 没登记意图（或登记的 skill 不是这个）⇒ 拒。这条就是"先明确意图，才有 UI"的落地。
+        return {"ok": False, "error": "no-intent-for-this-skill", "intent": intent}
+    fields = hit["fields"]
+    values = body.get("values") if isinstance(body.get("values"), dict) else {}
+    params, missing = {}, []
+    for fd in fields:
+        if fd["type"] in _FORM_MEDIA or fd["type"] == "locked":
+            continue
+        if _field_hidden(fd, values):
+            # 条件显隐：这一档不该有这个字段 ⇒ 既不要求、也不写进引擎入参。
+            # 规则只有一份（字段表里那个 show=），前端按同一条判，这里不另发明一套。
+            continue
+        v = str(values.get(fd["key"]) or "").strip()
+        if not v:
+            if fd["required"]:
+                missing.append(fd["label"])
+            continue
+        if fd["type"] == "select" and fd["options"] and v.split(" ")[0] not in [
+                o.split(" ")[0] for o in fd["options"]]:
+            return {"ok": False, "error": "选项不在字段表里：%s=%s" % (fd["key"], v[:40])}
+        if fd["type"] == "number":
+            try:
+                n = int(float(v))
+            except ValueError:
+                return {"ok": False, "error": "要填数字：%s=%s" % (fd["key"], v[:40])}
+            if fd["min"] is not None and n < fd["min"] or fd["max"] is not None and n > fd["max"]:
+                return {"ok": False, "error": "超出字段表给的区间：%s=%d（允许 %s~%s）" % (
+                    fd["key"], n, fd["min"], fd["max"])}
+            params[fd["param"]] = n
+            continue
+        params[fd["param"]] = v.split(" ")[0] if fd["type"] == "select" else v
+    if missing:
+        return {"ok": False, "error": "必填没填：" + "、".join(missing)}
+
+    stored, ferr = _form_store_files(sid, fields, body.get("files"))
+    if ferr:
+        return {"ok": False, "error": ferr}
+    params.update(stored)
+    # 🔴 必填的【文件槽】同样要卡：过去只卡文本必填 ⇒ "爆款视频必填"写在字段表里却没人拦，
+    #    客户空提交照样 ok:true，到引擎那侧才 FileNotFoundError —— 报在错的层，客户看不出是没传视频。
+    for fd in fields:
+        # 🔴 隐藏格必须一起跳过：这条判据前端(isShown)与服务端(_field_hidden)是同一条，前半段文本用了、
+        #    后半段媒体漏了 ⇒ super-clone 在"原声保留"下 参考音频 是隐藏格，客户提交却被"必填没交：参考音频"
+        #    拒掉（2026-10-10 现网：同一条会话连点 8 次全被这条拒，agent 那边永远 not-submitted、
+        #    结论还误判成"8100 没配 super-clone 这一档"）。
+        if _field_hidden(fd, values):
+            continue
+        if fd["type"] in _FORM_MEDIA and fd["required"] and fd["param"] not in params:
+            missing.append(fd["label"])
+    if missing:
+        return {"ok": False, "error": "必填没交：" + "、".join(missing)}
+    saved = sum(len(v) if isinstance(v, list) else 1 for v in stored.values())
+    # 🔴 提交即挂号【待醒】：客户点【提交这张表】就等于授权开工（2026-10-09 定的口径），
+    #    但 agent 只在轮到自己说话时才动 ⇒ 没有这一格，链路就断在"表交了没人看见"（T13 实测抓到的洞）。
+    #    叫醒动作在宿主插件里（只有那一侧拿得到 Agent.followup），这里只负责【记着该叫谁】。
+    ts = time.time()
+    return _form_write(FORM_PAYLOAD_PATH, sid, {
+        "skill": skill, "intent": intent, "params": params, "ts": ts,
+        "task": str(rec.get("task") or ""), "files": saved,
+        "wake": {"pending": True, "at": ts}}, "载荷")
+
+
+def form_wake_queue(data: dict) -> list:
+    """纯函数：从载荷里算出【该叫醒哪几条会话】。判据只在这里一份，插件不自己判。
+
+    四条规则（每条都有对应断言）：
+      1. 只有【真提交过】的记录算数 —— agent 回填写的是 defaults，不进这份表（prefill ≠ submitted）；
+      2. 过期（同 intent TTL）不算 —— 几天前填的表不该今天把人叫醒；
+      3. `wake.pending` 为假 ⇒ 不叫（叫过一次就别每 5 秒重叫 = 无限烧 token）；
+      4. 重新提交带新的 `at` ⇒ 又算一次待醒（客户改了参数重交，agent 必须再动一次）。
+    """
+    out = []
+    now = time.time()
+    for sid, rec in (data or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        w = rec.get("wake")
+        if not isinstance(w, dict) or not w.get("pending"):
+            continue
+        ts = float(rec.get("ts") or 0)
+        if not ts or now - ts > hypit_bridge.INTENT_TTL_SEC:
+            continue
+        out.append({"kind": "form", "session": str(sid), "skill": str(rec.get("skill") or ""),
+                    "task": str(rec.get("task") or ""), "at": float(w.get("at") or ts)})
+    return sorted(out, key=lambda x: x["at"])
+
+
+def _is_loopback(host) -> bool:
+    """环回判据【只这一份】：/api/spend/guard、/api/media/upload、表单写口、唤醒两个口都读它。
+    原来这五个地方各抄一遍元组 —— 抄第 N 遍的代价是"哪天要认 ::ffff:127.0.0.1 得改五处，
+    漏一处就是往安全口上漏"。"""
+    s = str(host or "").strip()
+    return s in ("127.0.0.1", "::1", "localhost") or s.startswith("::ffff:127.0.0.1")
+
+
+def wake_view() -> dict:
+    """GET /api/skills/form/wake：宿主插件每 5 秒问一次。只读、不改状态。
+
+    两份来源合并成【一条队列】（表单提交 + 批准核销），按 at 排序 —— 判据不许分两处问：
+    插件问两次就有"两次之间状态变了"的缝，也迟早有人只接一半。
+    ⚠️ URL 里那个 "form" 是历史名：改路径要和宿主插件【同时】重启，中间窗口里整条唤醒链会静默停摆，
+       风险大于名字带来的好处，所以留着，函数名与判据都按真实形状叫。
+    """
+    items = form_wake_queue(_form_payloads()) + approval_wake_queue(_approval_wake_load())
+    return {"ok": True, "pending": sorted(items, key=lambda x: x["at"])}
+
+
+def wake_ack(body: dict) -> dict:
+    """POST /api/skills/form/wake/ack —— 按 kind 分流到两份队列。
+
+    🔴 kind 必填（form|approval），不猜：猜错的那一下会去清另一份队列，
+       而那边的 `at` 恰好也可能对得上（同一秒内提交/批准），错清 = 那一格永远没人叫。
+    """
+    kind = str((body or {}).get("kind") or "")
+    if kind == "approval":
+        return approval_wake_ack(body)
+    if kind == "form":
+        return form_wake_ack(body)
+    return {"ok": False, "error": "ack 必须带 kind=form|approval（不猜是哪份队列）"}
+
+
+def form_wake_ack(body: dict) -> dict:
+    """POST /api/skills/form/wake/ack {session, at}：把这一条标成"已叫醒"。
+
+    🔴 必须回带我们发出去的那个 `at` 才清 —— 不带或对不上就不清。
+    否则"插件正去叫醒旧提交"的时候客户又交了一次新的，旧 ack 会把新那格一起抹掉
+    （= 客户重交了表却永远没人叫）。这是这条链路唯一安全的幂等写法。
+    """
+    sid = str((body or {}).get("session") or "")
+    at = (body or {}).get("at")
+    data = _form_payloads()
+    rec = data.get(sid)
+    if not sid or not isinstance(rec, dict):
+        return {"ok": False, "error": "没有这条会话的载荷：%s" % (sid or "(空)")}
+    w = rec.get("wake") or {}
+    try:
+        same = bool(at) and abs(float(w.get("at") or 0) - float(at)) < 1e-6
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        return {"ok": False, "error": "ack 的 at 与待发队列不符（不清队列，避免抹掉更新的提交）",
+                "pending": bool(w.get("pending"))}
+    if not w.get("pending"):
+        return {"ok": True, "already": True}
+    rec["wake"] = dict(w, pending=False, acked_at=time.time())
+    return _form_write(FORM_PAYLOAD_PATH, sid, rec, "唤醒回执")
+
+
+# ==== 批准核销也要叫醒同一条链（2026-10-10 用户："我点了审批不执行，还得回一句点了条子，这个逻辑有问题"）====
+# 形状与表单那条【逐条同构】：人点一下 = 一个必然发生的事件 ⇒ 当场挂号待醒，宿主插件领走开新一轮。
+# 差别只在"被叫醒之后该干什么"：表单那条是"开始做"，批准这条是"这一刀已经批了，继续跑"。
+# 🔴 队列与【批准簿分开存】：.gateway_spend_approvals.json 是钱的账，往里塞 UI 状态 = 两个写者抢同一份文件
+#    （当年"旧 ack 抹掉客户重交的新一次"就是这个形状，判据只能有一份、状态只能有一个主人）。
+APPROVAL_WAKE_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "approval_wake.json")
+
+
+def _approval_wake_load() -> dict:
+    try:
+        with open(APPROVAL_WAKE_PATH, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def approval_wake_note(grant: dict) -> dict:
+    """人在批准窗/批准页点上【批准，开始跑】⇒ 给那条会话挂一格待醒（按条子 id 为键，一条一格）。
+
+    🔴 只在核销成功之后调用：被拒的点击不挂号（拒了就没有任何该动的活），
+       条子缺 id 或缺会话也不挂号 —— 猜一个会话去叫醒 = 替别人花批准额度（2026-10-06 那颗雷）。
+    """
+    g = grant or {}
+    gid, sid = str(g.get("id") or ""), str(g.get("session") or "")
+    if not gid or not sid:
+        return {"ok": False, "error": "条子没有 id 或会话 ⇒ 不挂号（不猜该叫谁）"}
+    ts = time.time()
+    rec = {"grant_id": gid, "session": sid, "capability": str(g.get("capability") or ""),
+           "purpose": str(g.get("purpose") or ""), "account": str(g.get("account") or ""),
+           "count": g.get("count"), "credits": g.get("credits"),
+           "scope": str(g.get("scope") or ""), "expires": g.get("expires"), "ts": ts,
+           "wake": {"pending": True, "at": ts}}
+    return _form_write(APPROVAL_WAKE_PATH, gid, rec, "批准待醒")
+
+
+def approval_wake_queue(data: dict) -> list:
+    """纯函数：从核销留痕里算出【该叫醒哪几条会话】。四条规则与 form_wake_queue 同构。
+
+    1. 只有【人真点过】的条子算数（pending 建出来不算 —— 那还没批）；
+    2. 过期不算（同 intent TTL，几天前批的条子不该今天把人叫醒）；
+    3. `wake.pending` 为假 ⇒ 不叫（叫过一次就别每 5 秒重叫 = 无限烧 token）；
+    4. 同一会话再批一条 ⇒ 新的一格、再叫一次（不同条子互不覆盖，所以按 grant_id 存而不是按会话存）。
+    """
+    out = []
+    now = time.time()
+    for gid, rec in (data or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        w = rec.get("wake")
+        if not isinstance(w, dict) or not w.get("pending"):
+            continue
+        ts = float(rec.get("ts") or 0)
+        if not ts or now - ts > hypit_bridge.INTENT_TTL_SEC:
+            continue
+        out.append({"kind": "approval", "session": str(rec.get("session") or ""),
+                    "grant_id": str(gid), "at": float(w.get("at") or ts),
+                    "capability": str(rec.get("capability") or ""),
+                    "purpose": str(rec.get("purpose") or ""),
+                    "count": rec.get("count"), "credits": rec.get("credits"),
+                    "scope": str(rec.get("scope") or "")})
+    return sorted(out, key=lambda x: x["at"])
+
+
+def approval_wake_ack(body: dict) -> dict:
+    """POST /api/skills/form/wake/ack {kind:"approval", grant_id, at} ⇒ 销这一格。
+
+    🔴 与表单那份同一条幂等规矩：必须回带服务端发出去的 `at` 才对得上，
+       否则"插件正去叫旧那条"的时候人又批了一条新的，旧 ack 会把新那格抹掉。
+    """
+    gid = str((body or {}).get("grant_id") or "")
+    at = (body or {}).get("at")
+    data = _approval_wake_load()
+    rec = data.get(gid)
+    if not gid or not isinstance(rec, dict):
+        return {"ok": False, "error": "没有这条条子的待醒记录：%s" % (gid or "(空)")}
+    w = rec.get("wake") or {}
+    try:
+        same = bool(at) and abs(float(w.get("at") or 0) - float(at)) < 1e-6
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        return {"ok": False, "error": "ack 的 at 与待发队列不符（不清队列，避免抹掉更新的批准）",
+                "pending": bool(w.get("pending"))}
+    if not w.get("pending"):
+        return {"ok": True, "already": True}
+    rec["wake"] = dict(w, pending=False, acked_at=time.time())
+    return _form_write(APPROVAL_WAKE_PATH, gid, rec, "批准唤醒回执")
+
+
+def _form_write(path, sid, rec, what):
+    """两份表单文件（提交载荷 / agent 回填）共用同一次【读-改-写】：按会话为键、tmp+原子替换。
+    写失败必须明说 —— 静默丢过一次（WinError5 撞占用），丢的那次表现为"客户填了表 agent 却说没收到"。"""
+    data = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data[sid] = rec
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        if not hypit_bridge.atomic_replace(tmp, path):
+            return {"ok": False, "error": "写%s失败（文件被占用，重试已用完）" % what}
+    except OSError as e:
+        return {"ok": False, "error": "写%s失败：%s" % (what, str(e)[:80])}
+    return {"ok": True, "skill": rec.get("skill"), "params": rec.get("params"),
+            "count": rec.get("files", 0)}
+
+
+def form_prefill(body: dict) -> dict:
+    """agent 回填：把分析出来的参数【预填】进这张表，等客户自己点提交。
+
+    🔴 **prefill ≠ submitted**：这里只写 `form_prefill.json`（回显成 defaults），
+       载荷文件 `form_payload.json` 一个字都不碰 ⇒ `form_gate_view` 的 `submitted` 仍为 false。
+       否则就等于 agent 替客户交了表 —— 和 2026-10-08 定的"表单不代发/不代点头"是同一条线。
+    🔴 判据（必填、选项归一、param 名、未知 key 丢弃）仍只走 `form_submit` 那一份：这里先按同一
+       份字段表洗一遍 key，但【不判必填】—— 回填本来就是半成品，拿必填去卡客户还没填的表是错的。
+    文件项收 `path`（agent 已经把聊天附件复制进表单上传目录），路径必须 realpath 落在那个目录里。
+    """
+    body = body if isinstance(body, dict) else {}
+    sid = str(body.get("session") or "").strip()
+    skill = str(body.get("skill") or "").strip()
+    if not sid or not skill:
+        return {"ok": False, "error": "缺 session 或 skill"}
+    rec = (hypit_bridge.intent_map() or {}).get(sid)
+    intent = str((rec or {}).get("skill") or "").strip()
+    hit = skill_form_index().get(intent)
+    if not hit or hit["skill"] != skill:
+        return {"ok": False, "error": "no-intent-for-this-skill", "intent": intent}
+    fields = hit["fields"]
+    values = body.get("values") if isinstance(body.get("values"), dict) else {}
+    defaults, dropped = {}, []
+    for fd in fields:
+        if fd["type"] in _FORM_MEDIA:
+            continue
+        v = str(values.get(fd["key"]) or "").strip()
+        if not v:
+            continue
+        if fd["type"] == "select" and fd["options"] and v.split(" ")[0] not in [
+                o.split(" ")[0] for o in fd["options"]]:
+            dropped.append(fd["key"])        # 选项不在字段表里 ⇒ 丢，不臆造一个引擎入参
+            continue
+        defaults[fd["key"]] = v
+    unknown = [k for k in values if k not in {f["key"] for f in fields}]
+    # 回填【依据】：agent 要能说清"这个值是凭什么填的"，页面把它挂在「AI 已填 · 可改」的悬停上。
+    # 只留字段表里认得的 key，长度掐死 —— 这是给客户看的说明文字，不是 agent 的自由输出区。
+    raw_notes = body.get("notes") if isinstance(body.get("notes"), dict) else {}
+    notes = {k: str(v)[:120] for k, v in raw_notes.items() if k in {f["key"] for f in fields} and v}
+    media, merr = {}, ""
+    files = body.get("files") if isinstance(body.get("files"), list) else []
+    if files:
+        media, merr = _form_prefill_paths(sid, fields, files)
+        if merr:
+            return {"ok": False, "error": merr}
+    return _form_write(FORM_PREFILL_PATH, sid, {
+        "skill": skill, "intent": intent, "defaults": defaults, "media": media,
+        "ts": time.time(), "dropped": dropped + unknown, "notes": notes}, "回填")
+
+
+def form_route_dispatch(body):
+    """POST /api/skills/form 的分发：**一次请求只写一份**，stage 决定写哪一份。
+
+    🔴 这条函数为什么单独存在（2026-10-09 实测抓出的缺陷）：路由原来写成
+    "先无条件 form_submit，再按 stage 补一次 form_prefill" ⇒ 一发回填会把【载荷】也写了，
+    门控当场回 submitted=True —— 那就是 agent 替客户交了表，正是 prefill≠submitted 这条红线。
+    闸当时全绿没抓到，因为它测的是"直接调函数"，分发顺序只在路由层暴露（源码顺序断言是弱证据）。
+    所以分发抽成这一个纯函数，闸直接对它跑值表（哪一档调了谁、调了几次）。
+    """
+    body = body if isinstance(body, dict) else {}
+    stage = str(body.get("stage") or "").strip().lower()
+    if stage == "prefill":       # 大小写/空格不参与判档
+        return form_prefill(body)
+    if stage == "attempt":       # 客户点了提交但没成交 ⇒ 只记台账，不碰载荷（见 form_attempt）
+        return form_attempt(body)
+    return form_submit(body)
+
+
+FORM_ATTEMPT_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "form_attempts.json")
+FORM_ATTEMPT_KEEP = 20           # 每条会话留最近 20 次点击
+
+def _form_attempts():
+    try:
+        with open(FORM_ATTEMPT_PATH, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def form_attempt(body):
+    """记下【客户点了提交、但没走到"已提交"】的每一次：缺哪几格、当时页头是哪条会话哪个任务、服务端拒因。
+
+    🔴 为什么必须有（2026-10-10）：客户报"点了提交没反应"，盘上唯一能查的载荷文件里那条会话一行都没有
+       ⇒ 分不清是"点的是别的会话的表"、"这张表还差一格被前端拦下"、还是"fetch 根本没发出去"。
+       没有现场，就只能靠猜 —— 而这次连 agent 都猜错了（它拿一条 18 小时前、别的会话的旧载荷
+       当"你提交到了别的会话"的证据）。这条台账把"该发生却没发生"变成查得到。
+    🔴 它【只增台账】：不写 form_payload.json、不写 form_prefill.json，也不参与 submitted / wake 任何判据
+       —— 否则"点一下"就能伪造出"客户已授权开工"，那正是 prefill≠submitted 那条红线要防的形状。
+    """
+    body = body if isinstance(body, dict) else {}
+    sid = str(body.get("session") or "").strip()[:64]
+    if not sid:
+        return {"ok": False, "error": "缺 session"}
+    items = list((_form_attempts().get(sid) or {}).get("items") or [])
+    items.append({"ts": round(time.time(), 3),
+                  "skill": str(body.get("skill") or "")[:32],
+                  "task": str(body.get("task") or "")[:48],
+                  "missing": [str(x)[:24] for x in (body.get("missing") or [])][:12],
+                  "reason": str(body.get("reason") or "")[:160]})
+    rec = {"skill": str(body.get("skill") or "")[:32], "ts": items[-1]["ts"], "items": items[-FORM_ATTEMPT_KEEP:]}
+    out = _form_write(FORM_ATTEMPT_PATH, sid, rec, "提交尝试台账")
+    return {"ok": bool(out.get("ok")), "count": len(rec["items"])}
+
+def form_attempts_view(n: int = 10) -> dict:
+    """GET /api/skills/form/attempts —— 最近 n 次点击（跨会话合并按时间倒序）。只读。"""
+    rows = []
+    for sid, rec in _form_attempts().items():
+        for it in (rec or {}).get("items") or []:
+            r = dict(it)
+            r["session"] = sid
+            rows.append(r)
+    rows.sort(key=lambda x: -float(x.get("ts") or 0))
+    return {"ok": True, "path": FORM_ATTEMPT_PATH, "recent": rows[:max(1, int(n or 10))]}
+
+
+def _form_prefill_paths(sid, fields, files):
+    """回填的文件只认【已经在表单上传目录里】的路径：agent 要做的是先把聊天附件复制进去，
+    而不是让这条口变成任意文件读取器（`path` 是外部输入 ⇒ realpath 必须落在 FORM_UPLOAD_DIR 内，
+    扩展名也必须命中这个槽的允许集）。"""
+    media = [f for f in fields if f["type"] in _FORM_MEDIA]
+    if not media:
+        return {}, "这个技能的表单没有文件字段"
+    root = os.path.realpath(_form_sid_dir(sid))
+    buckets = {}
+    for it in files:
+        it = it if isinstance(it, dict) else {}
+        fk = str(it.get("field") or "").strip()
+        if not fk and len(media) == 1:
+            fk = media[0]["key"]
+        fd = next((f for f in media if f["key"] == fk), None)
+        if fd is None:
+            return {}, ("这张表有多个文件槽，每个回填项要写明 field"
+                        if not fk else "文件槽不在字段表里：%s" % fk[:40])
+        p = os.path.realpath(str(it.get("path") or ""))
+        if not p.startswith(root + os.sep) or not os.path.isfile(p):
+            return {}, "回填的文件不在表单上传目录里：%s" % os.path.basename(p)[:48]
+        ext = os.path.splitext(p)[1].lstrip(".").lower()
+        allow = set(_form_ext_map(fd["type"]).values())
+        if ext not in allow:
+            return {}, "%s：不收 .%s（这个槽收 %s）" % (fd["label"], ext, "/".join(sorted(allow)))
+        buckets.setdefault(fk, []).append(p)
+    out = {}
+    for fk, paths in buckets.items():
+        fd = next(f for f in media if f["key"] == fk)
+        cap = fd.get("max") or _FORM_MAX_DEFAULT[fd["type"]]
+        if len(paths) > cap:
+            return {}, "%s 最多 %d 个（回填了 %d 个）" % (fd["label"], cap, len(paths))
+        # 🔴 一律回数组，单槽也不拍平成字符串：这份 media 唯一的消费者是页面
+        #    （gate view 的 default_files），而页面里 `if (!Array.isArray(l)) delete …`
+        #    会把非数组【整格删掉】⇒ 原片明明回填成功了，界面上却永远是空的（2026-10-10 实测）。
+        #    引擎要的单条路径由提交侧自己取，不在这里提前变形。
+        out[fd["param"]] = paths
+    return out, ""
+
+
+def form_presence_view(sid):
+    """右栏"填参数"那一档的 presence（判定并成一个口的老规矩：新增一档就在 presence 里回，别开第二个口）。
+
+    🔴 三条判据：
+    1. `intent` = 这条会话登记的意图档【配了字段表】。没配表的线（omni/hypit 已冻结、纯提示词类）
+       这一档恒 false ⇒ 不会凭空多出一个空台。
+    2. `up` 恒 True：这一档画的是 8100 自己托管的表单页，不是引擎 ⇒ "引擎死了"不该把输入口一起藏掉
+       （工作区 AGENTS.md：存活只决定台里显示什么）。
+    3. 台里【不含价格数字】，点头仍只有 /approval 那一次点击。
+    """
+    rec = (hypit_bridge.intent_map() or {}).get(str(sid or "")) or {}
+    intent = str(rec.get("skill") or "").strip()
+    hit = skill_form_index().get(intent)
+    if not intent:
+        return {"intent": False, "up": True, "alive": True, "reason": "no-intent"}
+    if not hit:
+        # 🔴 intent 必须是布尔：判定口的契约里 intent 决定页签弹不弹。
+        #    上一版这里写成 {"intent": False, ..., "intent": intent}（重复 key，Python 留后者）
+        #    ⇒ 回了字符串 "omni"，JS 里恒 truthy ⇒ 【没配表的线也会弹一张空台】。
+        return {"intent": False, "up": True, "alive": True, "reason": "intent-has-no-form",
+                "intent_skill": intent}
+    live = _form_payload_live(_form_payloads(), str(sid or "")) or {}
+    pre = _form_prefill_live(_form_prefills(), str(sid or ""), hit["skill"]) or {}
+    submitted = bool(live.get("params"))
+    # 🔴 2026-10-10 用户拍的弹出时机：登记意图只是【必要条件】，不是充分条件。
+    #    空表一弹，等于把"哪个是原片、哪个是产品图"的归类工作推回给客户 —— 那是 agent 的活。
+    #    所以：agent 分析完并回填（哪怕没东西可填也要 `prefill --set '{}'` 声明一句）才弹。
+    surfaced = bool(pre) or submitted
+    if not surfaced:
+        # `has_input` 仍为真 ⇒ 判定口的排他规则照常把这条线的引擎页按住，
+        #    不会因为"暂时不弹"就把旧引擎台放回来（这是这次改动最容易踩的坑）。
+        return {"intent": False, "has_input": True, "up": True, "alive": True,
+                "reason": "await-prefill", "skill": hit["skill"], "intent_skill": intent,
+                "task": str(rec.get("task") or ""),
+                "next": "agent 还没回填这张表 ⇒ 先分析素材，再跑 intent.py prefill --set …（没东西可填也要跑一次）"}
+    return {"intent": True, "has_input": True, "up": True, "alive": True, "source": "explicit",
+            "skill": hit["skill"], "intent_skill": intent, "task": str(rec.get("task") or ""),
+            "surfaced": True, "submitted": submitted,
+            # 已提交但还没被插件叫醒 ⇒ 页面可以显示"参数已收到，正在开始跑"。
+            # 🔴 这只是显示用的【状态】，不是第二份判据：要不要叫醒只由 form_wake_queue 那一份算。
+            "wake_pending": bool((live.get("wake") or {}).get("pending")),
+            "url": "http://127.0.0.1:%d/ui/%s?session=%s" % (
+                _admin_port(), hit["skill"], urllib.parse.quote(str(sid or "")))}
+
+
+def _admin_port():
+    try:
+        return int(os.environ.get("MODEL_ADMIN_PORT") or 8100)
+    except ValueError:
+        return 8100
+
+
+# 把表单视图注册进判定口（hypit_bridge 不 import model_admin，避免环；这一行就是那根单向线）。
+hypit_bridge.register_form_view(form_presence_view)
+
+
 def delivery_pending_view(sid):
     """交付欠账的读视图（右栏 / 收工拦截 / 回归闸共用同一个口径，不开第二个口）。
 
@@ -676,15 +1803,15 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _not_loopback(self):
-        """花钱相关的动作口一律只认环回；不是环回就 403 并回 True（调用方直接 return）。"""
-        if str(self.client_address[0] or "") not in ("127.0.0.1", "::1", "localhost"):
-            self._send(403, json.dumps({"ok": False, "error": "FORBIDDEN：花钱批准的动作口只听环回请求"},
+    def _not_loopback(self, what="视频生成批准"):
+        """非环回就 403 并返回 True（调用方直接 return）。判据只在 _is_loopback 那一份。"""
+        if not _is_loopback(self.client_address[0]):
+            self._send(403, json.dumps({"ok": False, "error": "FORBIDDEN：%s 只听环回请求" % what},
                                        ensure_ascii=False))
             return True
         return False
 
-    def _send_file(self, data, ctype):   # 二进制：不能带 charset，否则 hypit collect 的 content-type 判定会脏
+    def _send_file(self, data, ctype, disposition=None, cors=False):   # 二进制：不能带 charset，否则 hypit collect 的 content-type 判定会脏
         total = len(data)
         start, end = 0, total - 1
         state, part = 200, False
@@ -716,6 +1843,13 @@ class H(BaseHTTPRequestHandler):
         if part:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
         self.send_header("Content-Type", ctype)
+        if cors:
+            # 大文件改走这条口后不能丢 CORS：DSH 右栏/看板是跨源 <img> 取图的
+            self.send_header("Access-Control-Allow-Origin", "*")
+        if disposition:
+            # 交付卡上的【下载视频】按钮靠这一条把"导航"变成"下载"（跨源时 <a download> 属性会被忽略，
+            # 只有 attachment 头一定生效）。
+            self.send_header("Content-Disposition", disposition)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -785,6 +1919,40 @@ class H(BaseHTTPRequestHandler):
                                         "path": gateway.SPEND_APPROVALS_PATH,
                                         "count_raw": len(gateway._approvals_load().get("pending") or [])},
                                        ensure_ascii=False), cors=True)
+        elif u.path.startswith("/ui/"):
+            # 技能表单页：【一个模板】服务所有 skill —— 字段表由页面自己问 /api/skills/form 要。
+            # 同源相对路径是这条设计的根据：页面出自 8100，接口也在 8100 ⇒ 右栏 iframe 不需要跨口。
+            self._send(200, skill_form_page.render_form_page(), "text/html", cors=True)
+        elif u.path == "/api/skills/form/file":
+            # 表单上传目录的只读回显（缩略图）。三道闸见 form_media_file()，且只听环回。
+            if self._not_loopback():
+                return
+            q = parse_qs(u.query)
+            data, ctype, err = form_media_file((q.get("session") or [""])[0],
+                                               (q.get("param") or [""])[0],
+                                               (q.get("name") or [""])[0])
+            if data is None:
+                self._send(404, json.dumps({"ok": False, "error": err}, ensure_ascii=False), cors=True)
+            else:
+                self._send_file(data, ctype, cors=True)
+        elif u.path == "/api/skills/form":
+            # 对话内表单的唯一读口：按会话意图门控（没登记意图 ⇒ show:false，一条 UI 都不出）。
+            q = parse_qs(u.query)
+            self._send(200, json.dumps(form_gate_view((q.get("session") or [""])[0]),
+                                       ensure_ascii=False), cors=True)
+        elif u.path == "/api/skills/form/wake":
+            # 待醒队列：宿主插件问"该叫醒哪几条会话"。🔴 只听环回 —— 这份表暴露了
+            # 本机有哪些会话在干什么，局域网里别的机器不该看见。
+            if self._not_loopback("/api/skills/form/wake"):
+                return
+            self._send(200, json.dumps(wake_view(), ensure_ascii=False))
+        elif u.path == "/api/skills/form/attempts":
+            # 只读：客户点了【提交】但没成交的最近几次（缺哪格 / 哪条会话 / 拒因）。
+            # 🔴 只听环回：里面带会话 id 与任务名；并且它【不是】第二份"已提交"判据 —— 只是现场。
+            if self._not_loopback("/api/skills/form/attempts"):
+                return
+            q = parse_qs(u.query)
+            self._send(200, json.dumps(form_attempts_view((q.get("n") or ["10"])[0]), ensure_ascii=False))
         elif u.path == "/assets/weeksir-logo.png":
             try:
                 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
@@ -851,32 +2019,56 @@ class H(BaseHTTPRequestHandler):
                 payload = {"error": "读项目失败: %s: %s" % (type(e).__name__, str(e)[:150]), "task": task}
             self._send(200, json.dumps(payload, ensure_ascii=False), cors=True)
         elif u.path == "/api/film/file":
-            # 看板页托管项目内图片/视频:GET ?task=&rel=,只放行 productions/<task>/ 内的 PNG/JPG/MP4。
+            # 看板页托管项目内图片/视频:GET ?task=&rel=[&dl=1],只放行 productions/<task>/ 内的媒体/JSON。
             # 防路径穿越:realpath 后必须在项目根内。带 Range(MP4 播放器要 206)。
+            # 🔴 dl=1 ⇒ 回 Content-Disposition: attachment，交付卡上的【下载视频】按钮就指这里。
+            #    下载腿只放媒体扩展名：json 是看板读数据用的，不能变成"把 productions 下任意状态文件下载走"的口子
+            #    （outputs/sr_*/phase_state.json 里就有明文厂商 key）。
             import os as _os, urllib.parse as _up
             task = (parse_qs(u.query).get("task") or [""])[0]
             rel = _up.unquote((parse_qs(u.query).get("rel") or [""])[0])
+            qs = parse_qs(u.query)
+            want_dl = (qs.get("dl") or [""])[0].lower() in ("1", "true", "yes")
             proots = [_os.environ.get("DSH_PROD_ROOT") or _os.path.join(_os.environ.get("DSH_WORKSPACE") or r"C:\dsh", "productions")]
             if not task or not rel:
                 self._send(400, json.dumps({"error": "缺 task 或 rel"}), cors=True); return
             target = None
+            # 🔴 越界判定以前只看 rel（`".." in rel`），task 完全没查 ⇒ ?task=..%2F..%2F..&rel=Windows/win.ini
+            #    这种拼法能跳出 productions/。这条口现在还要管【下载】，必须按 realpath 判根，
+            #    不能靠"字符串里有没有 .."（normpath 会把它吃掉，符号链接更不管用）。
             for pr in proots:
-                p = _os.path.normpath(_os.path.join(pr, task, rel))
-                if _os.path.isfile(p):
+                p = _os.path.realpath(_os.path.join(pr, task, rel))
+                root = _os.path.realpath(pr)
+                if p.startswith(root + _os.sep) and _os.path.isfile(p):
                     target = p; break
-            if not target or not _os.path.isfile(target) or ".." in rel:
+            if not target:
                 self._send(404, json.dumps({"error": "文件不存在或越界"}), cors=True); return
             ext = _os.path.splitext(target)[1].lower().lstrip(".")
             # 🔴 键是"png/mp4"这种【不带点】的扩展名：以前拿 ".mp4" 去查这张表永远查不中，
             #    于是所有看板直链都回 application/octet-stream —— 视频在浏览器里变成"下载"而不是"播放"，
             #    图片也不内联显示（交付三件套里的"直链"这一件其实是坏的）。
-            ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                     "webp": "image/webp", "mp4": "video/mp4", "json": "application/json"}.get(ext, "application/octet-stream")
+            ctype = FILM_INLINE_TYPES.get(ext)
+            # 🔴 未知扩展名以前回落到 octet-stream 照样发出去 = productions/ 下【任何】文件都能被读走
+            #    （.env、.py、状态 json 全在内）⇒ 白名单必须真拦：不在表里就 404，不发内容、不发类型。
+            if not ctype:
+                self._send(404, json.dumps({"error": "该类型不托管"}, ensure_ascii=False), cors=True); return
+            if want_dl and ext not in FILM_DOWNLOADABLE:
+                self._send(404, json.dumps({"error": "只有图片/视频可下载"}, ensure_ascii=False), cors=True); return
             with open(target, "rb") as f:
                 data = f.read()
-            # MP4 大文件走 _send_file(带 Range);小文件直接 _send
-            if ext == ".mp4" and len(data) > 1024 * 1024:
-                self._send_file(data, ctype)
+            disp = None
+            if want_dl:
+                name = _os.path.basename(target)
+                ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "download"
+                disp = "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (ascii_name, _up.quote(name, safe=""))
+            # 下载腿与【所有二进制】都走 _send_file（带 Range、不带 charset）。
+            # 🔴 以前这条只认 mp4 ⇒ >1MB 的 PNG/JPG 落到 _send 分支，被盲加 `; charset=utf-8`
+            #    （`image/png; charset=utf-8` 是错的：二进制没有字符集）。判据按【类型】不按大小：
+            #    图片/视频一律二进制出口，json 等文本仍走 _send（看板要 CORS + 字符集）。
+            # 曾经的第二个坑：条件写成 ext == ".mp4"，而 ext 早被 lstrip(".") 洗成不带点 ⇒ 恒假，
+            #    大 MP4 从来没走过 Range 分支、直链拖不动（2026-10-08 修）。
+            if want_dl or ctype.startswith(("image/", "video/")):
+                self._send_file(data, ctype, disposition=disp, cors=True)
             else:
                 self._send(200, data, ctype, cors=True)
         elif u.path == "/api/film/projects":
@@ -898,24 +2090,6 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 payload = {"error": "读项目失败: %s: %s" % (type(e).__name__, str(e)[:150]), "task": task}
             self._send(200, json.dumps(payload, ensure_ascii=False), cors=True)
-        elif u.path == "/api/film/file":
-            # 看板页托管项目内图片/视频(只读,防路径穿越,MP4 走 Range)
-            import importlib, sys as _sys, urllib.parse as _up
-            _sys.path.insert(0, r"C:\dsh")
-            task = (parse_qs(u.query).get("task") or [""])[0]
-            rel = _up.unquote((parse_qs(u.query).get("rel") or [""])[0])
-            try:
-                fps = importlib.import_module("_film_pipeline_status")
-                data, ctype, code = fps.film_file(task, rel)
-                if data is None:
-                    self._send(code, json.dumps({"error": "文件不存在或越界"}), cors=True)
-                    return
-                if code == 200 and ctype == "video/mp4" and len(data) > 512 * 1024:
-                    self._send_file(data, ctype)
-                else:
-                    self._send(200, data, ctype, cors=True)
-            except Exception as e:
-                self._send(500, json.dumps({"error": "读文件失败: %s: %s" % (type(e).__name__, str(e)[:120])}), cors=True)
         elif u.path == "/api/film/board":
             # 看板页(8100 同域,iframe 直接 src)
             import importlib, sys as _sys
@@ -968,9 +2142,7 @@ class H(BaseHTTPRequestHandler):
             self._send(code, json.dumps(payload, ensure_ascii=False), cors=True)
         elif u.path == "/api/spend/guard":
             # 只环回：消耗批准这件事不该由局域网里别的机器替本机用户做。
-            if str(self.client_address[0] or "") not in ("127.0.0.1", "::1", "localhost"):
-                self._send(403, json.dumps({"ok": False, "error": "FORBIDDEN：/api/spend/guard 只听环回请求"},
-                                           ensure_ascii=False))
+            if self._not_loopback("/api/spend/guard"):
                 return
             try:
                 body = json.loads(raw.decode("utf-8", "replace") or "{}")
@@ -979,6 +2151,46 @@ class H(BaseHTTPRequestHandler):
                 return
             code, payload = spend_guard(body if isinstance(body, dict) else {})
             self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path == "/api/media/upload":
+            # 素材上传口（不计费、不建预扣）。🔴 只听环回：这条口会把本机文件送到第三方，
+            # 局域网里别的机器不该替本机用户做这件事。
+            if self._not_loopback("/api/media/upload"):
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e}, ensure_ascii=False))
+                return
+            code, payload = media_upload(body if isinstance(body, dict) else {})
+            self._send(code, json.dumps(payload, ensure_ascii=False))
+        elif u.path == "/api/skills/form":
+            # 对话内表单的唯一写口。🔴 只听环回（往本机写文件 + 写"这条会话的引擎入参"，
+            # 不是局域网里别的机器该替本机做的事）。
+            # ⚠️ 本类【没有 do_OPTIONS】⇒ 前端必须用简单请求（Content-Type: text/plain）发，
+            #    用 application/json 会触发预检、直接撞 501，表现为"提交没反应"。
+            if self._not_loopback():
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e},
+                                           ensure_ascii=False), cors=True)
+                return
+            out = form_route_dispatch(body if isinstance(body, dict) else {})
+            self._send(200, json.dumps(out, ensure_ascii=False), cors=True)
+        elif u.path == "/api/skills/form/wake/ack":
+            # 插件叫醒之后来销账。只清【它领走的那一次】(at 对得上)，不清整条 ——
+            # 客户在插件路上又重交了一次时，旧 ack 不能把新那格抹掉（那就又变成没人叫）。
+            if self._not_loopback("/api/skills/form/wake/ack"):
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e},
+                                           ensure_ascii=False))
+                return
+            r = wake_ack(body if isinstance(body, dict) else {})
+            self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
         elif u.path in ("/api/spend/approve", "/api/spend/deny"):
             # 花钱批准页的两个动作口。🔴 只听环回（和 /api/spend/guard 同一条理由：批准/拒绝
             # 是本机用户的事，不该由局域网里别的机器替他点）。这里【没有】创建 pending 的口 ——
@@ -998,6 +2210,14 @@ class H(BaseHTTPRequestHandler):
                 r = gateway.deny_pending(pid)
             else:
                 r = gateway.consume_by_click(pid)     # 码由服务端自己取，页面不需要知道
+                # 🔴 人点掉批准 = 一个必然发生的事件 ⇒ 当场给那条会话挂号待醒（宿主插件 5 秒内领走、开新一轮）。
+                #    缺这一格就是 2026-10-10 那句"我点了审批不执行，还得回一句点了条子"：
+                #    agent 只在轮到自己说话时才动，没人叫醒它，它就只能等下一句人话。
+                #    置顶批准窗（approval_popup.py）走的也是这个口 ⇒ 两个壳共用同一次挂号，不各写一份。
+                #    ⚠️ 点【这次不跑】(deny) 故意【不】挂号：那一下的语义是"停"，叫醒 agent 没有活可派，
+                #       只会多烧一轮 token；agent 那边照旧靠 approvals/过期判据自己收口。
+                if r.get("ok"):
+                    r["wake"] = approval_wake_note(r.get("grant") or {})
             self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
         elif u.path == "/api/model/call":
             try:
