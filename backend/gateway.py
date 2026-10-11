@@ -2998,6 +2998,120 @@ def build_quote_summary(capability: str, purpose: str, account: str, count: int,
                scope or "（没写 scope！）"))
 
 
+# ── 报价出处判据（2026-10-11 现网 session-241ea3f7 08:23 复盘）───────────────────────
+# 那条消息写"单价 60 / 段数 1 / 预计总扣分 60 / 实扣 40 / 余额 99544"，末尾还给了 /approval 那条链接。
+# 盘上：approve 从没跑过（最新一张条子是 10-10 20:14 且不属于这条会话）⇒ 前三格加余额全部无出处；
+#      素材分析台账是 40+40+38 三次 ⇒ "实扣 40" 少报两次；accounts 里 default 是 99532 ⇒ 余额差 12；
+#      批准页里属于这条会话的行【一条都没有】⇒ 那句"批准入口"指的是空气。
+# 🔴 判据只这一份：回归闸（scripts/check-quote-provenance.py）与批准页都读这里，不许抄第二份。
+import re as _re
+
+QUOTE_FIELDS = ("单价", "段数", "预计总扣分", "余额", "实扣")
+_QUOTE_LABELS = {"单价": ("单价",), "段数": ("段数",),
+                 "预计总扣分": ("预计总扣分", "预计扣分", "总扣分"),
+                 "余额": ("当前余额", "余额"), "实扣": ("实扣", "实际扣分", "已扣分")}
+# 只认这些字样当"批准入口"证据 —— 拿"批准/点头"这种散文词判定会误伤正常汇报。
+_APPROVAL_ENTRY_MARKS = ("/approval", "批准入口", "批准页", "批准窗", "点【批准", "approval 页")
+
+
+def quote_numbers_in(text: str) -> list:
+    """从一条报价里抓「五格 → 数字」。允许 `60`、`60 分`、markdown 表格 `| 单价 | 60 |`、全角冒号。
+    🔴 每个字段一条合并正则、别名按【长在前】排：`预计总扣分|预计扣分` 若分两次扫，
+       "预计总扣分 60" 会被算成两条（短别名是长短语的子串）⇒ 判据会凭空翻倍报红。"""
+    out = []
+    for field, labels in _QUOTE_LABELS.items():
+        pat = _re.compile("(?:%s)[^0-9]{0,6}(\\d+)" % "|".join(_re.escape(x) for x in labels))
+        for m in pat.finditer(text or ""):
+            out.append((field, int(m.group(1))))
+    return out
+
+
+def quote_facts(session: str = "", account: str = "local") -> dict:
+    """现读【报价出处】。全只读：不建条子、不碰额度、0 消耗。"""
+    data = _approvals_load()
+    now = _time.time()
+    pend = [p for p in (data.get("pending") or [])
+            if (p.get("session") or "") == (session or "") and p.get("status") == "pending"
+            and float(p.get("expires") or 0) > now]
+    grants = [g for g in (data.get("grants") or [])
+              if (g.get("session") or "") == (session or "") and float(g.get("expires") or 0) > now]
+    charged = [int(r.get("credits") or 0) for r in media_analysis_rows()
+               if (r.get("session") or "") == (session or "") and r.get("credits") is not None]
+    try:
+        bal = ledger().balance(account)
+    except Exception:                                       # noqa: BLE001 —— 读不到就说读不到，不猜一个数
+        bal = None
+    return {"session": session, "account": account,
+            "pending_id": (pend[0].get("id") if pend else ""),
+            "quote_text": (pend[0].get("quote") if pend else ""),
+            "count": (pend[0].get("count") if pend else None),
+            "credits": (pend[0].get("credits") if pend else None),
+            "grant_ids": [g.get("id") for g in grants],
+            "balance": bal, "charged": charged, "charged_total": sum(charged)}
+
+
+def quote_problems(message: str, facts: dict, unit=None) -> list:
+    """纯函数（自己不读盘 ⇒ 能被整块抠出来跑真值表）。返回每条说不通的地方，空 = 五格都有出处。
+    `unit` 由调用方现读 `unit_price(路由)` 传进来。
+    🔴 五格的出处【不全是 pending】，别一锅端：单价的出处是价目表、余额的出处是账本，这两格不建条子也能核；
+       段数与预计总扣分只有 approve 才知道（段数从盘上算、分数从段数算），所以它们【必须有 pending】才算有出处。
+       把单价也绑到 pending 上 = 判据在替"没跑 approve"这件事重复喊，真正的错（余额写错、实扣少报）反而被淹掉。"""
+    got = quote_numbers_in(message)
+    if not got:
+        return []
+    probs, has_pending = [], bool(facts.get("pending_id") or facts.get("grant_ids"))
+    for field, num in got:
+        if field == "实扣":
+            # "实扣" = 这条会话到现在真扣掉的分 ⇒ 只能等于台账合计；报单次数字 = 少报重复消耗
+            if not facts.get("charged"):
+                probs.append("实扣=%s 但台账里【没有这条会话的任何记录】⇒ 无出处" % num)
+            elif num != int(facts.get("charged_total") or 0):
+                probs.append("实扣=%s 与台账不符：这条会话共 %d 次 %s，合计 %s 分"
+                             % (num, len(facts["charged"]), facts["charged"], facts["charged_total"]))
+            continue
+        if field == "单价":
+            if unit is None:
+                probs.append("单价=%s 无法核对：报价里那条路由在价目表里读不到单价"
+                             "（没跑 prices 就不要写这一格）" % num)
+            elif int(num) != int(unit):
+                probs.append("单价=%s 与价目表不符（现读=%s）⇒ 凭记忆写价" % (num, unit))
+            continue
+        if field == "余额":
+            if facts.get("balance") is None:
+                probs.append("余额=%s 无法核对：账本读不到账户 %s 的余额" % (num, facts.get("account")))
+            elif int(num) != int(facts["balance"]):
+                probs.append("余额=%s 与账本不符（现读=%s，账户 %s）"
+                             % (num, facts["balance"], facts.get("account")))
+            continue
+        if not has_pending:
+            probs.append("%s=%s 无出处：这条会话【没有待批条子】⇒ approve 没跑过，"
+                         "段数与总扣分只能从它的输出里抄，不许手写" % (field, num))
+            continue
+        want = {"段数": facts.get("count"), "预计总扣分": facts.get("credits")}[field]
+        if want is None:
+            probs.append("%s=%s 无法核对：盘上读不到对应值（不许拿消息里的数当自己的出处）" % (field, num))
+        elif int(num) != int(want):
+            probs.append("%s=%s 与盘上不符（应为 %s）" % (field, num, want))
+    if facts.get("pending_id"):
+        miss = [ln.strip() for ln in str(facts.get("quote_text") or "").splitlines()
+                if ln.strip().split("：")[0] in ("路由", "单价", "段数", "预计扣分", "当前余额")
+                and ln.strip() and ln.strip() not in (message or "")]
+        if miss:
+            probs.append("没把 approve 打出的原始报价行原样贴进消息：%s" % " / ".join(m[:28] for m in miss))
+    return probs
+
+
+def approval_entry_problems(message: str, facts: dict) -> list:
+    """出现『批准入口/批准页/approval』字样 ⇒ 该会话必须有 pending 或未过期的条子。
+    拦的是这个形状：印一条 http://127.0.0.1:8100/approval，而那张页面上没有属于这条会话的可批项。"""
+    text = message or ""
+    hit = sorted({w for w in _APPROVAL_ENTRY_MARKS if w in text})
+    if not hit or facts.get("pending_id") or facts.get("grant_ids"):
+        return []
+    return ["消息里出现了批准入口字样（%s），但 approvals 里没有这条会话的待批/已批条子"
+            " ⇒ 那个链接点进去是空的，客户看不到任何可批的东西。"
+            "先跑 gateway.py approve 建条子（它自己会弹置顶批准窗），再谈批准入口。" % "、".join(hit)]
+
 
 def _approvals_save(data: dict) -> None:
     # ⚠️ 写这份 json 的规矩：先 `_approvals_load()` 拿到完整 dict、原地改要改的那块、再存。
@@ -3802,12 +3916,16 @@ def _cli(argv):
         #                      ② 人在【自己的终端】里跑 `gateway.py code <pending_id>`。
         print("\npending: %s   （%.0f 分钟内有效）" % (p["id"], SPEND_PENDING_TTL / 60))
         pop = pop_approval_window(p["id"])
+        # 🔴 链接一律带 ?session= —— 批准页现在按它筛卡（不带 = 客户看到的是全局列表，
+        #    多会话并发时他能替别的方案点头）。这一行是 agent 唯一许贴给客户的那条地址。
+        appr_url = "http://127.0.0.1:8100/approval?session=%s" % (kv.get("session") or "")
         if not pop:
             print("⇒ 现在还没有任何批准额度。已把【置顶批准窗】弹到人桌面上："
                   "核对报价后点【批准，开始跑】才签出额度；不点 = 过期即拒（fail-closed）。")
+            print("   弹窗没被人看到时的备选地址（要给人就用这条，带会话号）：%s" % appr_url)
         else:
-            print("⇒ 现在还没有任何批准额度。⚠️ 弹窗没起来（%s）⇒ 请打开 http://127.0.0.1:8100/approval 点一次。"
-                  % pop)
+            print("⇒ 现在还没有任何批准额度。⚠️ 弹窗没起来（%s）⇒ 请打开 %s 点一次。"
+                  % (pop, appr_url))
         print("   备选：① DSH 对话里那张品牌审批卡点【允许一次】；"
               "② 人在【自己的终端】跑 gateway.py code %s（码不进本回复，免得跑命令的一方自己用掉）" % p["id"])
         return 0

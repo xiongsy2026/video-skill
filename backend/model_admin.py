@@ -631,10 +631,17 @@ button.no:hover{border-color:var(--bad);color:var(--bad)}
 </div>
 <script>
 const E=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* 🔴 页面要认得"我是来看哪条会话的"（2026-10-11 现网：agent 没建条子就印了 /approval 链接，
+   客户点进来看到的是【别的会话】的卡或一张空页，却没有人告诉他这条会话根本没有可批的东西）。
+   ?session= 有 ⇒ 只画这条会话的卡，一条都没有就明说；没有 ⇒ 照旧全列（运维从裸地址进来）。 */
+const MYSID=(new URLSearchParams(location.search).get('session')||'').trim();
+const tail=s=>String(s||'').replace(/^session-/,'').slice(0,8)||'未知';
 function card(p){
   const d=document.createElement('div');d.className='card';d.dataset.id=p.id;
+  const mine=!MYSID||(p.session||'')===MYSID;
   const left=Math.max(0,Math.round(p.left_seconds/60));
-  d.innerHTML=`<div class=route>${E(p.capability)} / ${E(p.purpose)} <span>· ${E(p.account)}</span></div>
+  d.innerHTML=`<div class=route>${E(p.capability)} / ${E(p.purpose)} <span>· ${E(p.account)}</span>
+  <span style="float:right;color:${mine?'var(--mut)':'#c9543e'}">会话 ${E(tail(p.session))}${MYSID?(mine?' · 就是这条':' · 不是这条会话'):''}</span></div>
   <div class=grid>
     <div class=kv><div class=k>要跑几段</div><div class=v>${E(p.count)} 段</div></div>
     <div class=kv><div class=k>最多扣多少分</div><div class="v money">${E(p.credits)} 分</div></div>
@@ -643,6 +650,7 @@ function card(p){
   <div class=scope>这次要做的：${E(p.scope)||'（没写）'}</div>
   <div class=acts><button class=ok>批准，开始跑</button><button class=no>这次不跑</button></div>
   <div class=msg></div>`;
+  if(!mine)d.style.opacity=.5;
   d.querySelector('.ok').onclick=()=>act(d,'/api/spend/approve',p.id,'已批准');
   d.querySelector('.no').onclick=()=>act(d,'/api/spend/deny',p.id,'已拒绝');
   return d;}
@@ -663,6 +671,16 @@ async function load(){
   try{rows=(await (await fetch('/api/spend/pending')).json()).pending||[];}
   catch(e){document.getElementById('list').innerHTML='<div class=card><div class=err>判定口 8100 没回话（不是"没有待批"）：'+E(e)+'</div></div>';return;}
   const box=document.getElementById('list');
+  if(MYSID){
+    const mine=rows.filter(p=>(p.session||'')===MYSID);
+    if(!mine.length){
+      if(box.dataset.last==='none-mine'&&box.children.length)return;
+      box.innerHTML='<div class=empty><b>这条会话（会话 '+E(tail(MYSID))+'）没有待批条子</b>'
+        +'Agent 还没跑 <code>gateway.py approve</code> ⇒ 这里没有任何属于这条会话的可批项。'
+        '<br>不要点别的会话的卡：那一下点的是【别的方案】的额度。'
+        '<br><span style=color:var(--mut)>让它先建条子（建完会自动弹批准窗），再回来看这一页。</span></div>';
+      box.dataset.last='none-mine';return;}
+    rows=mine;}
   if(!rows.length){
     if(box.dataset.last==='empty'&&box.children.length)return;   // 空态不重绘，免得闪
     box.innerHTML='<div class=empty><b>现在没有等你批的任务</b>Agent 提请批准时会立刻出现在这里</div>';
