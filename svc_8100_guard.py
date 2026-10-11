@@ -147,15 +147,39 @@ def _wait_healthy(seconds: float = 25.0) -> bool:
     return False
 
 
+SERVICE_LOG = os.path.join(HERE, "_svc_8100.service.log")
+
+
+def _log_sink():
+    """被看着的那个进程，stderr 该落哪儿。
+    🔴 结构要求：**看门狗自己的日志绝不被它看着的进程握着**。
+       现网形状（2026-10-11 21:31→23:53 这次宕机）：`_spawn_direct()` 把 model_admin 的 stdout/stderr
+       指到守卫自己那份 `_svc_8100.err.log`（任务那一跳又是 `2>>` 同一个文件），于是长期活着的
+       服务进程继承了那份句柄；下一次守卫要重启时 `open(LOG,"a")` 撞 PermissionError ⇒
+       `ensure` 每分钟崩在同一行裸 open 上，8100 一直没人起（首页四张技能封面全成碎图标）。
+       "要重启才走的那条路"恰好是唯一会碰这份日志的路 ⇒ 平时看不出来，一出事就是死锁。
+    退路顺序：服务专用日志 → 带时间戳的旁路 → DEVNULL（宁可无声，不可不起）。"""
+    for p in (SERVICE_LOG, "%s.%s" % (SERVICE_LOG, time.strftime("%Y%m%d-%H%M%S"))):
+        try:
+            return open(p, "a", encoding="utf-8", errors="replace"), os.path.basename(p)
+        except OSError:
+            continue
+    return subprocess.DEVNULL, "devnull"
+
+
 def _spawn_direct() -> str:
-    """最后兜底：任务那条路起不来时，自己拉一份（stderr 仍进同一份日志）。"""
-    py = sys.executable
-    err = open(LOG, "a")
-    kwargs = {}
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
-    subprocess.Popen([py, os.path.join(HERE, "backend", "model_admin.py")],
-                     cwd=HERE, stdout=err, stderr=err, stdin=subprocess.DEVNULL, **kwargs)
+    """最后兜底：任务那条路起不来时，自己拉一份（stderr 走服务专用那份，绝不碰守卫自己的日志）。"""
+    try:
+        err, where = _log_sink()
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        subprocess.Popen([sys.executable, os.path.join(HERE, "backend", "model_admin.py")],
+                         cwd=HERE, stdout=err, stderr=err, stdin=subprocess.DEVNULL, **kwargs)
+    except Exception as e:                                  # noqa: BLE001 —— 起服务这一刀不许把守卫带走
+        _log("direct-spawn 失败：%s: %s" % (type(e).__name__, str(e)[:120]))
+        return "direct-spawn-failed:%s" % type(e).__name__
+    _log("direct-spawn 已拉起 model_admin（stderr→%s）" % where)
     return "direct-spawn"
 
 
@@ -216,9 +240,12 @@ def ensure() -> int:
     if listener_pid():
         print("BUSY-TRYING-LATER")
         return 1
-    _spawn_direct()
+    _sp = _spawn_direct()
     ok = _wait_healthy()
     _log("ensure（%s）：%s" % (st, "起好了" if ok else "起了但仍不应答（下一跳再来）"))
+    if _sp.startswith("direct-spawn-failed"):
+        print("SPAWN-FAILED %s" % _sp)          # 🔴 起都没起来 ≠ 起了没应答，两件事别混成一条
+        return 1
     print("STARTED-OK" if ok else "STARTED-STILL-DEAD")
     return 0 if ok else 1
 
