@@ -1058,7 +1058,8 @@ def form_gate_view(sid: str) -> dict:
                 "session": sid, "intent": intent}
     payload = _form_payload_live(_form_payloads(), sid)
     same = bool(payload) and payload.get("skill") == hit["skill"]
-    pre = {} if same else _form_prefill_live(_form_prefills(), sid, hit["skill"])
+    pre_raw = _form_prefill_live(_form_prefills(), sid, hit["skill"])
+    pre = {} if same else pre_raw      # 交过表 ⇒ 页面不再拿回填覆盖客户自己填的（载荷更权威）
     out = {"ok": True, "show": True, "session": sid, "intent": intent,
            "skill": hit["skill"], "fields": _form_fields_wire(hit["fields"]),
            "params": (payload.get("params") or {}) if same else {},
@@ -1076,12 +1077,34 @@ def form_gate_view(sid: str) -> dict:
         # 回填依据：页面上挂在「AI 已填 · 可改」的悬停里。客户要能分清哪些是自己填的、
         # 哪些是 agent 猜的 —— 分不清的话，填错的归因会全落到我们头上（2026-10-09 产品的要求）。
         out["prefill_notes"] = pre.get("notes") or {}
+    # 🔴 "这张表 agent 看过没有"要能被机器问到（不靠 agent 自述）。跑过一次 prefill —— 哪怕是
+    #    `--set '{}'` —— 就是"我看过了"的声明；没跑过 ⇒ 右栏不弹表，报价也不该给。
+    #    2026-10-11 现网 16:30：agent 登记了意图、把默认值写在对话里说"可在提交前改"，
+    #    但那张表从没回填过 ⇒ 客户手上没有任何可改的地方，approve 照样建得出条子。
+    #    ⚠️ 这里必须读【原始记录】而不是 `pre`：客户一旦交过表，`pre` 会被故意清空（载荷更权威），
+    #       拿 `pre` 判"回填过没有"会把【客户自己填完了】的单误判成没回填。
+    out["prefilled"] = bool(pre_raw)
+    out["prefill_ts"] = float(pre_raw.get("ts") or 0.0)
     # 🔴 回填覆盖率（2026-10-10 现网：agent 只回填了声音档一格，原片明明已经下载却让客户自己再选）：
     #    unfilled_required = 到现在还没值的必填格；loose_materials = 素材根里躺着、却没被引用的文件；
     #    prefill_gap = 两者的【合成判据】（必填素材格缺值 + 根里有闲料）。
     #    runner 与 intent.py 都只读结论，不许自己再解析字段表 ⇒ 判据只在这一份。
-    _def = out.get("defaults") or {}
-    _med = out.get("default_files") or {}
+    #    🔴 算的是【生效值】：交过表就以载荷为准，否则以回填为准。2026-10-11 现网发现只对着回填算 ⇒
+    #       一条已经交齐的会话恒报"必填没填"，那是判据自己算错，会把合格对象判红（比漏判更坏）。
+    _def = dict((pre.get("defaults") or {}) if not same else {})
+    _med = dict((pre.get("media") or {}) if not same else {})
+    if same:
+        for k, v in ((payload.get("params") or {}) if same else {}).items():
+            fd = next((f for f in hit["fields"] if f["key"] == k or f.get("param") == k), None)
+            if v is None or v == "":
+                continue
+            if fd is not None and fd["type"] in _FORM_MEDIA:
+                lst = v if isinstance(v, list) else [v]
+                _med[k] = lst
+                if fd.get("param"):
+                    _med[fd["param"]] = lst
+            else:
+                _def[k] = v
     # 素材根 = inputs/（回填唯一认的根）+ src/（agent 自己下载/派生的地方）。
     # 加上 src/ 是为了抓"原片已下载却留在 src、表上原片永远空"那一次事故；
     # outputs/、frames/ 故意不扫 —— 派生物当客户素材判会天天误拦。

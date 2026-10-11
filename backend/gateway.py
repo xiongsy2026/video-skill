@@ -3404,6 +3404,59 @@ def spend_contract_problems(capability: str, purpose: str, params: dict | None =
             % (dirs[0], CONTRACT_RECEIPT_WALK, _sc.RECEIPT_NAME, lane)]
 
 
+# 🔴 判定口地址可用 env 覆盖 —— 这是给回归闸留的【测试缝】：闸拿自己的桩服务判各分支，
+#    不去碰线上 8100 的会话状态（否则测一次就往生产文件里写一条真回填）。
+FORM_GATE_URL = _os.environ.get("GATEWAY_FORM_GATE") or "http://127.0.0.1:8100/api/skills/form?session="
+
+
+def form_prefill_blockers(session: str) -> list:
+    """【配了表单的那条线】报价之前必须回填过表 —— 判据不在这儿，只读 8100 的结论。
+    为什么钉在 approve 上：这是花钱前唯一那一步【必然发生】的命令，绑在这里才不用指望 agent 自觉；
+    绑在 runner 上（像回填覆盖率那条）拦不住"不进 runner、直接在对话里把默认值报给客户"的形状
+    —— 2026-10-11 16:30 现网就是这样：登记了、没回填、`prefill_gap=["video"]`，条子照样建得出来。
+    三条放行/拒绝线：① 这条会话登记的档没配表单 ⇒ 不适用；② 回填过（或客户自己交齐了）且缺口为空 ⇒ 放行；
+    ③ 其余（没登记 / 没回填 / 缺口非空 / 8100 没回话）一律拒 —— 读不到不等于通过，fail-closed。"""
+    sid = str(session or "").strip()
+    if not sid or sid == "-":
+        return ["approve 没带 --session ⇒ 无法判断这条会话回填过没有。带会话号再来（不猜一个 id）。"]
+    import urllib.error
+    import urllib.parse
+    import urllib.request                       # gateway 顶部没有 import urllib —— 别拿 NameError 冒充"服务没回话"
+    try:
+        with urllib.request.urlopen(FORM_GATE_URL + urllib.parse.quote(sid), timeout=6) as r:
+            j = _json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return ["判定口 8100 没回话（%s）⇒ 确认不了这张表回填过没有，按【未回填】处理。"
+                "先把 8100 起来（python svc_8100_guard.py ensure）再报价，"
+                "别拿「客户在等」当理由跳过回填。" % type(e).__name__]
+    except Exception as e:                                   # noqa: BLE001 —— 内部错要说清是内部错
+        return ["读取判定口时【我方代码出错】（%s: %s）⇒ 按未回填处理，但这不是 8100 的故障，去修读它的那段。"
+                % (type(e).__name__, str(e)[:100])]
+    if str(j.get("reason") or "") == "intent-has-no-form":
+        return []                                            # 这条线没有表单输入口 ⇒ 不在射程
+    if str(j.get("reason") or "") == "no-intent":
+        return ["这条会话还没登记意图 ⇒ 第一步就没走（`python scripts/intent.py <档> <任务名>`）。"
+                "没有任务目录就没有素材归位、没有回填、表单也不弹，报价没有依据可核。"]
+    if not j.get("ok"):
+        return ["判定口回的不是合格结论（%s）⇒ 按未回填处理" % str(j.get("error") or j)[:120]]
+    gaps = j.get("prefill_gap") or []
+    loose = j.get("loose_materials") or []
+    unfilled = j.get("unfilled_required") or []
+    if not (j.get("prefilled") or j.get("submitted")):   # 客户自己交齐了 = 比回填更权威，算满足
+        return ["这张表从没回填过 ⇒ 右栏不会弹，客户手上没有任何可改的地方，"
+                "把默认值写在对话里等于用聊天当参数表（不进载荷、不进合同）。"
+                "先跑 python scripts/intent.py prefill --set @文件（没有东西可填也要 --set '{}'，"
+                "那是在声明「我看过了」）。"]
+    if gaps:
+        return ["回填不完整：槽 %s 还没值，而任务目录里已经躺着对得上类型的素材 %s ⇒ "
+                "先归位再回填（客户给的素材只能进 inputs/，从 src/ 回填会被服务端拒）"
+                % (gaps, [_os.path.basename(str(x)) for x in loose][:4])]
+    if unfilled:
+        return ["必填格还空着 %s ⇒ 这些要么由 agent 从素材里判出来回填，要么确实要客户自己给；"
+                "前者没做就是漏做，后者没给就别急着报价" % unfilled]
+    return []
+
+
 def skill_contract_lane_or_empty(capability: str, purpose: str) -> str:
     """信封里那一格只报事实：这条腿对应哪档合同，查不到就空着（不猜一个档名上去）。"""
     try:
@@ -3974,6 +4027,18 @@ def _cli(argv):
 
         if not needs_spend_approval(cap):
             print(f"⚠️ {cap} 本来就不需要批准（免批类：文本/看图）。这条 approve 只是留档，不影响任何调用。")
+        # 🔴 【有合同的那条线】报价之前必须回填过表 —— 判据只读 8100 的结论，网关不解析第二份字段表。
+        #    为什么钉在这一步：approve 是花钱前唯一【必然发生】的命令，绑在这里才不用指望 agent 自觉；
+        #    绑在 runner 上就拦不住「不进 runner、把默认值写在对话里」那种走法（2026-10-11 16:30 现网）。
+        if skill_contract_lane_or_empty(cap, kv["purpose"]):
+            _fb = form_prefill_blockers(kv["session"])
+            if _fb:
+                print("⚠️ 没有建待批条子 —— 0 分、0 额度，因为流程没走完：")
+                for _x in _fb:
+                    print("   - %s" % _x)
+                print("   为什么拦在这儿：报价的根据应该是【客户在右栏看得见、可改的那张表】，"
+                      "不回填就没有那张表；这条命令是花钱前唯一必经的一步，绑在这里才不靠自觉。")
+                return 1
         # 🔴 这一步【只建待批，不给额度】。系统弹窗已废（实测没人点也会返回【是】= 假人证）。
         #    额度只能由"人看到报价之后"的一次核销拿到：DSH 审批卡点【允许一次】，或人在自己终端跑 consumed。
         p = create_spend_pending(cap, kv["purpose"], kv["account"], int(kv["count"]),
