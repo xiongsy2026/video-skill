@@ -1769,20 +1769,16 @@ def form_presence_view(sid):
     live = _form_payload_live(_form_payloads(), str(sid or "")) or {}
     pre = _form_prefill_live(_form_prefills(), str(sid or ""), hit["skill"]) or {}
     submitted = bool(live.get("params"))
-    # 🔴 2026-10-10 用户拍的弹出时机：登记意图只是【必要条件】，不是充分条件。
-    #    空表一弹，等于把"哪个是原片、哪个是产品图"的归类工作推回给客户 —— 那是 agent 的活。
-    #    所以：agent 分析完并回填（哪怕没东西可填也要 `prefill --set '{}'` 声明一句）才弹。
-    surfaced = bool(pre) or submitted
-    if not surfaced:
-        # `has_input` 仍为真 ⇒ 判定口的排他规则照常把这条线的引擎页按住，
-        #    不会因为"暂时不弹"就把旧引擎台放回来（这是这次改动最容易踩的坑）。
-        return {"intent": False, "has_input": True, "up": True, "alive": True,
-                "reason": "await-prefill", "skill": hit["skill"], "intent_skill": intent,
-                "task": str(rec.get("task") or ""),
-                "next": "agent 还没回填这张表 ⇒ 先分析素材，再跑 intent.py prefill --set …（没东西可填也要跑一次）"}
+    # 🔴 2026-10-11 用户改判：弹表条件 = 【登记了意图 + 这条线配了字段表】，回填不再是前置。
+    #    10-10 那版把"agent 回填过"当弹表条件，代价是现网实测【点完 skill 到看见表空窗 38 分钟】
+    #    （20:18 登记 → 20:56 才出表），中间客户什么都不知道、也催不动。
+    #    压力没有取消，只是【换了位置】：回填仍是"报价/建批准条子"的硬前置
+    #    （gateway.form_prefill_blockers，2026-10-11 已落 + 闸 F 组）⇒ 空表可以弹，但空表换不来一次扣费。
+    #    保留 prefilled 这个字段：页面与判定口都要能说出"agent 还没看过素材"，不许静默。
+    surfaced = True
     return {"intent": True, "has_input": True, "up": True, "alive": True, "source": "explicit",
             "skill": hit["skill"], "intent_skill": intent, "task": str(rec.get("task") or ""),
-            "surfaced": True, "submitted": submitted,
+            "surfaced": True, "submitted": submitted, "prefilled": bool(pre),
             # 已提交但还没被插件叫醒 ⇒ 页面可以显示"参数已收到，正在开始跑"。
             # 🔴 这只是显示用的【状态】，不是第二份判据：要不要叫醒只由 form_wake_queue 那一份算。
             "wake_pending": bool((live.get("wake") or {}).get("pending")),

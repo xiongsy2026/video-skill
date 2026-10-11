@@ -619,6 +619,13 @@ function poll(){
     //    以前看不出来（只有 skill · task）。"我点了提交啊"查不到现场时，第一个要问的就是这个。
     document.getElementById("skill").textContent = j.skill + (j.task ? " · " + j.task : "")
       + " · 会话 " + String(SID).replace(/^session-/, "").slice(0, 8);
+    /* 2026-10-11 改判：表【登记完就弹】，不再等 agent 回填 —— 现网实测那段空窗是 38 分钟，
+       客户对着右栏什么也看不见，也不知道 agent 卡在哪。但空表不能长得像"没人管"：
+       agent 还没看过素材时这一行要明说，客户才分得清"是我先填"还是"等它填完我再改"。
+       （回填仍然是报价/建批准条子的硬前置 —— 压力没取消，只是不再拿它为难客户。） */
+    var subEl = document.getElementById("sub");
+    if (subEl) subEl.textContent = (!j.prefilled && !j.submitted)
+      ? "agent 还没分析这批素材 —— 你可以直接填，也可以等它回填之后再改（回填会进同样的格子）。" : "";
     aiDefaults = j.defaults || {}; notes = j.prefill_notes || {};
     // 🔴 回填要真的灌进输入框，不能只让按钮变黄 —— 只变黄 = 客户看不见我们替他填了什么。
     //    但【客户动过任何一个字段之后就不再覆盖】：回填是建议不是命令，也不许吃掉他刚打的字。
