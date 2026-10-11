@@ -3339,6 +3339,80 @@ def refund_spend_approval(grant_id, count: int = 1, credits: int = 0) -> dict:
     return {"refunded": grant_id}
 
 
+# ── 花钱那一刀认合同回执（2026-10-11 现网 session-241ea3f7 08:23 复盘）────────────────
+# 那条会话绕过 runner 自己 `from backend import gateway` 调引擎，盘上没有 .skill_receipt.json，
+# 而网关【只认批准条子】⇒ 合同对"花钱"这件事从来没有约束力：绕开入口 = 照样能扣费。
+# 已核实 `verify_or_raise` 全仓只有 `super_clone_wan3.py` 一处调 ⇒ 判据绑在最重的入口上，
+# 便宜的路一直开着。这条把它下移到唯一咽喉（所有 wan3 腿都经 gateway.invoke）。
+CONTRACT_RECEIPT_WALK = 6          # 从成片落点往上找几层（回执写在段目录，也可能写在任务根）
+
+
+def receipt_dirs(params: dict) -> list:
+    """【片子要写进哪个目录，那个目录（或它的父目录）里就必须有一份合格回执】。
+    🔴 不拿会话号找回执 —— 8090 那种常驻进程里没有 DSH_SESSION_ID，按会话找会直接漏掉它，
+       而那恰恰是"绕开入口"最常待的地方。落点是调用方自己给的，赖不掉。"""
+    out = str((params or {}).get("output_path") or "").strip()
+    if not out:
+        return []
+    d = _os.path.dirname(_os.path.abspath(out))
+    dirs = []
+    for _ in range(CONTRACT_RECEIPT_WALK):
+        if not d or d in dirs:
+            break
+        dirs.append(d)
+        parent = _os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return dirs
+
+
+def spend_contract_problems(capability: str, purpose: str, params: dict | None = None) -> list:
+    """返回【问题清单】，空表 = 放行。
+    · 只断提交，不断查询/捞回（带 job_id 的那条是去取回已提交的任务，重投=双花）。
+    · 这条腿若不属于任何【声明了 spend 的合同档】⇒ 不在射程，明说不假装管得住。
+    · 合同模块/反查本身出错 ⇒ 按不合格处理（判据读不到 ≠ 放行）。"""
+    params = params or {}
+    if str(params.get("job_id") or "").strip():
+        return []
+    try:
+        from backend import skill_contract as _sc
+    except Exception as e:                                   # noqa: BLE001
+        return ["合同模块读不到（%s: %s）⇒ 无法核验回执，按不合格处理"
+                % (type(e).__name__, str(e)[:120])]
+    try:
+        lane = _sc.skill_for_spend(capability, purpose)
+    except Exception as e:                                   # noqa: BLE001
+        return ["反查『这条花钱腿属于哪档合同』时出错（%s）⇒ 按不合格处理" % type(e).__name__]
+    if not lane:
+        return []
+    dirs = receipt_dirs(params)
+    if not dirs:
+        return ["这条腿属于合同档 %s（spend=%s/%s），但参数里没有 output_path ⇒ 不知道去哪儿核验回执。"
+                "成片落点都不给，等于产物无处可查，拒绝提交（0 消耗、不动批准额度）"
+                % (lane, capability, purpose)]
+    for d in dirs:
+        rec = _sc.load_receipt(d)
+        if not rec:
+            continue
+        problems = _sc.check_receipt(lane, rec, inputs=())   # 指纹由管线自己核（它才知道输入清单）
+        if not problems:
+            return []
+        return ["目录 %s 里的回执不合格：%s" % (d, "；".join(str(p) for p in problems)[:300])]
+    return ["从 %s 往上 %d 层里都没有 %s ⇒ 这条成片不是从 %s 声明的入口跑出来的。"
+            "要出片请跑该档 runner（它会在提交前写回执），而不是自己拼一次调用"
+            % (dirs[0], CONTRACT_RECEIPT_WALK, _sc.RECEIPT_NAME, lane)]
+
+
+def skill_contract_lane_or_empty(capability: str, purpose: str) -> str:
+    """信封里那一格只报事实：这条腿对应哪档合同，查不到就空着（不猜一个档名上去）。"""
+    try:
+        from backend import skill_contract as _sc
+        return _sc.skill_for_spend(capability, purpose) or ""
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def invoke(capability: str, purpose: str | None = None, account: str = "local",
            params: dict | None = None) -> dict:
     """skill 经 tool-jobs 调的总入口：resolve→估价→precheck/preauth→call→commit/rollback→信封。
@@ -3347,6 +3421,16 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
     account = account or "local"
     r = resolve(capability, purpose)
     est = meter(capability, r["purpose"], params)["credits_estimate"]
+    # 🔴 合同回执判在【批准之前】：反过来的话，一次"没有回执"的调用会先把人批下来的段数吃掉
+    #    再报失败 —— 那是拿别人的授权替自己的绕道买单（2026-10-10 已有会话这样吃空过别人的额度）。
+    _cp = spend_contract_problems(capability, r["purpose"], params)
+    if _cp:
+        return {"ok": False, "capability": capability, "purpose": r["purpose"], "result": None,
+                "credits": {"estimated": est, "charged": 0,
+                            "balance_after": ledger().balance(account)},
+                "error": ("skill_contract（花钱那一刀认回执）：%s" % "；".join(_cp))[:700],
+                "contract": {"problems": _cp, "lane": skill_contract_lane_or_empty(capability,
+                                                                                   r["purpose"])}}
     # 🔴 花钱批准闸钉在**预扣之前**（顺序错了就等于"先扣了再问"）：生成视频相关的能力，
     #    没有覆盖本次请求的人批准条子 ⇒ 直接回 approval_required，不建 hold、不发 HTTP。
     #    唯一例外 = SPEND_APPROVAL_AT_SOURCE 里那些"花钱在别的进程"的腿：条子由那一端消费，这里不重复扣。
