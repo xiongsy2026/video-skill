@@ -1810,6 +1810,12 @@ class H(BaseHTTPRequestHandler):
     # 206/Range 是 HTTP/1.1 的特性，1.0 下浏览器把视频当整段下载 ⇒ 播得了、拖不动。
     # 切 1.1 的前提是全部分支都带 Content-Length（本类只有 _send/_send_file 两处写口，都带）。
     protocol_version = "HTTP/1.1"
+    # 🔴 keep-alive 必须有空闲超时。HTTP/1.1 下每条连接会一直挂在 handle() 里等下一个请求
+    #    （BaseHTTPRequestHandler.timeout 默认 None = 永不超时），右栏插件 5 秒一轮 + 表单页 8 秒一轮
+    #    ⇒ 连接只增不减。2026-10-11 现网就是这么攒到 21 条、accept 积压打满，新连接直接
+    #    【连接被拒】—— 端口还 LISTENING、进程还在，但整个 8100 不再答话（表单页与批准页同时死）。
+    #    20 秒比任何一轮轮询都长、比一次人工操作短；只掐空闲连接，正在传的不受影响。
+    timeout = 20
 
     def _send(self, code, body, ctype="application/json", cors=False):
         b = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -2270,7 +2276,17 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("MODEL_ADMIN_PORT", "8100"))
-    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    except OSError as e:
+        # 🔴 端口被占 ⇒ 立刻退非 0，绝不留一个"活着但没在服务"的进程。
+        #    2026-10-11 现网同时挂着两份 model_admin（一份抢到 8100、一份一个端口都没有），
+        #    看门狗与人都只看得见端口那份，另一份成了查不出来的僵尸。
+        sys.stderr.write("bind 127.0.0.1:%d failed: %s: %s ⇒ 已有实例在跑，本进程退出\n"
+                         % (port, type(e).__name__, e))
+        sys.stderr.flush()
+        sys.exit(3)
+
     try:
         n = hypit_bridge.reconcile_orphans()   # 别让上个进程留下的 job 永远挂着 running（hypit 会一直等）
         held = hypit_bridge.holds_pending()

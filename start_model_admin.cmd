@@ -1,9 +1,14 @@
 @echo off
-rem Weeksir model_admin launcher (no console window). ASCII + CRLF only.
-rem Guard = HTTP probe, NOT netstat: a wedged server keeps the port LISTENING, so
-rem "port open" can let the watchdog report success while nothing actually answers.
-curl.exe -fs -m 3 -o nul http://127.0.0.1:8100/api/model/caps && exit /b 0
+rem Weeksir 8100 watchdog tick (hidden: run_hidden.vbs wraps this; task = WeeksirModelAdmin).
+rem ONE line on purpose. The whole rule (probe -> kill the wedged holder -> start -> re-verify)
+rem lives in svc_8100_guard.py and is pinned by C:\dsh\scripts\check-svc-8100.py.
+rem Two earlier shapes failed in the field on 2026-10-11:
+rem   * "curl probe && exit 0" then start  -> a wedged-but-LISTENING server made it start a
+rem     second instance that could never bind (a zombie with no port at all).
+rem   * "guard sweep" + "start" on two lines -> line 2 waited for line 1; a stuck sweep meant
+rem     8100 simply never came back.
+rem The guard must also never call "schtasks /run": this file IS the task action, so that is
+rem self-recursion and it kills whatever it just brought up.
 cd /d "D:\video-skill"
-rem stderr goes to a log: pythonw has no console, so a real crash used to leave zero evidence
-rem (that is why "8100 keeps crashing" could not be confirmed or denied on 2026-10-02).
-".venv\Scripts\pythonw.exe" "backend\model_admin.py" 2>>"D:\video-skill\_svc_8100.err.log"
+".venv\Scripts\pythonw.exe" "svc_8100_guard.py" ensure 2>>"D:\video-skill\_svc_8100.err.log"
+exit /b %ERRORLEVEL%

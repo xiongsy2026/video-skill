@@ -139,6 +139,10 @@ padding:5px 0;border-bottom:1px solid var(--line)}
 var QS = new URLSearchParams(location.search), SID = QS.get("session") || "";
 var API = "/api/skills/form";        // 同源相对路径：页面由 8100 自己发，绝不跨口（端口收敛的根据）
 var gate = null, vals = {}, files = {}, aiDefaults = {}, busy = false, sent = false, notes = {};
+/* 🔴 editing = 人从【已提交摘要卡】点了「改参数」回来。它是"别再拿 done 覆盖这张表"的旗子：
+   服务端 submitted 一直是 true（载荷在那儿摆着），轮询每 8 秒就会把整页换回只读卡 ——
+   没有这面旗，客户点【改参数】等于什么都不会发生（2026-10-11 现网那句"ai 帮我选了我没法选"）。 */
+var editing = false;
 /* 🔴 客户一旦动过任何一格，就不再拿回填覆盖他（回填是建议，不是命令）。
    touched 只记"人改过的 key"；vals 里来自回填的 key 不算。 */
 var touched = {}, lastPrefill = "";
@@ -521,7 +525,7 @@ function submit(){
     busy = false;
     if (!j || !j.ok){ hint((j && j.error) || "提交失败（8100 没接受）", "bad");
                       reportAttempt([], (j && j.error) || "8100 没接受"); paint(); return; }
-    sent = true; showDone(j.params || {}); paint();
+    sent = true; editing = false; showDone(j.params || {}); paint();
   }).catch(function(e){ busy = false; hint("提交失败：" + ((e && e.message) || e), "bad");
                         reportAttempt([], "fetch/解析失败：" + ((e && e.message) || e)); paint(); });
 }
@@ -536,16 +540,54 @@ function showDone(params){
     card.appendChild(h("div", {class:"row"}, ));
     var row = card.lastChild;
     row.appendChild(h("span", {class:"k", text:(labelOf(k))}));
-    row.appendChild(h("span", {text:Array.isArray(v) ? (v.length + " 个文件") : String(v)}));
+    var f = fieldOf(k);
+    var shown = (!Array.isArray(v) && f && isMedia(f) && v)
+      ? String(v).split(/[\/\\]/).pop() : displayValue(k, v);
+    row.appendChild(h("span", {text:shown}));
   });
+  /* 🔴 这里原来只有一句"要改就回这一栏重新提交一次"，而那一栏已经被本函数 innerHTML="" 清空、
+     提交条也 display:none 了 —— 文案指的路代码里不存在，客户只能干看着。改成真的按钮：
+     点它 = 退出只读卡、把已交的非素材值灌回格子、恢复提交条（素材格由 default_files 自己长回来）。 */
+  var back = h("div", {class:"chip", text:"改参数 · 改完重新提交一次", style:"margin-top:12px",
+    title:"改完点【提交给 agent 分析】；这一版交上去之前，agent 用的还是下面这份参数。",
+    onclick:function(){
+      editing = true; sent = false;
+      Object.keys(params).forEach(function(k){
+        var f = fieldOf(k);
+        if (Array.isArray(params[k]) || (f && isMedia(f))) return;   // 素材走 default_files，别把路径当文本塞进去
+        vals[k] = String(params[k]);
+      });
+      render(); paint();
+      hint("已放开编辑：改完点下面的【提交给 agent 分析】。", "");
+    }});
+  card.appendChild(back);
   card.appendChild(h("p", {class:"sub", style:"margin:12px 0 0",
-    text:"要改就回这一栏重新提交一次；生视频那一下仍要在批准页点一次，我才开始扣费跑。"}));
+    text:"生视频那一下仍要在批准页点一次，我才开始扣费跑。"}));
   host.innerHTML = ""; host.appendChild(card);
   document.getElementById("bar").style.display = "none";
 }
 function labelOf(param){ var hit = null;
   (gate.fields || []).forEach(function(f){ if (f.param === param) hit = f.label; });
   return hit || param; }
+
+function fieldOf(k){ var hit = null;
+  ((gate && gate.fields) || []).forEach(function(f){ if (f.key === k || f.param === k) hit = f; });
+  return hit; }
+
+/* 🔴 摘要卡上印的必须是【人话】。服务端回的是引擎值（preserve_original / adaptive），
+   直接 String(v) 印出来，客户看到的就是一行 token —— 读不懂，还更像"这格被锁死了"。
+   select 走 matchOption→optLabel：显示「原声保留（preserve_original）」，值也留着，便于和 agent 对口令。
+   对不上选项就【原样印】，不猜一个中文上去（猜错的中文比英文 token 更坑）。 */
+function displayValue(k, v){
+  if (Array.isArray(v)) return v.length + " 个文件";
+  var f = fieldOf(k);
+  if (f && f.type === "select"){
+    var op = matchOption(f, v);
+    if (op){ var code = String(op).split(" ")[0], lab = optLabel(op);
+             return lab === code ? String(v) : lab + "（" + code + "）"; }
+  }
+  return String(v);
+}
 
 function boot(){
   document.getElementById("go").addEventListener("click", submit);
@@ -570,7 +612,7 @@ function poll(){
     document.getElementById("empty").style.display = "none";
     var fieldsChanged = !gate || gate.skill !== j.skill || JSON.stringify(gate.fields) !== JSON.stringify(j.fields);
     if (fieldsChanged){                       // 换技能 = 整张表重来（残留上一线的值最坑人）
-      vals = {}; files = {}; touched = {}; sent = false; lastPrefill = "";
+      vals = {}; files = {}; touched = {}; sent = false; editing = false; lastPrefill = "";
     }
     gate = j;
     // 🔴 页头要带会话尾号：这台机器多会话并发、任务名还可能重名，客户点的到底是哪条会话的表
@@ -588,7 +630,7 @@ function poll(){
         render();
       } else { drawAll(); paint(); return; }
     }
-    if (j.submitted){ sent = true; showDone(j.params || {}); paint(); return; }
+    if (j.submitted && !(editing || userDirty())){ sent = true; showDone(j.params || {}); paint(); return; }
     paint();
   }).catch(function(){
     gate = null;
