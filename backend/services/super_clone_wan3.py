@@ -117,6 +117,43 @@ def _llm_stamp(client, model: str) -> dict:
     return {"model": str(model or "")[:60], "provider": host or "未知", "ledger": "off"}
 
 
+def _lane_cell(capability: str, purpose: str = "") -> str:
+    """现读这条【网关账本内】的腿会用哪个模型，拼成回执「模型/路由」那一格。
+
+    🔴 只取 resolve() 的 model / provider 两个键 —— 那一份里带 api_key，整份绝不外传、绝不打印。
+    取不到 ⇒ 回空串 ⇒ skill_contract.tick() 拒绝打钩 ⇒ 花钱那一刀之前拒。
+    为什么宁可拒也不兜一个默认型号：这一格是"哪个模型跑的"的唯一出处，编一个比空着更坏。
+    """
+    from backend import gateway as _gw
+    try:
+        r = _gw.resolve(capability, purpose or None)
+    except Exception:                                          # noqa: BLE001
+        return ""
+    return "%s@%s · 网关账本内" % (str(r.get("model") or "(默认)")[:60],
+                                   str(r.get("provider") or "?"))
+
+
+def _mimo_cell() -> str:
+    """Step1 分镜那条腿的模型名 —— 从真函数的签名里读【这次实际会用的默认值】，不抄散文。
+
+    ⚠️ `账本外·直连厂商` 是如实标注：pipeline.step1_mimo_parse 自己拼 HTTP，不经 gateway.invoke
+       （BOUNDARY 整文件保护：只调不改；把它接进网关是待办）。
+    """
+    import inspect as _in
+    import urllib.parse as _up
+    try:
+        from pipeline.step1_mimo_parse import run as _mimo_run
+        p = _in.signature(_mimo_run).parameters.get("model")
+        mdl = "" if p is None or p.default is _in.Parameter.empty else str(p.default)
+    except Exception:                                          # noqa: BLE001
+        mdl = ""
+    if not mdl.strip():
+        return ""
+    raw = str(getattr(settings, "MIMO_BASE_URL", "") or "")
+    host = (_up.urlsplit(raw).netloc or raw).replace("https://", "").replace("http://", "")[:60]
+    return "%s@%s · 账本外·直连厂商" % (mdl[:60], host or "未知")
+
+
 # ── ffprobe 工具（本地副本，避免跨模块依赖）──
 def _ffprobe_duration(video_path: str) -> Optional[float]:
     """用 ffprobe 探测视频时长（秒）。"""
@@ -3012,6 +3049,18 @@ async def step2_wan3_execute(
     _dump_path = Path(output_dir) / "_wan3_request.json"
     _dump_path.write_text(json.dumps(_wan3_request_dump, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"✓ Wan3.0 请求参数已 dump → {_dump_path}")
+    # 🔴 提交腿自己打钩（2026-10-12 用户口径"每一次进行打钩，有模型名"）：
+    #    模型名现读网关这条 lane（表单锁定 ↔ 合同 spend ↔ ROUTES 三方同源，由单一源闸钉）。
+    #    打不上钩不影响这次提交 —— 它只让交付表少一格，绝不是"钱已经花了却查不到哪个模型跑的"。
+    try:
+        from backend import skill_contract as _skc2
+        _r2 = _skc2.tick("super-clone", str(output_dir), "submit-package",
+                         evidence=str(_dump_path), model=_lane_cell("video.generate", "wan3-prime"),
+                         impl="gateway:invoke:video.generate/wan3-prime")
+        if not _r2.get("ok"):
+            log("⚠️ 回执 submit-package 没打上钩：%s" % _r2.get("error"))
+    except Exception as _te:                                  # noqa: BLE001
+        log("⚠️ 回执 submit-package 打钩异常（不影响这次提交，交付表会缺一格）：%s" % _te)
 
     def _progress(phase: str, elapsed: int, msg: str) -> None:
         if on_progress:
@@ -3326,12 +3375,41 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
        既不写 prompt.txt、也不写回执、更不核验，直奔提交。用户问"回执呢、提示词呢"，
        真相是那个运行形状物理上就没有这两样（2026-10-10 实测），不是"没展示"。
        两条路现在共用同一个写者，一处定义。
+
+    🔴 回执是【打钩单】不是结尾总结（2026-10-12 用户定："回执的写法是每一次进行打钩，有模型名"）：
+       开工先 open_receipt() 落一张全 ⬜ 的表，之后每落一件物证当场 tick() 一格，
+       每一格都带【现读的模型名】（网关腿 _lane_cell / MiMo 腿 _mimo_cell / 编译器 _llm_stamp；
+       不经模型的本地步写 skill_contract.NO_MODEL）。
+       ⇒ 中途崩了看得见打到第几格；打不上钩的那一格要么补上、要么必需步缺失 ⇒ 花钱那一刀拒。
     """
     from backend import skill_contract as _skc
     seg_dir = Path(seg_dir)
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    def _l(msg: str) -> None:
+        if log:
+            log(msg)
+
+    def _tk(step_id: str, evidence, model: str, impl: str = "") -> None:
+        """做完一步就打一个钩；打不上必须出声（原样把 tick 的原因打出来，不许吞）。"""
+        r = _skc.tick("super-clone", str(seg_dir), step_id, evidence=evidence, model=model, impl=impl)
+        if not r.get("ok"):
+            _l("⚠️ 回执这一格【没打上钩】：%s" % r.get("error"))
+        elif r.get("error"):
+            _l("⚠️ 这一格打钩了但没写进盘：%s" % r.get("error"))
+
+    # 🔴 模型名现读，三家一次读齐（不写死、不凭记忆）：看图腿 / Step1 分镜腿 / 编译器腿
+    _cell_analyze = _lane_cell("video.analyze")
+    _cell_mimo = _mimo_cell()
+    # 开工即落骨架（含输入指纹）。素材没看过而 raise 时，盘上留下的就是这张【全 ⬜ 的打钩单】——
+    # 它不是"脏盘"，正是用户要的东西：一眼看出这次跑到第几步、卡在哪一格。
+    _skc.set_ctx("super-clone", str(seg_dir))
+    _skc.open_receipt("super-clone", str(seg_dir),
+                      inputs=[str(ref_video)] + [str(x) for x in (seg_product_paths or [])])
     # 🔴 素材必须【真看过】（2026-10-10 用户裁定：提交前 agent 要分析所有素材做意图匹配）。
     #    判据不认 agent 自述、只认网关台账：每条 video.analyze 跑完由网关自己记账，
-    #    这里按内容 sha8 对账 ⇒ 没看过就提交不出去。放在写任何物证之前 ⇒ 拒的时候盘上是干净的。
+    #    这里按内容 sha8 对账 ⇒ 没看过就提交不出去。放在写任何【物证】之前 ⇒ 拒的时候盘上只剩
+    #    那张全 ⬜ 的打钩单（open_receipt 落的骨架），一格假钩都没有。
     from backend import gateway as _gw
     _sid = _gw._session_of({})
     _mats = [str(x) for x in (seg_product_paths or []) if str(x or "").strip()]
@@ -3364,8 +3442,8 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             + ("｜熔断在 %d 分（SUPER_CLONE_ANALYZE_CAP 可调），不是闸坏了" % MATERIAL_ANALYZE_CREDIT_CAP
                if _spent >= MATERIAL_ANALYZE_CREDIT_CAP else
                "｜多半是这条腿本身跑不通（看 material_analysis.json 的 auto_ran 里的 error）"))
-    seg_dir.mkdir(parents=True, exist_ok=True)
-    (seg_dir / "material_analysis.json").write_text(json.dumps({
+    _ma = seg_dir / "material_analysis.json"
+    _ma.write_text(json.dumps({
         "session": _sid or "未知",
         "materials": [_gw.file_identity(p) for p in _mats],
         "missing": _missing,
@@ -3373,25 +3451,35 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
         # 🔴 谁跑的、花了多少：交付表与报价都读这一份，不靠 agent 自述
         "executor": "pipeline:invoke:video.analyze",   # 与合同 手段= 同一个 token：交付表与合同对得上
         "auto_ran": _auto, "auto_spent": _spent,
+        # 这一格的模型名从【这条腿现在的路由】现读；台账行只记 sha8 不记型号（要改网关那份才行）
+        "model_cell": _cell_analyze,
         "credit_cap": MATERIAL_ANALYZE_CREDIT_CAP,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
+    _tk("material-analysis", str(_ma), _cell_analyze, impl="pipeline:invoke:video.analyze")
 
-    def _l(msg: str) -> None:
-        if log:
-            log(msg)
-
-    (seg_dir / "prompt.txt").write_text(seg_prompt, encoding="utf-8")
-    sb = seg_dir / "storyboard.json"
-    sb.write_text(json.dumps(seg_board, ensure_ascii=False, indent=2), encoding="utf-8")
     cs = compiled_seg or {}
     mdl, prov, led = str(cs.get("model") or ""), str(cs.get("provider") or ""), str(cs.get("ledger") or "off")
-    (seg_dir / "prompt_meta.json").write_text(json.dumps({
+    cell = ("%s@%s · %s" % (mdl or "?", prov or "?",
+                           "网关账本内" if led == "on" else "账本外·直连厂商")) if mdl else ""
+
+    _pt = seg_dir / "prompt.txt"
+    _pt.write_text(seg_prompt, encoding="utf-8")
+    _tk("compile-prompt", str(_pt), cell)
+    _tk("negative-lock", str(_pt), cell, impl="compiler-negative-lock")
+
+    sb = seg_dir / "storyboard.json"
+    sb.write_text(json.dumps(seg_board, ensure_ascii=False, indent=2), encoding="utf-8")
+    _tk("storyboard", str(sb), _cell_mimo)
+
+    _pm = seg_dir / "prompt_meta.json"
+    _pm.write_text(json.dumps({
         "source": str(cs.get("source") or ""),
         # 🔴 模型身份单独记：source 只证明"走了编译器这个函数"，答不出"哪个模型跑的"
         "model": mdl, "provider": prov, "ledger": led,
         "storyboard_sha8": _skc.sha8(str(sb)),
         "prompt_chars": len(seg_prompt),
         "target_duration": float(seg_duration)}, ensure_ascii=False, indent=1), encoding="utf-8")
+    _tk("compile-bound", str(_pm), cell)
 
     # 🔴 storyboard-fact-check（2026-10-11 补的合同步）：MiMo 的分镜表是【上游解析结果】，不是事实本身
     #    （现网：5.1s 单镜头被解析成 2 镜，还标了"硬切 + 换装"）。SKILL.md 早就要求"标签不符就按秒写死
@@ -3415,6 +3503,7 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
         "note_sha8": (_skc.sha8(str(npath)) if _note else ""),
         "storyboard_sha8": _skc.sha8(str(sb)),
     }, ensure_ascii=False, indent=1), encoding="utf-8")
+    _tk("storyboard-fact-check", str(sc), _skc.NO_MODEL, impl="runner:--extra-note")
 
     fit = Path(source_fit) if source_fit else None
     if fit is None or not fit.exists():
@@ -3422,30 +3511,12 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             if (seg_dir / cand).exists():
                 fit = seg_dir / cand
                 break
-    cell = ("%s@%s · %s" % (mdl or "?", prov or "?",
-                           "网关账本内" if led == "on" else "账本外·直连厂商")) if mdl else ""
-    _skc.set_ctx("super-clone", str(seg_dir))
-    try:
-        _skc.write_receipt(
-            "super-clone", str(seg_dir),
-            steps={"material-analysis": str(seg_dir / "material_analysis.json"),
-                   "compile-prompt": str(seg_dir / "prompt.txt"),
-                   "storyboard": str(sb),
-                   "storyboard-fact-check": str(sc),
-                   "compile-bound": str(seg_dir / "prompt_meta.json"),
-                   "negative-lock": str(seg_dir / "prompt.txt"),
-                   "source-fit": (str(fit) if fit and fit.exists() else None),
-                   "reference-clean": (str(seg_dir / "product_absent.jpg")
-                                       if (seg_dir / "product_absent.jpg").exists() else None)},
-            inputs=[str(ref_video)] + [str(x) for x in seg_product_paths],
-            # 手段申报进【回执行】：合同给某步写死了 `手段=` 白名单，不在名单里或根本没申报 ⇒ check_receipt 拒。
-            # （原来这行没写，impl 被错传给了 verify_or_raise —— 那个函数没这个参数，直接 TypeError。）
-            impl={"negative-lock": "compiler-negative-lock",
-                  "material-analysis": "pipeline:invoke:video.analyze",
-                  "storyboard-fact-check": "runner:--extra-note"},
-            models={"compile-prompt": cell, "compile-bound": cell})
-    except Exception as _re:                              # noqa: BLE001
-        _l("⚠️ 回执写入失败（下一步核验会因此拒绝提交，不是上游问题）：%s" % _re)
+    if fit is not None and fit.exists():
+        _tk("source-fit", str(fit), _skc.NO_MODEL)
+    _pa = seg_dir / "product_absent.jpg"
+    if _pa.exists():
+        _tk("reference-clean", str(_pa), _skc.NO_MODEL)
+
     # 🔴 花钱那一刀之前：无回执 / 合同版本不符 / 输入指纹变了 ⇒ 抛，不提交、0 分。
     #    只断提交，不断查询与捞回 —— 已提交的任务照旧能用 taskId 取回（重投=双花）。
     #    ⚠️ 这里原来还多传了一个 `impl=` —— `verify_or_raise` 没有这个参数 ⇒ 【每次多段复刻都在这行

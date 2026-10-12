@@ -4,7 +4,8 @@
 设计见 C:\\dsh\\docs\\ADR-skill-contract.md。一句话：**绕开合同必须失败，且失败不了就必须现形。**
 
 三层共用这一份判据（谁都不许抄第二份）：
-  · 入口（run.py 等）跑完调 write_receipt() 落 productions/<task>/.skill_receipt.json
+  · 入口开工先调 open_receipt() 落一份全 ⬜ 骨架，之后【每做完一步当场 tick() 一个钩】
+    ⇒ productions/<task>/.skill_receipt.json 是从头长到尾的，中途崩了也看得见"打到第几格"
   · 花钱那一刀调 verify_or_raise()：无回执 / 版本不符 / 输入指纹对不上 ⇒ 抛，不提交
   · 交付（deliver_pack.py）调 summarize()：把缺步与偏离原样印进交付消息
 
@@ -272,50 +273,190 @@ def set_ctx(skill: str, task_dir: str, session: str = "") -> None:
                                       "session": session or ""}, ensure_ascii=False)
 
 
+NO_MODEL = "不用模型"          # 确实不经模型的步（本地 ffmpeg / 后端常量 / 纯对账）要明写这一句，不许留空
+
+
+def _me() -> str:
+    return os.environ.get("DSH_SESSION_ID") or str(ctx().get("session") or "")
+
+
+def _dump_receipt(rec: dict, task_dir: str) -> str:
+    """原子落盘 + 撞句柄重试 4 次。返回 ""=写成了，否则原因。
+
+    🔴 回执写失败【不许抛】：它是留痕，不是新故障点（同网关那条素材台账）。
+       但也不许静默 —— 原因原样回给调用方打印，人看得见"这一格没记上"。"""
+    p = os.path.join(task_dir, RECEIPT_NAME)
+    try:
+        os.makedirs(task_dir, exist_ok=True)
+    except Exception as exc:                                     # noqa: BLE001
+        return "目录建不出：%s: %s" % (type(exc).__name__, str(exc)[:100])
+    tmp = "%s.%d.tmp" % (p, os.getpid())                         # pid 进临时名：多段并发不许互相踩
+    last = ""
+    for _ in range(4):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, indent=1))
+            os.replace(tmp, p)
+            return ""
+        except Exception as exc:                                 # noqa: BLE001
+            last = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+            time.sleep(0.25)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return last
+
+
+def _skeleton(skill: str, task_dir: str, inputs=(), contract: dict | None = None) -> dict:
+    """内存里的【全 ⬜】骨架：合同声明的每一步都先在表上占一行，做一件打一件。"""
+    c = contract or contract_for(skill)
+    return {"kind": "skill_receipt", "skill": skill, "contract_version": c.get("version", ""),
+            "entry": c.get("entry", ""), "task_dir": os.path.abspath(task_dir),
+            "session": _me(), "ts": round(time.time(), 3),
+            "inputs": [{"path": os.path.abspath(x), "sha8": sha8(x)} for x in inputs if os.path.isfile(x)],
+            "steps": [{"id": st["id"], "ok": False, "required": st["required"], "impl": "", "model": "",
+                       "pred": st.get("pred") or "", "evidence": "", "evidence_sha8": "",
+                       "session": "", "ts": None} for st in c.get("steps", [])],
+            "deviations": []}
+
+
+def open_receipt(skill: str, task_dir: str, inputs=(), contract: dict | None = None) -> dict:
+    """开工第一行动它：落一份还没打钩的骨架 ⇒ 回执从【跑完才有】变成【一直在长】。
+
+    🔴 为什么要开工就落盘（2026-10-12 用户定"回执的写法是每一次进行打钩"）：原来只在提交前一次性写，
+       中途崩了盘上要么没文件、要么是上一次那份旧的 ⇒ "跑到第几步"没人答得出。
+    · 同一档同一合同版本已经开过 ⇒ 只补输入指纹，**不清钩**（重跑同一个段目录不该抹掉历史打钩）；
+    · 合同改过版 ⇒ 旧回执本来就不算数（check_receipt 按版本拒），这里重建骨架。
+    """
+    c = contract or contract_for(skill)
+    rec = load_receipt(task_dir)
+    if rec and rec.get("skill") == skill and rec.get("contract_version") == c.get("version"):
+        fresh = [{"path": os.path.abspath(x), "sha8": sha8(x)} for x in inputs if os.path.isfile(x)]
+        if fresh:
+            rec["inputs"] = fresh
+            _dump_receipt(rec, task_dir)
+        return rec
+    rec = _skeleton(skill, task_dir, inputs=inputs, contract=c)
+    _dump_receipt(rec, task_dir)
+    return rec
+
+
+def tick(skill: str, task_dir: str, step_id: str, evidence=None, model: str = "",
+         impl: str = "", contract: dict | None = None) -> dict:
+    """🔴 做完一步当场打一个钩。这一步做了 = 打钩；做不到 = 这一格还是 ⬜，交付时人看得见。
+
+    三条硬规矩（都是"缺一样就不算这一步"，不是提示）：
+      ① `step_id` 必须在合同 steps 里 ⇒ 合同外的一步打了钩等于伪造一张合格表；
+      ② `model` 必须给 ⇒ 用户要的正是"每一格都有模型名"。只许现读：网关腿 `gateway.lane_model()`，
+         账本外直连腿 `_llm_stamp()`，确实不经模型写 `NO_MODEL`；
+      ③ 物证要么是真存在的文件，要么显式 `True`（内联证据）⇒ 空字符串/不存在的路径不算。
+    返回 {"ok","row","error","written"}；**不抛**（留痕不许变成故障点），失败由调用方打印。
+    署名沿用：同一格物证与模型都没变 ⇒ 保留第一次的会话与时间（台账记事实，不是记最后碰文件的人）。"""
+    c = contract or contract_for(skill)
+    st = next((x for x in c.get("steps", []) if x.get("id") == step_id), None)
+    if st is None:
+        return {"ok": False, "error": "步 %r 不在合同（%s）的 steps 里 ⇒ 没打钩：合同外的一步打上钩，"
+                                      "等于替这条流程伪造一格合格状态" % (step_id, c.get("version") or "?")}
+    if (not evidence) or (isinstance(evidence, str) and not evidence.strip()):
+        why_model = "步 %s 没给物证 ⇒ 没打钩（合同要求：%s）" % (step_id, st.get("proof") or "无说明")
+    elif isinstance(evidence, str) and not os.path.isfile(evidence):
+        why_model = "步 %s 的物证文件不在（%s）⇒ 没打钩" % (step_id, evidence)
+    elif not str(model or "").strip():
+        why_model = ("步 %s 没给模型名 ⇒ 没打钩。这一格只许现读：网关腿用 gateway.lane_model"
+                     "(capability, purpose)，账本外直连腿用 _llm_stamp(client, model)；"
+                     "确实不经模型就写 %r" % (step_id, NO_MODEL))
+    else:
+        why_model = ""
+    rec = load_receipt(task_dir)
+    if not rec or rec.get("skill") != skill or rec.get("contract_version") != c.get("version"):
+        rec = open_receipt(skill, task_dir, contract=c)
+
+    def _clear(why: str) -> dict:
+        """🔴 打不上钩 ⇒ 这一格必须当场抹成 ⬜（连同上一次的物证/指纹/模型名）。
+
+        不清就是假钩：重跑同一段时编译器没报模型名，这一格却还挂着【上一次】的 ok=True
+        ⇒ 交付表说"这步做了"，而这一次它根本没被核验过。抹掉之后必需步缺失 ⇒ 花钱那一刀拒。"""
+        rr = load_receipt(task_dir) or _skeleton(skill, task_dir, contract=c)
+        for x in rr.get("steps", []):
+            if x.get("id") == step_id:
+                x.update({"ok": False, "evidence": "", "evidence_sha8": "", "model": "",
+                          "impl": "", "session": "", "ts": None, "why": why})
+        rr["session"] = _me()
+        rr["ts"] = round(time.time(), 3)
+        _dump_receipt(rr, task_dir)
+        return {"ok": False, "error": why, "cleared": True}
+
+    if why_model:
+        return _clear(why_model)
+    if isinstance(evidence, str) and evidence.strip():
+        cell, path = os.path.abspath(evidence), os.path.abspath(evidence)
+    else:
+        cell, path = "inline", None
+    row = next((r for r in rec.get("steps", []) if r.get("id") == step_id), None)
+    if row is None:                                    # 合同新加的一步在旧骨架里没有 ⇒ 补一行再打钩
+        row = {"id": step_id, "ok": False, "required": st["required"], "impl": "", "model": "",
+               "pred": st.get("pred") or "", "evidence": "", "evidence_sha8": "", "session": "", "ts": None}
+        rec["steps"].append(row)
+    sha = sha8(path) if path else ""
+    same = (bool(row.get("ok")) and row.get("evidence") == cell and row.get("evidence_sha8") == sha
+            and row.get("model") == str(model) and str(row.get("impl") or "") == str(impl or ""))
+    old_session, old_ts = str(row.get("session") or ""), row.get("ts")
+    row.pop("why", None)                               # 上一次打不上钩的原因，打上钩就作废
+    row.update({"ok": True, "required": st["required"], "pred": st.get("pred") or "",
+                "evidence": cell, "evidence_sha8": sha, "model": str(model),
+                "impl": str(impl or ""), "session": _me(), "ts": round(time.time(), 3)})
+    if same and old_session:
+        row["session"], row["ts"] = old_session, old_ts
+    rec["session"] = _me()          # 拿不到就留空 ⇒ 表里那一列明写"未知"，绝不拿上一份回执的头替这次署名
+    rec["ts"] = round(time.time(), 3)
+    why = _dump_receipt(rec, task_dir)
+    return {"ok": True, "row": row, "receipt": rec, "error": why, "written": not why}
+
+
+def note_deviation(task_dir: str, step_id: str, reason: str) -> dict:
+    """跳过某步要当场写明原因 —— 豁免不许静默（check_receipt 对没原因的偏离直接拒）。"""
+    rec = load_receipt(task_dir)
+    if not rec:
+        return {"ok": False, "error": "还没开工（没有回执）⇒ 偏离没处记：先调 open_receipt()"}
+    rs = str(reason or "").strip()
+    if not rs:
+        return {"ok": False, "error": "偏离 %s 没写原因 ⇒ 不许记（豁免必须看得见）" % step_id}
+    rec["deviations"] = [d for d in rec.get("deviations", [])
+                         if isinstance(d, dict) and d.get("step") != step_id]
+    rec["deviations"].append({"step": step_id, "reason": rs, "ts": round(time.time(), 3),
+                              "session": _me()})
+    why = _dump_receipt(rec, task_dir)
+    return {"ok": not why, "receipt": rec, "error": why}
+
+
 def write_receipt(skill: str, task_dir: str, steps: dict, inputs=(), deviations=(),
                   impl: dict | None = None, contract: dict | None = None,
                   models: dict | None = None) -> dict:
-    """入口专用：steps = {step_id: 证据路径或 True}；缺的步必须出现在 deviations 里并写原因。
-    models = {step_id: "模型名@provider · 账本外"} ⇒ 交付时答得出"这一步到底是哪个模型跑的"。
-    🔴 不填就明写"没记"，绝不回退成 source 字段那种"看起来像模型名"的函数标签。
+    """批量形状：open_receipt + 逐格 tick，**没有第二套打钩规则**。
+    steps = {step_id: 证据路径或 True}；models = {step_id: "模型名@provider · 账本内外"}。
 
-    🔴 逐行署名沿用【上一次回执】的：这一行没变（证据路径 + sha8 + 手段 + 合格状态 + 必需标记全同，
-       且合同版本没动）才算同一次做的。否则"甲会话做分镜、乙会话只重跑编译"会把整张表的会话栏刷成乙，
-       "每一步是谁做的"当场作废 —— 台账记的是事实，不是最后一个碰文件的人。"""
+    🔴 缺模型名的那一格现在【打不上钩】而不是"少填一列"：回执说了"这步做了"却答不出哪个模型跑的，
+       交付时人问"哪个模型跑的"仍然只能靠猜（2026-10-10 就是这一问）。
+    没打的格不是错误 —— 但必需步没打 ⇒ check_receipt 报"缺少步" ⇒ verify_or_raise 在花钱前拒。"""
     c = contract or contract_for(skill)
-    prev = load_receipt(task_dir)
-    prev_rows = {s.get("id"): s for s in prev.get("steps", []) if isinstance(s, dict)}
-    # 只有【同一档、同一合同版本】的上一份回执才许继承署名；合同改版 = 旧署名不再算数
-    inherit = bool(prev) and prev.get("skill") == skill and prev.get("contract_version") == c.get("version")
-    now = round(time.time(), 3)
-    me = os.environ.get("DSH_SESSION_ID") or str(ctx().get("session") or "")
-    rows = []
-    for st in c.get("steps", []):
-        ev = steps.get(st["id"])
-        path = ev if isinstance(ev, str) and os.path.isfile(ev) else (None if ev else None)
-        # 🔴 ok 的判据是"证据真的在"，不是"调用方给了个字符串"：以前传一个不存在的路径也会记 ok=True
-        #    ⇒ 回执说"这步做了"，文件却根本没有，核验只能靠 sha 那条恰好不为空才拦得住。
-        ok = bool(ev) and (not isinstance(ev, str) or path is not None)
-        row = {"id": st["id"], "ok": ok, "required": st["required"],
-               "impl": str((impl or {}).get(st["id"]) or ""),
-               "model": str((models or {}).get(st["id"]) or ""),
-               "pred": st.get("pred") or "",
-               "evidence": (os.path.abspath(ev) if path else (ev if isinstance(ev, str) else "inline")),
-               "evidence_sha8": sha8(path) if path else "", "session": me, "ts": now}
-        old = prev_rows.get(st["id"]) if inherit else None
-        if old and all(old.get(k) == row[k] for k in ("ok", "evidence", "evidence_sha8", "impl",
-                                                      "required", "model")):
-            row["session"] = str(old.get("session") or "") or me
-            row["ts"] = old.get("ts") or now
-        rows.append(row)
-    rec = {"kind": "skill_receipt", "skill": skill, "contract_version": c.get("version", ""),
-           "entry": c.get("entry", ""), "task_dir": os.path.abspath(task_dir),
-           "session": me, "ts": now,
-           "inputs": [{"path": os.path.abspath(x), "sha8": sha8(x)} for x in inputs if os.path.isfile(x)],
-           "steps": rows, "deviations": [d for d in deviations if isinstance(d, dict)]}
-    os.makedirs(task_dir, exist_ok=True)
-    with open(os.path.join(task_dir, RECEIPT_NAME), "w", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False, indent=1))
+    open_receipt(skill, task_dir, inputs=inputs, contract=c)
+    req = {st["id"]: bool(st["required"]) for st in c.get("steps", [])}
+    errs = []
+    for sid, ev in (steps or {}).items():
+        # 连"没给物证"也要走一遍 tick ⇒ 那一格被抹成 ⬜（不许留着上一次的旧钩当这次的合格状态）
+        r = tick(skill, task_dir, sid, evidence=ev, model=str((models or {}).get(sid) or ""),
+                 impl=str((impl or {}).get(sid) or ""), contract=c)
+        why = r.get("error") or ("" if r.get("ok") else "没打上钩")
+        if why and (not r.get("ok") or req.get(sid, True)):
+            errs.append("%s：%s" % (sid, why))
+    if deviations:
+        rec = load_receipt(task_dir)
+        rec["deviations"] = [d for d in deviations if isinstance(d, dict)]
+        _dump_receipt(rec, task_dir)
+    rec = load_receipt(task_dir)
+    if errs:
+        rec["tick_errors"] = errs
     return rec
 
 
@@ -363,6 +504,12 @@ def check_receipt(skill: str, receipt: dict, inputs=(), contract: dict | None = 
         elif got.get("evidence_sha8") and got.get("evidence") and os.path.isfile(got["evidence"]):
             if sha8(got["evidence"]) != got.get("evidence_sha8"):
                 bad.append("步 %s 的证据文件在回执之后被改过（sha8 不符）⇒ 手写替换过的嫌疑" % st["id"])
+        # 🔴 打了钩就必须有模型名（2026-10-12 用户口径："回执的写法是每一次进行打钩，有模型名"）。
+        #    tick() 已经把这条守在【打钩那一刻】；这里再钉一次，是因为回执是一个 JSON 文件 ——
+        #    手改出来的 ok=True + 空模型，和手写台账行伪造"我看过图了"是同一种形状（2026-10-12 现网真发生过）。
+        if got and got.get("ok") and not str(got.get("model") or "").strip():
+            bad.append("步 %s 打了钩却没记模型名 ⇒ 这一格不算数（现读 gateway.lane_model / "
+                       "_llm_stamp；确实不经模型就写 %r）" % (st["id"], NO_MODEL))
         # 🔴 内容判据：文件在、sha 没动，还不够 —— 还得是"真跑了那一步才会有的形状"
         _pred = (got or {}).get("pred") or st.get("pred") or ""
         if _pred and got and got.get("ok"):
@@ -441,33 +588,44 @@ def plan_table(skill: str) -> str:
 
 
 def who_table(receipt: dict) -> str:
-    """🔴 每次提交【那一刻】的执行表：这一步是谁做的、什么时候、用什么手段、物证与指纹。
+    """🔴 这张表就是【打钩单】：合同里每一步一行，做到哪打到哪，最后一列一眼看清 已打钩 / 没打钩。
+    用户 2026-10-12 定的写法："每一次进行打钩，有模型名" ⇒
+      · 每一行都带【模型/路由】：现读的模型名（`gateway.lane_model` / `_llm_stamp`），不经模型写「不用模型」；
+      · 没打钩的格子【照样在表上】并标 ⬜ —— 骨架是开工时落的，所以"跑到第几步"看得见，
+        而不是像以前那样：中途崩了盘上要么没文件、要么是上一次那份旧的。
     署名按【行】取（不是整表取回执头部那一个）—— 多会话接力时只有按行才看得出是谁改的哪一步。
     会话 id 取不到就明写"未知"，不许留空糊过去（留空 = 事后查不到责任人）。"""
     if not receipt:
         return "（没有回执 ⇒ 这次不是从声明的入口进来的，无表可出）"
     head = receipt.get("session") or "未知（DSH_SESSION_ID 没传进这个进程）"
-    rows = ["**流程执行表**（%s · 合同 %s · 本次写入会话 `%s` · %s）" % (
+    steps = [s for s in receipt.get("steps", []) if isinstance(s, dict)]
+    done = sum(1 for s in steps if s.get("ok"))
+    need = sum(1 for s in steps if s.get("required"))
+    done_need = sum(1 for s in steps if s.get("required") and s.get("ok"))
+    rows = ["**流程执行表**（%s · 合同 %s · 打钩 必需 %d/%d · 全部 %d/%d · 本次写入会话 `%s` · %s）" % (
         receipt.get("skill") or "?", receipt.get("contract_version") or "?",
-        head, _fmt_ts(receipt.get("ts"))),
+        done_need, need, done, len(steps), head, _fmt_ts(receipt.get("ts"))),
         "| 步 | 必需 | 谁做的（会话） | 时间 | 手段 | 模型/路由 | 物证 | 指纹 | 状态 |",
         "|---|---|---|---|---|---|---|---|---|"]
     fb_sid, fb_ts = (head.split("（")[0] or "未知"), _fmt_ts(receipt.get("ts"))
-    for s in receipt.get("steps", []):
+    for s in steps:
         ev = str(s.get("evidence") or "")
         rows.append("| `%s` | %s | %s | %s | %s | %s | `%s` | `%s` | %s |" % (
             s.get("id"), "✅" if s.get("required") else "—",
-            (str(s.get("session") or "") or fb_sid) if s.get("ok") else "—（这步没做）",
+            (str(s.get("session") or "") or "未知（这一格的写入者没传会话）") if s.get("ok") else "—（这步没做）",
             ((_fmt_ts(s.get("ts")) if s.get("ts") else fb_ts) if s.get("ok") else "—"),
             s.get("impl") or "—",
-            # 🔴 没记就明写"没记"：这一格留空或回退成 `step1_5_gpt_compiler` 那种函数标签，
-            #    会让人以为"模型是 GPT"——而它其实只证明走了哪个函数，不证明用的哪个模型。
-            ("`" + str(s.get("model")) + "`") if s.get("model") else "没记",
+            # 🔴 打钩了却没模型名 = 这一格不算数（check_receipt 直接拒）；没打钩的行不是"漏记模型"，
+            #    它压根还没发生 ⇒ 写"—（还没做）"，绝不拿 source 函数标签那种"看起来像模型名"的东西冒充。
+            ("`" + str(s.get("model")) + "`") if s.get("model") else
+            ("没记" if s.get("ok") else "—（还没做）"),
             os.path.basename(ev) if ev and ev != "inline" else ("内联" if ev == "inline" else "—"),
-            s.get("evidence_sha8") or "—", "✅" if s.get("ok") else "❌"))
+            s.get("evidence_sha8") or "—",
+            ("✅ 已打钩" if s.get("ok") else
+             "⬜ 没打钩（%s…）" % str(s.get("why"))[:56] if s.get("why") else "⬜ 没打钩")))
     for d in receipt.get("deviations", []):
         if isinstance(d, dict):
-            rows.append("| `%s` | ? | %s | %s | 跳过 | 没记 | — | — | ⚠️ %s |" % (
+            rows.append("| `%s` | ? | %s | %s | 跳过 | —（这步被跳过了） | — | — | ⚠️ %s |" % (
                 d.get("step"), fb_sid, fb_ts, d.get("reason") or "（没写原因）"))
     return "\n".join(rows)
 
