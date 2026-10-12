@@ -3742,9 +3742,17 @@ async def run_pipeline(
                 extra_compile_note=extra_compile_note,
                 extra_model_image_paths=extra_model_image_paths,
                 as_duration_chunk=True,
+                stop_after=stop_after,
                 background_override=background_override,
                 voice_audio_paths=voice_audio_paths,
             )
+            if chunk_result.get("compiled_only"):
+                # 🔴 档位必须一路传到底（2026-10-12 现网 super-clone-20261012-1824）：按长度切段的递归
+                #    以前不带 stop_after ⇒ `--stage compile` 的每一块照样走到提交那一刀，
+                #    只是当时没有批准条子才被网关拦回 approval_required —— 有条子就是真花 60 分/段。
+                #    这里早退，是因为下面那半句把"没有成片"判成"生成失败"。
+                return {"index": i, "win": win, "compiled_only": True,
+                        "fitted": None, "chunk_result": chunk_result}
             part = chunk_result.get("final_path") or chunk_result.get("local_path")
             if not part or not Path(str(part)).exists():
                 raise RuntimeError(f"第 {i}/{len(windows)} 段生成失败，无法拼接")
@@ -3779,6 +3787,22 @@ async def run_pipeline(
             raise RuntimeError("多段生成失败，无法拼接：" + "；".join(errors))
 
         ordered = sorted(chunk_outcomes, key=lambda item: item["index"])
+        if stop_after == "compile":
+            # 只编译档位的收口：没有 fitted.mp4、没有拼接、一条都没提交 ⇒ 0 分
+            _segs: List[Dict[str, Any]] = []
+            for item in ordered:
+                for s in (item["chunk_result"].get("segments") or []):
+                    _d = dict(s)
+                    _d["seg"] = item["index"]
+                    _segs.append(_d)
+            log("档位=只编译 ⇒ %d 段全部只走到【物证 + 回执 + 合同核验】，一条都没提交、0 分" % len(ordered))
+            return {
+                "compiled_only": True, "stop_after": "compile", "success": True,
+                "duration_status": "not_submitted", "segments": _segs,
+                "prompt": None, "storyboard": None, "media_manifest": media_manifest,
+                "task_id": None, "result_url": None, "local_path": None,
+                "final_path": None, "output_duration": None, "duration": None,
+            }
         part_paths: List[str] = []
         prompt_parts: List[str] = []
         merged_board: List[Dict[str, Any]] = []
