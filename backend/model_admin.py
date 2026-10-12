@@ -1554,6 +1554,58 @@ def wake_view() -> dict:
     return {"ok": True, "pending": sorted(items, key=lambda x: x["at"])}
 
 
+def task_obligations(task_dir: str) -> list:
+    """这条任务有没有【还没到终态的活】。判据只在这一份（宿主插件、闸、人都读它，不许各抄一遍）。
+
+    🔴 为什么要有这件事（2026-10-12 现网 session-5282eabf）：agent 把编译/提交起起来之后
+       就 `turn/end` 收工了 —— 而"后台那条命令跑完"不是表单提交/批准核销/编译跑完这三个事件源之一，
+       所以【没有任何东西会把它叫回来】。"必须盯到终态"写在 AGENTS.md 里只是散文。
+       这一份盘上事实就是给 `agent/turn-stopping` 用的：有活没干完 ⇒ 不许收工。
+    两条判据都按盘上算，不认任何人自述：
+      · compiling      —— 任务目录的 .compile.pid 还活着（8100 点火起的那台在跑）
+      · awaiting_video —— outputs/**/wan3_job.json 有任务号，但成片没落盘（已提交、结果还没到手）
+    """
+    import glob as _g
+    out = []
+    if not task_dir or not os.path.isdir(task_dir):
+        return out
+    pidf = os.path.join(task_dir, ".compile.pid")
+    if os.path.isfile(pidf):
+        try:
+            pid = int((io.open(pidf, encoding="utf-8").read() or "0").strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        if pid and _proc_alive(pid):
+            out.append({"kind": "compiling", "who": pid, "since": round(os.path.getmtime(pidf), 3),
+                        "where": os.path.join(task_dir, "compile.log")})
+    for p in _g.glob(os.path.join(task_dir, "outputs", "**", "wan3_job.json"), recursive=True):
+        try:
+            with io.open(p, encoding="utf-8") as f:
+                j = json.load(f) or {}
+        except (OSError, ValueError):
+            continue
+        tid = str(j.get("task_id") or "").strip()
+        dest = str(j.get("output_path") or "").strip()
+        if tid and dest and not os.path.isfile(dest):
+            out.append({"kind": "awaiting_video", "who": tid, "dest": dest,
+                        "since": round(os.path.getmtime(p), 3)})
+    return out
+
+
+def obligation_view(session: str) -> dict:
+    """GET /api/skills/obligation?session=<id> —— 收工拦截那一句"这条会话还有活吗"。只读。
+
+    读不到会话/没有任务目录 ⇒ busy=False：没有事实就不拦人收工（这条不是"默认有罪"，
+    它拦的是【盘上确实在跑的活】；把"查不到"当成"有活"会变成谁都无法收工的死循环）。
+    """
+    sid = str(session or "").strip()
+    rec = (hypit_bridge.intent_map() or {}).get(sid) or {}
+    tdir = str(rec.get("task_dir") or "").strip()
+    items = task_obligations(tdir)
+    return {"ok": True, "session": sid, "skill": str(rec.get("skill") or ""), "task_dir": tdir,
+            "busy": bool(items), "items": items}
+
+
 def wake_ack(body: dict) -> dict:
     """POST /api/skills/form/wake/ack —— 按 kind 分流到三份队列。
 
@@ -2143,6 +2195,13 @@ class H(BaseHTTPRequestHandler):
             if self._not_loopback("/api/skills/form/wake"):
                 return
             self._send(200, json.dumps(wake_view(), ensure_ascii=False))
+        elif u.path == "/api/skills/obligation":
+            # 收工拦截那一问：这条会话的任务还有没有【没跑完的活】。只读、只听环回（同上）。
+            if self._not_loopback("/api/skills/obligation"):
+                return
+            q = parse_qs(u.query)
+            self._send(200, json.dumps(obligation_view((q.get("session") or [""])[0]),
+                                       ensure_ascii=False))
         elif u.path == "/api/skills/form/attempts":
             # 只读：客户点了【提交】但没成交的最近几次（缺哪格 / 哪条会话 / 拒因）。
             # 🔴 只听环回：里面带会话 id 与任务名；并且它【不是】第二份"已提交"判据 —— 只是现场。

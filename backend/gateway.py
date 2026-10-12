@@ -1944,6 +1944,71 @@ def _yz_prime_reconcile(base: str, api_key: str):
     return rec
 
 
+def prime_job_path(output_path: str) -> str:
+    """任务号那份留痕住哪：成片旁边（同目录、固定名）。判据只在这一份。"""
+    import os as _o
+    out = str(output_path or "").strip()
+    return _o.path.join(_o.path.dirname(_o.path.abspath(out)), "wan3_job.json") if out else ""
+
+
+def read_prime_job(output_path: str) -> dict:
+    """只读：这条成片位置有没有一个【已提交但可能没落盘】的 wan3 任务号。读不到就回 {}。"""
+    import json as _j
+    import os as _o
+    p = prime_job_path(output_path)
+    if not p or not _o.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            v = _j.load(f)
+        return v if isinstance(v, dict) and v.get("kind") == "wan3_job" else {}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _yz_prime_note_job(params: dict, tid: str, model: str = "") -> str:
+    """🔴 任务号【当场】落盘，就在成片旁边（wan3_job.json）。
+
+    为什么必须有（2026-10-12 现网 session-5282eabf）：agent 的前台命令被工具 10 分钟上限强杀
+    （dsh-pwsh-local 的 maxTimeoutMs=6e5，传更大也被夹回来），而一条 wan3-prime 生成实测 10–17 分钟
+    ⇒ 号只在内存里 = 进程一死号就丢 ⇒ 唯一剩下的动作是重投，那是真双花。
+    有了这份留痕，任何一条只读命令都能按 job_id 把片子捞回来（适配器认 job_id 走 poll 模式，不重提交）。
+    写失败【不影响这次生成】（留痕不许变成故障点），但会把原因打出来 —— 那时"捞不回来"这件事就重新成立。
+    """
+    import json as _j
+    import os as _o
+    import time as _t
+    out = str(params.get("output_path") or "").strip()
+    p = prime_job_path(out)
+    if not p or not str(tid or "").strip():
+        return ""
+    rec = {"kind": "wan3_job", "task_id": str(tid), "model": str(model or ""),
+           "route": "video.generate/wan3-prime", "output_path": _o.path.abspath(out),
+           "submitted_at": round(_t.time(), 3), "pid": _o.getpid()}
+    try:
+        _o.makedirs(_o.path.dirname(p), exist_ok=True)
+        old = read_prime_job(out)
+        if old.get("task_id") and old.get("task_id") != rec["task_id"]:
+            # 同一格重投过：把上一次的号留着，别把它抹掉（否则双花反而查不出来）
+            rec["prev_task_ids"] = (old.get("prev_task_ids") or []) + [old["task_id"]]
+        tmp = "%s.%d.tmp" % (p, rec["pid"])
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(_j.dumps(rec, ensure_ascii=False, indent=1))
+            _o.replace(tmp, p)
+        finally:
+            try:
+                if _o.path.isfile(tmp):
+                    _o.remove(tmp)             # 换名成功就没这条；失败时别把临时文件留在段目录里
+            except OSError:
+                pass
+        return p
+    except Exception as e:                                   # noqa: BLE001
+        print("[wan3_job] 任务号没落盘（这次生成照常，但进程一死就没法只读捞回）：%s: %s"
+              % (type(e).__name__, str(e)[:120]))
+        return ""
+
+
 def prime_retry_verdict(kind, task_id, seen_ids, rec, attempts_left):
     """纯判据：失败这一次之后，该【重投】、该【捞回】、还是该【停】。抽成函数是为了能被闸整块抠出来跑值表。
 
@@ -2043,6 +2108,7 @@ def _yz_prime_once(params: dict, route: dict | None, base: str, api_key: str, mo
         if not tid:
             return _unknown("提交回 2xx 但挖不到任务号（回包形状变了？回文：%s）" % _text(raw), "")
         vals["task_id"] = tid
+        _yz_prime_note_job(params, tid, model)     # 🔴 号一拿到就落盘，见函数 docstring
 
     deadline = time.time() + poll_timeout
     misses = 0
