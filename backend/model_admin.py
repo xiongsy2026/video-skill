@@ -1443,8 +1443,14 @@ def kickoff_compile(sid: str, skill: str, rec: dict) -> dict:
         fh = subprocess.DEVNULL
         logp = "（日志不可开 ⇒ 丢弃，但照常起）"
     cmd = [sys.executable, runner, "--from-form", "--session", sid, "--stage", KICKOFF_STAGE]
+    # 🔴 子进程的输出编码必须钉成 utf-8：日志文件是我们以 utf-8 开的，而子进程默认按**系统 ANSI(cp936)**
+    #    往这个句柄里写字节 ⇒ compile.log 半文件是 GBK 乱码（2026-10-12 现网 agent 第一反应就是
+    #    "输出是 GBK 乱码，让我换个方式读"，白烧几步）。人自己在控制台跑照旧走本地编码，不受影响。
+    _env = dict(os.environ)
+    _env["PYTHONIOENCODING"] = "utf-8"
     try:
         p = subprocess.Popen(cmd, cwd=WORKSPACE_DIR, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+                             env=_env,
                              creationflags=(0x00000008 | 0x00000200) if os.name == "nt" else 0)
     except OSError as e:
         return {"started": False, "why": "起进程失败：%s: %s" % (type(e).__name__, str(e)[:120])}
