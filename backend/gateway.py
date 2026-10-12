@@ -2765,8 +2765,12 @@ def file_identity(path: str) -> dict:
             "name": _o.path.basename(p)}
 
 
-def record_media_analysis(path, capability, purpose, session="", credits=None) -> dict:
-    """网关跑完一条看图腿之后调它。写失败不许影响业务（返回 ok=False + 原因）。"""
+def record_media_analysis(path, capability, purpose, session="", credits=None, hold_id="") -> dict:
+    """网关跑完一条看图腿之后调它。写失败不许影响业务（返回 ok=False + 原因）。
+    🔴 `hold_id` = 这次调用的**凭证**（invoke 的预扣号）。没有它的行【不算证据】——
+       2026-10-12 现网：agent 发现台账没记上，就 import 这个函数自己写了 3 条"看过图"（13 毫秒三条、credits=0），
+       于是合同那句"不认 agent 自述、只认台账"被自证破功。凭证不要求不可伪造（同一个 Administrator 做不到），
+       要求的是【伪造得贵 + 看得见】：要伪造就得连预扣记录一起编，而 `gateway.py analyses` 会当场显示没有尾号。"""
     import os as _o
     import json as _j
     import time as _time
@@ -2774,6 +2778,7 @@ def record_media_analysis(path, capability, purpose, session="", credits=None) -
     row = {"sha8": idn.get("sha8") or "", "name": idn.get("name") or "",
            "bytes": idn.get("bytes"), "capability": capability, "purpose": purpose,
            "session": str(session or ""), "ts": round(_time.time(), 3),
+           "hold_id": str(hold_id or ""),
            "credits": (credits or {}).get("charged")}
     if not idn.get("ok"):
         row["error"] = "文件读不到 ⇒ 不记台账"
@@ -2799,6 +2804,8 @@ def analysis_missing_paths(paths, rows, session="") -> list:
     for r in rows or []:
         if str(r.get("capability") or "") != "video.analyze":
             continue
+        if not str(r.get("hold_id") or "").strip():
+            continue                      # 🔴 没有调用凭证的行不算证据（agent 自己 import 记账函数写的那种）
         if session and str(r.get("session") or "") != str(session):
             continue                      # 别的会话看过 ≠ 这条线看过（报价与归属都按会话算）
         have[str(r.get("sha8") or "")] = r
@@ -3544,9 +3551,10 @@ def invoke(capability: str, purpose: str | None = None, account: str = "local",
         if capability == "video.analyze" and params.get("path"):
             # 🔴 素材分析台账：跑完这条腿才记账 ⇒ agent 伪造不了『我看过图了』。
             #    写失败不影响业务（返回值里带原因），但【不许抛】——台账是留痕，不是新故障点。
+            #    hold_id = 这次调用的预扣号，判据只认带凭证的行（没它就算 agent 手写的一条）。
             record_media_analysis(params.get("path"), capability, r["purpose"],
                                   _session_of(params), {
-"charged": charged})
+"charged": charged}, hold_id=(hold or {}).get("hold_id") or "")
         return {"ok": True, "capability": capability, "purpose": r["purpose"], "result": result,
                 "credits": {"estimated": est, "charged": charged, "tokens": tokens, "basis": basis,
                             "hold_id": hold["hold_id"],
@@ -4194,11 +4202,19 @@ def _cli(argv):
                 lim = int(a)
         tail = rows[-lim:] if lim else rows[-25:]
         print("素材分析台账 共 %d 条（显示最近 %d 条）· 文件=%s" % (len(rows), len(tail), media_analysis_log_path()))
+        _nokey = 0
         for r in tail:
-            print("  %s  %-10s %-26s %s/%s  会话=%s  %s 分  %s" % (
+            _hk = str(r.get("hold_id") or "")
+            if not _hk:
+                _nokey += 1
+            print("  %s  %-10s %-26s %s/%s  会话=%s  %s 分  凭证=%s  %s" % (
                 _time.strftime("%m-%d %H:%M:%S", _time.localtime(r.get("ts") or 0)),
                 (r.get("sha8") or "?"), r.get("name", "")[:26], r.get("capability"), r.get("purpose"),
-                (str(r.get("session") or "")[:12] or "无"), r.get("credits"), r.get("error") or ""))
+                (str(r.get("session") or "")[:12] or "无"), r.get("credits"),
+                (_hk[-8:] if _hk else "🔴无（不算证据）"), r.get("error") or ""))
+        if _nokey:
+            print("  🔴 上面有 %d 条【没有调用凭证】⇒ 判据不认它们（那种行是有人 import 记账函数手写的，"
+                  "2026-10-12 现网发生过）" % _nokey)
         if not rows:
             print("  （空）⇒ 还没有任何一条素材被真看过；超级复刻提交前要求每个素材都在这里有一条记录。")
         return 0
