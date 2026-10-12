@@ -3301,6 +3301,21 @@ async def step2_wan3_execute(
 # ─────────────────────────────────────────────────────────────────
 # 顶层编排：Step1 → Step2
 # ─────────────────────────────────────────────────────────────────
+# ── 素材分析：执行人 = 管线，不是 agent（2026-10-12 用户裁定"skill 要锁死交给谁干"）────────────
+# 以前合同这一步只在【报错文案】里教 agent 自己去跑 CLI ⇒ 它真的自己干：PowerShell 吃引号 → 猜参数键名
+# → 写 _analyze_run.py 手搓 → 走了不记账的近路 → 台账 0 条却汇报"齐全"（现网 session-1e7a5162 08:45–08:48）。
+# 现在这段由管线自己经 gateway.invoke 跑（会预扣、会结算、会记台账），agent 在这条路上不碰任何模型。
+MATERIAL_ANALYZE_QUESTION = (
+    "这是本次要替换上去的产品图。请逐项说清：品类、颜色（尽量具体色名）、材质与工艺、版型或尺寸、"
+    "可见细节（扣子/拉链/图案/边饰/配件）、画面里是否有文字或水印。"
+    "只描述画面中真实存在的东西，不要推测品牌、价格、功效。")
+# 300 是 analyze_media 的默认正文预算：实测会把 15s 视频的逐秒时间轴截断在前几秒（现网就是这么截的），
+# 所以这条腿自己给到 900；要改给环境变量，不改代码。
+MATERIAL_ANALYZE_TOKENS = int(os.environ.get("SUPER_CLONE_ANALYZE_TOKENS") or "900")
+# 熔断：看图免批不免账，一条单挂 10 张产品图就可能失控 ⇒ 自动补跑累计超过这个分数就先停下报数，不许死循环烧分。
+MATERIAL_ANALYZE_CREDIT_CAP = int(os.environ.get("SUPER_CLONE_ANALYZE_CAP") or "120")
+
+
 def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_duration,
                        ref_video, seg_product_paths, source_fit=None,
                        extra_note: Optional[str] = None,
@@ -3320,18 +3335,45 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
     from backend import gateway as _gw
     _sid = _gw._session_of({})
     _mats = [str(x) for x in (seg_product_paths or []) if str(x or "").strip()]
+    # 🔴 缺哪几张由【管线】补跑，不甩给 agent：只补还缺的、有熔断、跑完再对账（判据只有一份 =
+    #    gateway.analysis_missing_paths，这里不解析错误字符串）。范围只含产品图 —— 原片的动作与时间轴
+    #    事实由 Step1 MiMo 那条腿承担，再花一次看图分是重复消耗（用户 2026-10-12 定"最可靠"）。
+    _spent, _auto = 0, []
+    for _round in (1, 2):
+        _miss = _gw.analysis_missing_paths(_mats, _gw.media_analysis_rows(), _sid)
+        if not _miss or _round == 2 or _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
+            break
+        for one in _miss:
+            env = _gw.invoke("video.analyze", None, "local",
+                             {"path": one, "question": MATERIAL_ANALYZE_QUESTION,
+                              "max_tokens": MATERIAL_ANALYZE_TOKENS}) or {}
+            _cr = int(((env.get("credits") or {}).get("charged")) or 0)
+            _spent += _cr
+            _auto.append({"name": os.path.basename(one), "ok": bool(env.get("ok")), "charged": _cr,
+                          "error": str(env.get("error") or "")[:160]})
+            if _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
+                break
+    if _auto and log:
+        log("素材分析由管线自动补跑 %d 条、实扣 %d 分（免批不免账，已计入这次消耗）"
+            % (len(_auto), _spent))
     _missing = _gw.analysis_coverage_problems(_mats, _gw.media_analysis_rows(), _sid)
     if _missing:
         raise RuntimeError(
-            "素材没看过 ⇒ 不提交（0 消耗）。缺 %d 项：%s" % (len(_missing), "；".join(_missing)[:400])
-            + "。先跑 python D:" + chr(92) + "video-skill" + chr(92) + "backend" + chr(92)
-            + "gateway.py call video.analyze <路径> —— 看图免批但不免账（单价现读 prices），要花的分先算进报价。")
+            "素材没看过 ⇒ 不提交（本轮管线自动补跑 %d 次、实扣 %d 分）。缺 %d 项：%s"
+            % (len(_auto), _spent, len(_missing), "；".join(_missing)[:400])
+            + ("｜熔断在 %d 分（SUPER_CLONE_ANALYZE_CAP 可调），不是闸坏了" % MATERIAL_ANALYZE_CREDIT_CAP
+               if _spent >= MATERIAL_ANALYZE_CREDIT_CAP else
+               "｜多半是这条腿本身跑不通（看 material_analysis.json 的 auto_ran 里的 error）"))
     seg_dir.mkdir(parents=True, exist_ok=True)
     (seg_dir / "material_analysis.json").write_text(json.dumps({
         "session": _sid or "未知",
         "materials": [_gw.file_identity(p) for p in _mats],
         "missing": _missing,
         "ledger_rows": len(_gw.media_analysis_rows()),
+        # 🔴 谁跑的、花了多少：交付表与报价都读这一份，不靠 agent 自述
+        "executor": "pipeline:invoke:video.analyze",   # 与合同 手段= 同一个 token：交付表与合同对得上
+        "auto_ran": _auto, "auto_spent": _spent,
+        "credit_cap": MATERIAL_ANALYZE_CREDIT_CAP,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def _l(msg: str) -> None:
@@ -3399,7 +3441,7 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             # 手段申报进【回执行】：合同给某步写死了 `手段=` 白名单，不在名单里或根本没申报 ⇒ check_receipt 拒。
             # （原来这行没写，impl 被错传给了 verify_or_raise —— 那个函数没这个参数，直接 TypeError。）
             impl={"negative-lock": "compiler-negative-lock",
-                  "material-analysis": "gateway:video.analyze",
+                  "material-analysis": "pipeline:invoke:video.analyze",
                   "storyboard-fact-check": "runner:--extra-note"},
             models={"compile-prompt": cell, "compile-bound": cell})
     except Exception as _re:                              # noqa: BLE001

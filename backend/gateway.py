@@ -2791,8 +2791,10 @@ def record_media_analysis(path, capability, purpose, session="", credits=None) -
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120]), "row": row}
 
 
-def analysis_coverage_problems(paths, rows, session="") -> list:
-    """纯判据：paths 里每个素材都必须有一条同会话的 video.analyze 记录。空列表 = 覆盖。"""
+def analysis_missing_paths(paths, rows, session="") -> list:
+    """🔴 "还缺哪几个素材没看过" —— 这条判据【只在这一份】。
+    以前只有下面那个人话版，于是"缺哪些"这件事只能靠解析错误字符串，管线要自动补跑就得再抄一份判据
+    （两份必然漂）。现在：判据回路径，文案由它套出来。"""
     have = {}
     for r in rows or []:
         if str(r.get("capability") or "") != "video.analyze":
@@ -2800,19 +2802,30 @@ def analysis_coverage_problems(paths, rows, session="") -> list:
         if session and str(r.get("session") or "") != str(session):
             continue                      # 别的会话看过 ≠ 这条线看过（报价与归属都按会话算）
         have[str(r.get("sha8") or "")] = r
-    p = []
-    seen = set()
+    out, seen = [], set()
     for one in paths or []:
         idn = file_identity(one)
         key = idn.get("sha8") or ""
-        label = "%s(%s)" % (idn.get("name") or one, key or "无sha8")
         if not idn.get("ok"):
-            p.append("素材读不到 ⇒ 没法证明看过：%s" % label)
+            out.append(one)               # 读不到也要报：不给免检牌
         elif key in seen:
             continue                      # 同一张图给两次不算两个洞
         elif key not in have:
-            p.append("没有看图记录：%s ⇒ 先跑 gateway.py call video.analyze（6 分/次，免批不免账）" % label)
+            out.append(one)
         seen.add(key)
+    return out
+
+
+def analysis_coverage_problems(paths, rows, session="") -> list:
+    """纯判据（人话版）：paths 里每个素材都必须有一条同会话的 video.analyze 记录。空列表 = 覆盖。
+    🔴 判据本体在 analysis_missing_paths，这里只贴标签 —— 补跑这件事已经不归 agent 做（2026-10-12），
+       所以文案不再教它敲 CLI，改成"由管线补跑"，免得它又去手搓脚本。"""
+    p = []
+    for one in analysis_missing_paths(paths, rows, session):
+        idn = file_identity(one)
+        label = "%s(%s)" % (idn.get("name") or one, idn.get("sha8") or "无sha8")
+        p.append("素材读不到 ⇒ 没法证明看过：%s" % label if not idn.get("ok")
+                 else "没有看图记录：%s ⇒ 由管线补跑 video.analyze（6 分/次，免批不免账）" % label)
     return p
 
 # ── 段数的唯一机器源（2026-10-10 用户裁定：审批一次就行）───────────────────────
@@ -3877,14 +3890,43 @@ def _cli(argv):
             ms = f"{v['ms']}ms" if v["ms"] is not None else "-"
             print(f"  {v['status']:<11} {key:<26} {v['provider']}/{v['model']:<22} {ms:>8}  {v['detail']}")
     elif cmd == "analyze":
-        # 用法: python gateway.py analyze <图片/视频路径> [问题...]
+        # 用法: python gateway.py analyze <图片/视频路径> [问题...] [--account X] [--max-tokens N]
+        # 🔴 这条子命令以前直接走 call()（能力分发器），而【记账/预扣/结算全在 invoke() 里】
+        #    ⇒ 它看着是"网关的正规入口"，实际一条账都不留（2026-10-12 现网：agent 走这条路跑了三次分析，
+        #    台账 0 条，还汇报"预扣/结算/台账齐全"；合同按 sha8 对账时它反而过不了）。
+        #    现在：一条能力只有一个入口 —— 转 invoke()，与 call 子命令同轨。
         import json
-        if len(argv) < 2:
-            print("用法: python gateway.py analyze <媒体路径> [问题]")
+        rest = list(argv[1:])
+        acct = "local"
+        mtok = None
+        if "--account" in rest:
+            i = rest.index("--account")
+            if i + 1 >= len(rest):
+                print("--account 后面要跟成员名")
+                return 2
+            acct, rest = rest[i + 1], rest[:i] + rest[i + 2:]
+        if "--max-tokens" in rest:
+            i = rest.index("--max-tokens")
+            if i + 1 >= len(rest):
+                print("--max-tokens 后面要跟整数（默认 300，看视频建议 1200+，否则正文被截成前几秒）")
+                return 2
+            try:
+                mtok = int(rest[i + 1])
+            except ValueError:
+                print("--max-tokens 要整数")
+                return 2
+            rest = rest[:i] + rest[i + 2:]
+        if not rest:
+            print("用法: python gateway.py analyze <媒体路径> [问题...] [--account X] [--max-tokens N]")
             return 2
-        path = argv[1]
-        q = " ".join(argv[2:]) or "用一句话描述这个画面的关键信息。"
-        print(json.dumps(call("video.analyze", path=path, question=q), ensure_ascii=False, indent=2))
+        path = rest[0]
+        params = {"path": path,
+                  "question": " ".join(rest[1:]) or "用一句话描述这个画面的关键信息。"}
+        if mtok:
+            params["max_tokens"] = mtok
+        env = invoke("video.analyze", None, acct, params)
+        print(json.dumps(env, ensure_ascii=False, indent=2))
+        return 0 if env.get("ok") else 1
     elif cmd == "call":
         # 用法: python gateway.py call <capability> [purpose] [--account <member>] [--json '<params>']
         # skill 经 tool-jobs 调模型的唯一入口；返回归一 JSON（含 credits）。
