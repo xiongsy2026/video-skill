@@ -1593,15 +1593,22 @@ def compile_died_queue(now: float = None) -> list:
 
 
 def compile_died_ack(body: dict) -> dict:
-    """POST /api/skills/form/wake/ack {kind:compile_died, session, pid}：销账 = 删掉那份死牌子。
+    """POST /api/skills/form/wake/ack {kind:compile_died, session, pid|at}：销账 = 删掉那份死牌子。
 
-    🔴 必须带 pid 对得上才删：这一秒可能又点火起了一台新的（牌子已被覆盖成新 pid），
+    🔴 必须认出【是哪一台】才删：这一秒可能又点火起了一台新的（牌子已被覆盖成新 pid），
        拿旧的那台销账会把【新那台】的牌子摘掉 ⇒ 它又变回"盘上不存在的编译"，正是这次要堵的形状。
+    身份两个写法都收（同一个保证，只是老插件只发得出其中一个）：
+      · `pid` = 报的那台的进程号（新插件那半）；
+      · `at`  = 那份牌子的 mtime（第四份来源的 `at` 本来就是 mtime）。
+    🔴 为什么不能只认 pid（2026-10-12 部署窗口）：插件那半要**完整重启 DSH** 才带得上 pid，
+       只重启 8100 的中间窗口里跑的是老插件，它发的是 `{session, at}` ⇒ 一律拒 = **永远销不掉账**，
+       那张死牌子会一直挂在队列里，比不删更坏。
     删完队列自然空（这一格没有 pending 标志：牌子本身就是状态，别再造第二份状态）。
     """
     body = body if isinstance(body, dict) else {}
     sid = str(body.get("session") or "").strip()
     pid = str(body.get("pid") or "").strip()
+    at = body.get("at")
     rec = (hypit_bridge.intent_map() or {}).get(sid)
     tdir = str((rec or {}).get("task_dir") or "").strip()
     if not sid or not tdir:
@@ -1611,11 +1618,18 @@ def compile_died_ack(body: dict) -> dict:
         return {"ok": True, "already": True}
     try:
         mine = (io.open(path, encoding="utf-8").read() or "").strip()
+        mtime = round(os.path.getmtime(path), 3)
     except OSError as e:
         return {"ok": False, "error": "读不到牌子：%s: %s" % (type(e).__name__, str(e)[:80])}
-    if not pid or pid != mine:
-        return {"ok": False, "error": "ack 的 pid 与牌子不符（牌子=%s / 报的=%s）⇒ 不删，"
-                                      "免得把新起那台的牌子摘了" % (mine or "无", pid or "空")}
+    _same_at = False
+    try:
+        _same_at = bool(at) and abs(float(at) - mtime) < 1e-6
+    except (TypeError, ValueError):
+        _same_at = False
+    if not ((pid and pid == mine) or _same_at):
+        return {"ok": False, "error": "ack 认不出是哪一台（牌子 pid=%s mtime=%s / 报的 pid=%s at=%s）"
+                                      "⇒ 不删，免得把新起那台的牌子摘了"
+                                      % (mine or "无", mtime, pid or "空", at)}
     try:
         os.remove(path)
     except OSError as e:
