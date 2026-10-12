@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -1383,10 +1384,128 @@ def form_submit(body: dict) -> dict:
     #    但 agent 只在轮到自己说话时才动 ⇒ 没有这一格，链路就断在"表交了没人看见"（T13 实测抓到的洞）。
     #    叫醒动作在宿主插件里（只有那一侧拿得到 Agent.followup），这里只负责【记着该叫谁】。
     ts = time.time()
-    return _form_write(FORM_PAYLOAD_PATH, sid, {
+    resp = _form_write(FORM_PAYLOAD_PATH, sid, {
         "skill": skill, "intent": intent, "params": params, "ts": ts,
         "task": str(rec.get("task") or ""), "files": saved,
         "wake": {"pending": True, "at": ts}}, "载荷")
+    # 🔴 交表即点火（2026-10-12 用户定）：客户点【提交这张表】= 授权开工，那"开工"的第一段
+    #    （0 分编译）就不该等 agent 想起来跑。结果原样带回响应 ⇒ 页面上看得见"起没起、为什么没起"。
+    #    只起 `--stage compile`：不花钱、不建预扣；跑完由它回来挂 compiled 事件（见 compiled_report）。
+    if isinstance(resp, dict) and resp.get("ok"):
+        resp["kickoff"] = kickoff_compile(sid, skill, rec)
+    return resp
+
+
+# ── 交表即点火（2026-10-12 用户定：提交表单 = 直接进 skill 管线跑编译，不要"先给 agent 分析再进管线"）──
+# 切点【写死在编译】：服务端只允许起 `--stage compile`（0 分、不建预扣、不进执行器）；
+# 编译产物出来 ⇒ 挂一条 `compiled` 事件叫醒 agent 去报价、建条子；**花钱那一下仍只有 agent 能发起，
+# 且仍要人在批准窗点一次**。理由不是客气：提交后要盯终态、失败要补跑、交付要贴图，那些是 agent 的活；
+# 而"程序自己扣钱"一旦开口，范围变化（加段数/换路由）就没人拦了。
+# 🔴 这不算"给 8100 长出执行端点"：命令不来自请求体 —— 只有白名单里那条 runner、参数固定四个、
+#    路径自己拼、无 shell；外部没有任何办法借它跑别的程序。
+KICKOFF_RUNNERS = {"super-clone": os.path.join(".dsh", "skills", "super-clone", "runner", "run.py")}
+KICKOFF_STAGE = "compile"          # 🔴 写死。改成别的值 = 让服务端自己花钱，闸 K2 会红
+COMPILE_WAKE_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "compile_wake.json")
+
+
+def _proc_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def kickoff_compile(sid: str, skill: str, rec: dict) -> dict:
+    """客户点【提交这张表】那一下起一条只读编译。返回人话状态，进 form_submit 的响应 ⇒ 页面上看得见。"""
+    import subprocess
+    rel = KICKOFF_RUNNERS.get(skill)
+    if not rel:
+        return {"started": False, "why": "这条线没登记可点火的 runner ⇒ 仍由 agent 决定怎么跑（不猜命令）"}
+    runner = os.path.join(WORKSPACE_DIR, rel)
+    tdir = str((rec or {}).get("task_dir") or "").strip()
+    if not os.path.isfile(runner):
+        return {"started": False, "why": "runner 不在盘上（%s）⇒ 不起" % runner}
+    if not tdir or not os.path.isdir(tdir):
+        return {"started": False, "why": "这条会话的意图里没有任务目录 ⇒ 不起（不猜往哪写）"}
+    pidf = os.path.join(tdir, ".compile.pid")
+    try:
+        old = (io.open(pidf, encoding="utf-8").read() or "").strip() if os.path.isfile(pidf) else ""
+    except OSError:
+        old = ""
+    if old and _proc_alive(old):
+        return {"started": False, "reused": True, "pid": int(old),
+                "why": "这条任务已经有一台编译在跑 ⇒ 不起第二台（同名产物互相覆盖）"}
+    logp = os.path.join(tdir, "compile.log")
+    try:                                  # 🔴 日志打不开不许挡住点火（今天 8100 就是死在这形状上）
+        fh = open(logp, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        fh = subprocess.DEVNULL
+        logp = "（日志不可开 ⇒ 丢弃，但照常起）"
+    cmd = [sys.executable, runner, "--from-form", "--session", sid, "--stage", KICKOFF_STAGE]
+    try:
+        p = subprocess.Popen(cmd, cwd=WORKSPACE_DIR, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+                             creationflags=(0x00000008 | 0x00000200) if os.name == "nt" else 0)
+    except OSError as e:
+        return {"started": False, "why": "起进程失败：%s: %s" % (type(e).__name__, str(e)[:120])}
+    try:
+        with open(pidf, "w", encoding="utf-8") as f:
+            f.write(str(p.pid))
+    except OSError:
+        pass
+    return {"started": True, "pid": p.pid, "log": logp, "cmd": " ".join(cmd[-4:])}
+
+
+def compiled_report(body: dict) -> dict:
+    """POST /api/skills/form/compiled —— runner 跑完编译回来挂号（第三份唤醒来源）。
+    🔴 只认【服务端自己起过的那条】：`.compile.pid` 在、且 pid 就是刚跑完的那个 ⇒ 才挂。
+       否则任何本机进程 POST 一下就能凭空造一条"待醒"，那是把唤醒链变成注入面。"""
+    body = body if isinstance(body, dict) else {}
+    sid = str(body.get("session") or "").strip()
+    pid = body.get("pid")
+    rec = (hypit_bridge.intent_map() or {}).get(sid)
+    tdir = str((rec or {}).get("task_dir") or "").strip()
+    if not sid or not tdir:
+        return {"ok": False, "error": "没有这条会话或它没有任务目录 ⇒ 不挂号"}
+    pidf = os.path.join(tdir, ".compile.pid")
+    if not os.path.isfile(pidf):
+        return {"ok": False, "error": "这台编译不是我起的（没有 .compile.pid）⇒ 不挂号"}
+    try:
+        mine = (io.open(pidf, encoding="utf-8").read() or "").strip()
+    except OSError:
+        mine = ""
+    if pid is not None and str(pid).strip() != mine:
+        return {"ok": False, "error": "pid 对不上（挂号的 %s ≠ 我起的 %s）⇒ 拒" % (pid, mine or "无")}
+    ts = time.time()
+    out = _form_write(COMPILE_WAKE_PATH, sid, {
+        "session": sid, "skill": str((rec or {}).get("skill") or ""), "ts": ts,
+        "ok": bool(body.get("ok")), "error": str(body.get("error") or "")[:200],
+        "task": str((rec or {}).get("task") or ""), "task_dir": tdir,
+        "wake": {"pending": True, "at": ts}}, "编译待醒")
+    try:
+        os.remove(pidf)                   # 跑完了就把"我在跑"这个牌子摘掉，允许改参数重交后再起一台
+    except OSError:
+        pass
+    return out
+
+
+def compile_wake_queue(data: dict) -> list:
+    """纯函数：编译跑完了该叫醒谁。四条规则与 form_wake_queue / approval_wake_queue 同构。"""
+    out = []
+    now = time.time()
+    for sid, rec in (data or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        w = rec.get("wake") or {}
+        if not w.get("pending"):
+            continue
+        at = float(w.get("at") or rec.get("ts") or 0)
+        if not at or now - at > hypit_bridge.INTENT_TTL_SEC:
+            continue
+        out.append({"kind": "compiled", "session": sid, "at": at, "ok": bool(rec.get("ok")),
+                    "error": str(rec.get("error") or ""), "skill": str(rec.get("skill") or ""),
+                    "task": str(rec.get("task") or "")})
+    return out
 
 
 def form_wake_queue(data: dict) -> list:
@@ -1430,22 +1549,25 @@ def wake_view() -> dict:
     ⚠️ URL 里那个 "form" 是历史名：改路径要和宿主插件【同时】重启，中间窗口里整条唤醒链会静默停摆，
        风险大于名字带来的好处，所以留着，函数名与判据都按真实形状叫。
     """
-    items = form_wake_queue(_form_payloads()) + approval_wake_queue(_approval_wake_load())
+    items = (form_wake_queue(_form_payloads()) + approval_wake_queue(_approval_wake_load())
+             + compile_wake_queue(_compile_wake_load()))
     return {"ok": True, "pending": sorted(items, key=lambda x: x["at"])}
 
 
 def wake_ack(body: dict) -> dict:
-    """POST /api/skills/form/wake/ack —— 按 kind 分流到两份队列。
+    """POST /api/skills/form/wake/ack —— 按 kind 分流到三份队列。
 
-    🔴 kind 必填（form|approval），不猜：猜错的那一下会去清另一份队列，
-       而那边的 `at` 恰好也可能对得上（同一秒内提交/批准），错清 = 那一格永远没人叫。
+    🔴 kind 必填（form|approval|compiled），不猜：猜错的那一下会去清另一份队列，
+       而那边的 `at` 恰好也可能对得上（同一秒内提交/批准/编译完），错清 = 那一格永远没人叫。
     """
     kind = str((body or {}).get("kind") or "")
     if kind == "approval":
         return approval_wake_ack(body)
     if kind == "form":
         return form_wake_ack(body)
-    return {"ok": False, "error": "ack 必须带 kind=form|approval（不猜是哪份队列）"}
+    if kind == "compiled":
+        return compile_wake_ack(body)
+    return {"ok": False, "error": "ack 必须带 kind=form|approval|compiled（不猜是哪份队列）"}
 
 
 def form_wake_ack(body: dict) -> dict:
@@ -1563,6 +1685,38 @@ def approval_wake_ack(body: dict) -> dict:
         return {"ok": True, "already": True}
     rec["wake"] = dict(w, pending=False, acked_at=time.time())
     return _form_write(APPROVAL_WAKE_PATH, gid, rec, "批准唤醒回执")
+
+
+def _compile_wake_load() -> dict:
+    try:
+        with open(COMPILE_WAKE_PATH, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def compile_wake_ack(body: dict) -> dict:
+    """POST /api/skills/form/wake/ack {kind:"compiled", session, at} ⇒ 销这一格。
+    与前两份同一条幂等规矩：必须回带服务端发出去的那个 `at`，否则不清（别抹掉更新的一次编译）。"""
+    sid = str((body or {}).get("session") or "")
+    at = (body or {}).get("at")
+    data = _compile_wake_load()
+    rec = data.get(sid)
+    if not sid or not isinstance(rec, dict):
+        return {"ok": False, "error": "没有这条会话的编译待醒：%s" % (sid or "(空)")}
+    w = rec.get("wake") or {}
+    try:
+        same = bool(at) and abs(float(w.get("at") or 0) - float(at)) < 1e-6
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        return {"ok": False, "error": "ack 的 at 与待发队列不符（不清队列，避免抹掉更新的一次编译）",
+                "pending": bool(w.get("pending"))}
+    if not w.get("pending"):
+        return {"ok": True, "already": True}
+    rec["wake"] = dict(w, pending=False, acked_at=time.time())
+    return _form_write(COMPILE_WAKE_PATH, sid, rec, "编译唤醒回执")
 
 
 def _form_write(path, sid, rec, what):
@@ -2233,6 +2387,19 @@ class H(BaseHTTPRequestHandler):
                                            ensure_ascii=False))
                 return
             r = wake_ack(body if isinstance(body, dict) else {})
+            self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
+        elif u.path == "/api/skills/form/compiled":
+            # 交表即点火的那台编译跑完回来挂号（第三份唤醒来源）。🔴 只听环回 + 只认服务端自己起的 pid，
+            # 否则任何本机进程 POST 一下就能凭空造一条"待醒"，把唤醒链变成注入面。
+            if self._not_loopback("/api/skills/form/compiled"):
+                return
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": "bad json: %s" % e},
+                                           ensure_ascii=False))
+                return
+            r = compiled_report(body if isinstance(body, dict) else {})
             self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
         elif u.path in ("/api/spend/approve", "/api/spend/deny"):
             # 花钱批准页的两个动作口。🔴 只听环回（和 /api/spend/guard 同一条理由：批准/拒绝
