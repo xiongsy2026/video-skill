@@ -24,6 +24,33 @@ BRAND = "WEEKSIR 电商AI专家 · 专注电商AI落地"
 POLL_MS = 2000
 
 
+def center_xy(sw: int, sh: int, w: int, h: int) -> tuple:
+    """纯判据：屏幕 sw×sh、窗口 w×h ⇒ 左上角该放哪（居中，且不许放到屏幕外）。
+
+    🔴 为什么这条必须是函数而不是两行内联算术：这张窗是【唯一的人证入口】，
+       它落在屏幕角落里 = 客户没看见 = 15 分钟过期 = 这条方案白报价（2026-10-12 用户点名"弹窗要居中"）。
+    夹到 0 是为了另一种形状：窗口比屏幕还高（内容长、或客户是 1366×768 的小屏）⇒
+    居中算出来是负数，那会把标题栏推到屏幕外，连【批准】那颗按钮都够不着。
+    """
+    return max(0, int((sw - w) // 2)), max(0, int((sh - h) // 2))
+
+
+def place_centered(root) -> tuple:
+    """按【当前实际尺寸】把窗口挪到屏幕正中；返回 (x, y) 方便出声报数。
+
+    🔴 为什么写全 `宽x高+X+Y` 而不是只写 `+X+Y`（2026-10-12 实测）：只给位置不带尺寸时
+       Tk 不设 USPosition 标志，窗口一 map 就被 Windows **级联放置**接管 —— 现网两次弹出来
+       落在 78,78 和 130,130（每次往下偏 52px），居中那一句等于没执行。带上尺寸两个标志都置上，
+       WM 才认这个位置。
+    """
+    root.update_idletasks()                       # 没有这句，winfo_req* 还是打包前的旧尺寸
+    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+    x, y = center_xy(root.winfo_screenwidth(), root.winfo_screenheight(), w, h)
+    root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+    root.update_idletasks()
+    return x, y
+
+
 def _rpc(port: int, path: str, body=None):
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method="POST" if body else "GET")
     if body:
@@ -114,6 +141,7 @@ def main(argv):
         root.after(POLL_MS, tick)
 
     tick()
+    place_centered(root)                  # 🔴 居中：这张窗就是人证本身，落在角落里等于没弹
     root.lift()
     root.focus_force()
     root.mainloop()

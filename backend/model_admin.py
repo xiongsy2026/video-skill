@@ -1469,7 +1469,8 @@ def compiled_report(body: dict) -> dict:
         return {"ok": False, "error": "没有这条会话或它没有任务目录 ⇒ 不挂号"}
     pidf = os.path.join(tdir, ".compile.pid")
     if not os.path.isfile(pidf):
-        return {"ok": False, "error": "这台编译不是我起的（没有 .compile.pid）⇒ 不挂号"}
+        return {"ok": False, "error": "任务目录没有 .compile.pid ⇒ 这台没挂过牌"
+                                      "（不是 --stage compile，或挂牌那一步写不上）⇒ 不挂号"}
     try:
         mine = (io.open(pidf, encoding="utf-8").read() or "").strip()
     except OSError:
@@ -1541,16 +1542,98 @@ def _is_loopback(host) -> bool:
     return s in ("127.0.0.1", "::1", "localhost") or s.startswith("::ffff:127.0.0.1")
 
 
+COMPILE_DIED_QUIET_SEC = 30       # 牌子刚落下的这 30 秒不判死：点火那一下可能正好被读到
+
+
+def compile_died_items(records: list, now: float, alive) -> list:
+    """纯判据：牌子还在、进程没了 ⇒ 这台编译【半路死了】（唤醒队列的第四份来源）。
+
+    🔴 为什么要有这一份（2026-10-12 现网 video33-cardigan-swap 16:11）：8100 点火起了 pid=35196，
+       跑到一半没了，产物一片没落 —— 而 `compiled` 那一格是【跑完才挂】的，死掉的那台永远不挂号
+       ⇒ 盘上零条红、agent 等不到叫醒、客户对着右栏干等。"牌子 + 没进程"是它唯一的遗言。
+    参数拆开是为了让闸能跑真值表：`records` 由调用方从意图簿整（枚举不在判据里），
+    `alive` 是探针（默认 _proc_alive；闸必须传桩，不许拿别人的真进程赌）。
+    四条规则（每条对应断言）：
+      1. 牌子内容读成一个纯数字才算数 —— 半截写入 ≠ 死了，读不出就【不判】，不误叫人；
+      2. 牌子 mtime 距今 < COMPILE_DIED_QUIET_SEC 不判（刚点火那一瞬）；
+      3. 超过意图 TTL 也不判（几天前的死相不该今天把人叫醒）；
+      4. 摘牌 = `compiled_report` 挂号那一步做的 ⇒ 牌子还在就是"从没报过"，不用另记一份状态。
+    """
+    out = []
+    for sid, skill, task, tdir in records:
+        if not tdir or not os.path.isdir(tdir):
+            continue
+        path = os.path.join(tdir, ".compile.pid")
+        try:
+            raw = (io.open(path, encoding="utf-8").read() or "").strip()
+            pid = int(raw.splitlines()[0]) if raw else 0
+            age = now - os.path.getmtime(path)
+        except (OSError, ValueError, IndexError):
+            continue
+        if not pid or age < COMPILE_DIED_QUIET_SEC or age > hypit_bridge.INTENT_TTL_SEC:
+            continue
+        if alive(pid):
+            continue
+        out.append({"kind": "compile_died", "session": sid, "skill": skill, "task": task,
+                    "at": round(os.path.getmtime(path), 3), "pid": pid,
+                    "log": os.path.join(tdir, "compile.log")})
+    return out
+
+
+def compile_died_queue(now: float = None) -> list:
+    """从意图簿整出【配了点火的那几档】，交给上面那份判据（枚举与判据分开，判据只有一份）。"""
+    recs = []
+    for sid, rec in (hypit_bridge.intent_map() or {}).items():
+        skill = str((rec or {}).get("skill") or "")
+        if skill not in KICKOFF_RUNNERS:          # 没配点火的档没有"服务端起的编译"这回事 ⇒ 不判
+            continue
+        recs.append((sid, skill, str((rec or {}).get("task") or ""),
+                     str((rec or {}).get("task_dir") or "").strip()))
+    return compile_died_items(recs, time.time() if now is None else now, _proc_alive)
+
+
+def compile_died_ack(body: dict) -> dict:
+    """POST /api/skills/form/wake/ack {kind:compile_died, session, pid}：销账 = 删掉那份死牌子。
+
+    🔴 必须带 pid 对得上才删：这一秒可能又点火起了一台新的（牌子已被覆盖成新 pid），
+       拿旧的那台销账会把【新那台】的牌子摘掉 ⇒ 它又变回"盘上不存在的编译"，正是这次要堵的形状。
+    删完队列自然空（这一格没有 pending 标志：牌子本身就是状态，别再造第二份状态）。
+    """
+    body = body if isinstance(body, dict) else {}
+    sid = str(body.get("session") or "").strip()
+    pid = str(body.get("pid") or "").strip()
+    rec = (hypit_bridge.intent_map() or {}).get(sid)
+    tdir = str((rec or {}).get("task_dir") or "").strip()
+    if not sid or not tdir:
+        return {"ok": False, "error": "没有这条会话或它没有任务目录 ⇒ 不销账"}
+    path = os.path.join(tdir, ".compile.pid")
+    if not os.path.isfile(path):
+        return {"ok": True, "already": True}
+    try:
+        mine = (io.open(path, encoding="utf-8").read() or "").strip()
+    except OSError as e:
+        return {"ok": False, "error": "读不到牌子：%s: %s" % (type(e).__name__, str(e)[:80])}
+    if not pid or pid != mine:
+        return {"ok": False, "error": "ack 的 pid 与牌子不符（牌子=%s / 报的=%s）⇒ 不删，"
+                                      "免得把新起那台的牌子摘了" % (mine or "无", pid or "空")}
+    try:
+        os.remove(path)
+    except OSError as e:
+        return {"ok": False, "error": "删不掉牌子：%s: %s" % (type(e).__name__, str(e)[:80])}
+    return {"ok": True, "removed": path}
+
+
 def wake_view() -> dict:
     """GET /api/skills/form/wake：宿主插件每 5 秒问一次。只读、不改状态。
 
-    两份来源合并成【一条队列】（表单提交 + 批准核销），按 at 排序 —— 判据不许分两处问：
+    三份来源合并成【一条队列】（表单提交 + 批准核销 + 编译跑完），加**第四份：编译半路死了**
+    （死掉的机器自己报不了 —— 见 compile_died_items），按 at 排序 —— 判据不许分两处问：
     插件问两次就有"两次之间状态变了"的缝，也迟早有人只接一半。
     ⚠️ URL 里那个 "form" 是历史名：改路径要和宿主插件【同时】重启，中间窗口里整条唤醒链会静默停摆，
        风险大于名字带来的好处，所以留着，函数名与判据都按真实形状叫。
     """
     items = (form_wake_queue(_form_payloads()) + approval_wake_queue(_approval_wake_load())
-             + compile_wake_queue(_compile_wake_load()))
+             + compile_wake_queue(_compile_wake_load()) + compile_died_queue())
     return {"ok": True, "pending": sorted(items, key=lambda x: x["at"])}
 
 
@@ -1562,7 +1645,7 @@ def task_obligations(task_dir: str) -> list:
        所以【没有任何东西会把它叫回来】。"必须盯到终态"写在 AGENTS.md 里只是散文。
        这一份盘上事实就是给 `agent/turn-stopping` 用的：有活没干完 ⇒ 不许收工。
     两条判据都按盘上算，不认任何人自述：
-      · compiling      —— 任务目录的 .compile.pid 还活着（8100 点火起的那台在跑）
+      · compiling      —— 任务目录的 .compile.pid 还活着（谁起的都算：8100 点火 or agent 自己跑）
       · awaiting_video —— outputs/**/wan3_job.json 有任务号，但成片没落盘（已提交、结果还没到手）
     """
     import glob as _g
@@ -1607,9 +1690,9 @@ def obligation_view(session: str) -> dict:
 
 
 def wake_ack(body: dict) -> dict:
-    """POST /api/skills/form/wake/ack —— 按 kind 分流到三份队列。
+    """POST /api/skills/form/wake/ack —— 按 kind 分流到四份队列。
 
-    🔴 kind 必填（form|approval|compiled），不猜：猜错的那一下会去清另一份队列，
+    🔴 kind 必填（form|approval|compiled|compile_died），不猜：猜错的那一下会去清另一份队列，
        而那边的 `at` 恰好也可能对得上（同一秒内提交/批准/编译完），错清 = 那一格永远没人叫。
     """
     kind = str((body or {}).get("kind") or "")
@@ -1619,7 +1702,10 @@ def wake_ack(body: dict) -> dict:
         return form_wake_ack(body)
     if kind == "compiled":
         return compile_wake_ack(body)
-    return {"ok": False, "error": "ack 必须带 kind=form|approval|compiled（不猜是哪份队列）"}
+    if kind == "compile_died":
+        return compile_died_ack(body)
+    return {"ok": False,
+            "error": "ack 必须带 kind=form|approval|compiled|compile_died（不猜是哪份队列）"}
 
 
 def form_wake_ack(body: dict) -> dict:
