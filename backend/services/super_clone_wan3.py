@@ -3303,6 +3303,7 @@ async def step2_wan3_execute(
 # ─────────────────────────────────────────────────────────────────
 def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_duration,
                        ref_video, seg_product_paths, source_fit=None,
+                       extra_note: Optional[str] = None,
                        log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """物证三件（prompt.txt / storyboard.json / prompt_meta.json）+ 回执 + 花钱前的合同核验。
 
@@ -3350,6 +3351,29 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
         "prompt_chars": len(seg_prompt),
         "target_duration": float(seg_duration)}, ensure_ascii=False, indent=1), encoding="utf-8")
 
+    # 🔴 storyboard-fact-check（2026-10-11 补的合同步）：MiMo 的分镜表是【上游解析结果】，不是事实本身
+    #    （现网：5.1s 单镜头被解析成 2 镜，还标了"硬切 + 换装"）。SKILL.md 早就要求"标签不符就按秒写死
+    #    时间轴压过它"，但那一步既没有物证、也没登记授权手段 ⇒ agent 每改一次都要自己论证一遍合法性，
+    #    论证不出来就去绕开入口手搓 driver（2026-10-11 现网 21:23 就是这个形状）。
+    #    现在把两样都登记上：改了什么（extra_note.txt 全文 + 指纹）+ 改之前是什么（镜数/时长/分镜指纹），
+    #    由管线自己落盘，不是 agent 手写。
+    #    ⚠️ 强度边界照实说：这份物证证明"对账发生过、改的是哪一版"，【不证明改得对】——
+    #       对不对由人在审帧那一刀看（frames/ 与成片），不由这个文件担保。
+    _note = str(extra_note or "").strip()
+    npath = seg_dir / "extra_note.txt"
+    if _note:
+        npath.write_text(_note + "\n", encoding="utf-8")
+    sc = seg_dir / "storyboard_check.json"
+    sc.write_text(json.dumps({
+        "source": "step1_mimo+runner-extra-note",
+        "shot_count": len(seg_board or []),
+        "duration": float(seg_duration),
+        "note_present": bool(_note),
+        "note_chars": len(_note),
+        "note_sha8": (_skc.sha8(str(npath)) if _note else ""),
+        "storyboard_sha8": _skc.sha8(str(sb)),
+    }, ensure_ascii=False, indent=1), encoding="utf-8")
+
     fit = Path(source_fit) if source_fit else None
     if fit is None or not fit.exists():
         for cand in ("trimmed_source.mp4", "source.mp4"):
@@ -3365,6 +3389,7 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             steps={"material-analysis": str(seg_dir / "material_analysis.json"),
                    "compile-prompt": str(seg_dir / "prompt.txt"),
                    "storyboard": str(sb),
+                   "storyboard-fact-check": str(sc),
                    "compile-bound": str(seg_dir / "prompt_meta.json"),
                    "negative-lock": str(seg_dir / "prompt.txt"),
                    "source-fit": (str(fit) if fit and fit.exists() else None),
@@ -3374,7 +3399,8 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             # 手段申报进【回执行】：合同给某步写死了 `手段=` 白名单，不在名单里或根本没申报 ⇒ check_receipt 拒。
             # （原来这行没写，impl 被错传给了 verify_or_raise —— 那个函数没这个参数，直接 TypeError。）
             impl={"negative-lock": "compiler-negative-lock",
-                  "material-analysis": "gateway:video.analyze"},
+                  "material-analysis": "gateway:video.analyze",
+                  "storyboard-fact-check": "runner:--extra-note"},
             models={"compile-prompt": cell, "compile-bound": cell})
     except Exception as _re:                              # noqa: BLE001
         _l("⚠️ 回执写入失败（下一步核验会因此拒绝提交，不是上游问题）：%s" % _re)
@@ -3414,6 +3440,7 @@ async def run_pipeline(
     as_duration_chunk: bool = False,
     background_override: Optional[str] = None,
     voice_audio_paths: Optional[List[str]] = None,
+    stop_after: Optional[str] = None,
 ) -> Dict[str, Any]:
     """超级复刻 Wan3.0/H3 - 4 步工作流顶层编排。
 
@@ -3438,6 +3465,7 @@ async def run_pipeline(
         trim_end: 裁剪终点（秒，0-based）
         model_image_path: 模特参考图本地路径（可选，用于人物替换）
         scene_image_path: 场景参考图本地路径（可选，用于背景替换）
+        stop_after: None=照常提交；"compile"=只走到"物证+回执+合同核验"就返回（不提交、不建 hold、0 分）
 
     Returns:
         {
@@ -3461,6 +3489,14 @@ async def run_pipeline(
     _lock = engine_lock_error(engine)
     if _lock:
         raise RuntimeError(_lock)
+
+    # 🔴 第二道：档位锁（2026-10-11）。stop_after="compile" = 只走到"物证 + 回执 + 合同核验"就返回，
+    #    不提交、不建 hold、0 分。为什么必须有这一档：SKILL.md 要求"分镜/动作标签不符 ⇒ 补 extra-note
+    #    重编译（0 分，不烧 Wan）"，而入口以前【只有整条跑到提交】一种走法 ⇒ 想遵守这句散文就只能绕开
+    #    入口手搓 driver 直调 run_pipeline（2026-10-11 现网 21:23 就是这么走的，绕道又撞上"不许发明手段"）。
+    #    拼错的档位一律拒 —— 不许把 "compil" 静默当成"照常提交"（那等于拿拼写错误花钱）。
+    if stop_after not in (None, "", "compile"):
+        raise RuntimeError('stop_after 只认 None 或 "compile"（收到 %r）' % (stop_after,))
 
     def log(msg: str) -> None:
         if on_log:
@@ -4012,6 +4048,7 @@ async def run_pipeline(
         )
         split_root.mkdir(parents=True, exist_ok=True)
         part_paths: List[str] = []
+        compiled_only: List[Dict[str, Any]] = []      # 只编译档位收这一段（不进执行器 ⇒ 0 消耗）
         last_result: Dict[str, Any] = {}
         for index, group in enumerate(segments, start=1):
             seg_dir = split_root / f"seg_{index:02d}"
@@ -4063,7 +4100,7 @@ async def run_pipeline(
             _contract_evidence(
                 seg_dir, seg_board=seg_board, seg_prompt=seg_prompt, compiled_seg=compiled_seg,
                 seg_duration=seg_duration, ref_video=ref_video,
-                seg_product_paths=seg_product_paths, log=log,
+                seg_product_paths=seg_product_paths, extra_note=extra_compile_note, log=log,
             )
             log(
                 f"段 {index}/{len(segments)} "
@@ -4071,6 +4108,12 @@ async def run_pipeline(
                 f"Shot {sorted(group['shot_nums'])} "
                 f"产品={'绑定' if include_product else '占位'}"
             )
+            if stop_after == "compile":
+                # 只编译档位：物证与回执已经写完（上面那一刀），这里【不进执行器】⇒ 0 消耗。
+                compiled_only.append({"seg": index, "dir": str(seg_dir),
+                                      "prompt_path": str(Path(seg_dir) / "prompt.txt"),
+                                      "window": [float(group["start"]), float(group["end"])]})
+                continue
             last_result = await _run_executor(
                 exec_prompt=seg_prompt,
                 exec_video=ref_video,
@@ -4087,6 +4130,17 @@ async def run_pipeline(
                     f"第 {index}/{len(segments)} 段生成失败，无法拼接"
                 )
             part_paths.append(str(part))
+        if stop_after == "compile":
+            log("档位=只编译 ⇒ 不提交、不建 hold、0 分（%d 段提示词已落盘并过合同核验）"
+                % len(compiled_only))
+            return {
+                "compiled_only": True, "stop_after": "compile",
+                "prompt": prompt, "storyboard": storyboard, "segments": compiled_only,
+                "target_duration": target_duration, "trimmed_path": trimmed_path,
+                "task_id": None, "result_url": None, "local_path": None,
+                "final_path": None, "output_duration": None, "duration": None,
+                "duration_status": "not_submitted",
+            }
         concat_path = str(split_root / "final_concat.mp4")
         log(f"拼接 {len(part_paths)} 段 → {concat_path}")
         concat_videos(part_paths, concat_path)
@@ -4115,7 +4169,20 @@ async def run_pipeline(
         _contract_evidence(_whole_dir, seg_board=storyboard, seg_prompt=prompt,
                            compiled_seg=compiled, seg_duration=float(target_duration),
                            ref_video=trimmed_path, seg_product_paths=list(product_image_paths),
-                           source_fit=trimmed_path, log=log)
+                           source_fit=trimmed_path, extra_note=extra_compile_note, log=log)
+        if stop_after == "compile":
+            log("档位=只编译 ⇒ 不提交、不建 hold、0 分（提示词/分镜/回执已落在 %s）" % _whole_dir)
+            return {
+                "compiled_only": True, "stop_after": "compile",
+                "prompt": prompt, "storyboard": storyboard, "media_manifest": media_manifest,
+                "target_duration": target_duration, "trimmed_path": trimmed_path,
+                "task_id": None, "result_url": None, "local_path": None,
+                "final_path": None, "output_duration": None, "duration": None,
+                "duration_status": "not_submitted",
+                "segments": [{"seg": 1, "dir": _whole_dir,
+                              "prompt_path": str(Path(_whole_dir) / "prompt.txt"),
+                              "window": [0.0, float(target_duration)]}],
+            }
         if engine == "h3":
             log("=== Step 3/4: 满雪 H3 全能参考（执行器）→ 原视频 + 产品图 + 原提示词 ===")
             step2 = await _run_executor(
