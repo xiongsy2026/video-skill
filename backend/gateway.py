@@ -3068,6 +3068,65 @@ def deny_pending(pending_id: str, reason: str = "denied-on-page") -> dict:
     return {"ok": True, "reason": reason}
 
 
+def known_balance(account: str):
+    """账本里【真有这个账户】才回它的余额；查不到回 None。
+
+    🔴 为什么不用 `ledger().balance()`：它对不认识的账户回**默认 100000**（实测
+    `balance("__no_such__") == 100000`）⇒ 卡上/报价里那句"余额 100000 → 最低 99820"是个凭空数。
+    现网 2026-10-11 08:23 那次报价的"余额 99544"就是这么来的（盘上真值 99532）。
+    报价五格里"余额"这一格的出处必须是账本，不是解释器的默认值。
+    """
+    name = str(account or "").strip()
+    if not name:
+        return None
+    try:
+        rows = ledger().accounts() or []
+    except Exception:                                       # noqa: BLE001
+        return None
+    for r in rows:
+        if isinstance(r, dict) and str(r.get("member") or "").strip() == name:
+            try:
+                return int(r.get("balance"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+APPROVE_BUTTON = "确认发起 · 不可撤回"
+
+
+def approval_notice(p: dict) -> dict:
+    """批准卡上那段【点下去之后】—— 置顶窗与批准页共用这一份，谁都不许自己写一遍。
+
+    🔴 为什么要这段（2026-10-12 用户："审核这里做一个批准确认，说明批准后发起任务没法撤回"）：
+       卡上原有四格（要跑几段 / 最多扣多少分 / 多久内有效 / 这次要做的）全是【事前量】，
+       没有一句说后果不可逆 —— 而"撤销"这个动作我们物理上签不出来（上游按次计费）。
+       所以那一下点击必须带着它的后果一起被看见，而不是让人事后才发现回不去。
+    🔴 同时必须写"不扣的情况"：只讲"不能撤回"不讲"失败本来就不该你买单"，那是拿恐惧换点头。
+    数字一律现读（单价/余额都从账本与价目取），条子上写什么就说什么，不许另算一份。
+    """
+    p = p if isinstance(p, dict) else {}
+    cap, pur = str(p.get("capability") or "?"), str(p.get("purpose") or "")
+    lane = "%s/%s" % (cap, pur) if pur else cap
+    count = p.get("count")
+    credits = p.get("credits")
+    acct = str(p.get("account") or "")
+    bal = known_balance(acct)                               # None = 账本里没这个账户 ⇒ 不印余额
+    spend = "（余额 %s → 最低 %s）" % (bal, bal - int(credits or 0)) if (
+        isinstance(bal, int) and isinstance(credits, int)) else ""
+    return {
+        "headline": "点下去之后",
+        "button": APPROVE_BUTTON,
+        "bullets": [
+            "这张条子当场生效，任务随即发起（%s · %s 段 · 最多 %s 分%s），不再问你第二次。"
+            % (lane, count if count is not None else "?", credits if credits is not None else "?", spend),
+            "🔴 不能撤回：上游按次计费，一旦交到厂商手里，撤销这个动作我们签不出来；已扣的分不退。",
+            "不扣的情况：上游失败 / 超时 / 5xx ⇒ 不计次、预扣自动回滚（失败本来就不该你买单）。",
+            "范围锁死：加段数、换路由、改片型 ⇒ 这张条子立刻失效，要重新报价、重新点一次。",
+        ],
+    }
+
+
 def build_quote_summary(capability: str, purpose: str, account: str, count: int,
                         credits: int, scope: str, session: str = "") -> str:
     """报价正文（终端与审批卡共用一份，数字一律现算，不让人对着空气点头）。"""
@@ -3075,9 +3134,9 @@ def build_quote_summary(capability: str, purpose: str, account: str, count: int,
         unit = unit_price(capability, purpose)
     except Exception:
         unit = "?"
-    try:
-        bal = ledger().balance(account)
-    except Exception:
+    # 余额走 known_balance：账本里查不到就回 "?"，绝不拿解释器的默认 100000 当余额报给人。
+    bal = known_balance(account)
+    if bal is None:
         bal = "?"
     return ("路由：%s/%s\n账户：%s\n单价：%s 分/段\n段数：%s\n预计扣分：%s\n当前余额：%s\n会话：%s\n方案：%s"
             % (capability, purpose, account, unit, count, credits, bal, session or "-",
@@ -3123,10 +3182,7 @@ def quote_facts(session: str = "", account: str = "local") -> dict:
               if (g.get("session") or "") == (session or "") and float(g.get("expires") or 0) > now]
     charged = [int(r.get("credits") or 0) for r in media_analysis_rows()
                if (r.get("session") or "") == (session or "") and r.get("credits") is not None]
-    try:
-        bal = ledger().balance(account)
-    except Exception:                                       # noqa: BLE001 —— 读不到就说读不到，不猜一个数
-        bal = None
+    bal = known_balance(account)        # 与报价正文同一份判据：账本里没这个账户就是 None，不拿默认 100000 充数
     return {"session": session, "account": account,
             "pending_id": (pend[0].get("id") if pend else ""),
             "quote_text": (pend[0].get("quote") if pend else ""),
@@ -3146,6 +3202,18 @@ def quote_problems(message: str, facts: dict, unit=None) -> list:
     if not got:
         return []
     probs, has_pending = [], bool(facts.get("pending_id") or facts.get("grant_ids"))
+    # 🔴 格子里写的不是数（"?" / "读不到"）**不算有出处**：数字解析器会直接跳过它，于是"五格全绿"
+    #    其实是五格全空 —— 2026-10-12 把余额换成 known_balance 之后就是这个形状（正文印"当前余额：?"
+    #    而判据读到 100000，B5 那条变异因为"改不动文本"静默拿了空集合）。
+    for _f, _labels in _QUOTE_LABELS.items():
+        if any(_f == f for f, _n in got):
+            continue
+        for _lb in _labels:
+            _m = _re.search(r"%s[：:]\s*([^|\n\r]+)" % _re.escape(_lb), message or "")
+            if _m and not _re.match(r"\s*\d", _m.group(1)):
+                probs.append("%s 这一格写的不是数（%s）⇒ 没有出处就别贴这一格"
+                             % (_f, _m.group(1).strip()[:24]))
+                break
     for field, num in got:
         if field == "实扣":
             # "实扣" = 这条会话到现在真扣掉的分 ⇒ 只能等于台账合计；报单次数字 = 少报重复消耗

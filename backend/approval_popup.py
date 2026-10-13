@@ -97,6 +97,12 @@ def main(argv):
     detail.pack(padx=18, anchor="w")
     left = Label(root, text="", fg="#e0a35c", bg="#0f1115", font=("Microsoft YaHei UI", 9))
     left.pack(padx=18, anchor="w", pady=(6, 0))
+    # 后果说明区：内容整段来自服务端那一份 notice（谁都不许在这里写第二份"不能撤回"）
+    nhead = Label(root, text="", fg="#e0a35c", bg="#0f1115", font=("Microsoft YaHei UI", 9, "bold"))
+    nhead.pack(padx=18, anchor="w", pady=(10, 2))
+    nbody = Label(root, text="", fg=fg, bg="#0f1115", font=("Microsoft YaHei UI", 9),
+                  wraplength=430, justify="left", align="top")
+    nbody.pack(padx=18, anchor="w")
     box = Frame(root, bg="#0f1115")
     box.pack(pady=16)
     state = {"done": False}
@@ -113,9 +119,10 @@ def main(argv):
         state["done"] = True
         root.after(3000, root.destroy)
 
-    Button(box, text="批准，开始跑", command=lambda: act("approve"), bg="#1f8a5f", fg="#fff",
-           activebackground="#26a874", relief="flat", padx=18, pady=8,
-           font=("Microsoft YaHei UI", 11, "bold")).pack(side="left", padx=(0, 10))
+    ok_btn = Button(box, text="批准，开始跑", command=lambda: act("approve"), bg="#1f8a5f", fg="#fff",
+                    activebackground="#26a874", relief="flat", padx=18, pady=8,
+                    font=("Microsoft YaHei UI", 11, "bold"))
+    ok_btn.pack(side="left", padx=(0, 10))
     Button(box, text="先不跑", command=lambda: act("deny"), bg="#2a2f3a", fg=fg,
            activebackground="#353b47", relief="flat", padx=14, pady=8,
            font=("Microsoft YaHei UI", 11)).pack(side="left")
@@ -136,6 +143,15 @@ def main(argv):
         cap = "%s/%s" % (row.get("capability"), row.get("purpose"))
         title.config(text="%s · %s 段 · 上限 %s 分" % (cap, row.get("count"), row.get("credits")))
         detail.config(text="要做的：%s\n账户：%s" % (row.get("scope") or "（没写范围）", row.get("account")))
+        # 🔴「点下去之后」这段后果说明只有一份（gateway.approval_notice，随 /api/spend/pending 下发）
+        #    ⇒ 窗口里不许自己写一句"不能撤回"，也不许在批准页 HTML 里再写一遍：两处迟早漂。
+        notice = row.get("notice") or {}
+        bullets = notice.get("bullets") or []
+        if bullets:
+            nhead.config(text=notice.get("headline") or "点下去之后")
+            nbody.config(text="\n".join("· " + b.replace("🔴 ", "") for b in bullets))
+            if notice.get("button"):
+                ok_btn.config(text=notice["button"])
         sec = int(row.get("left_seconds") or 0)
         left.config(text="剩余 %d 分 %d 秒后自动作废（作废 = 拒绝，不是默认同意）" % (sec // 60, sec % 60))
         root.after(POLL_MS, tick)

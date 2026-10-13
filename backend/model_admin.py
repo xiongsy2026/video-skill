@@ -610,6 +610,9 @@ h1{font-size:17px;margin:0 0 4px;font-weight:600}
 .kv .v{font-size:15px;font-weight:600}
 .v.money{color:var(--warn)}
 .scope{background:color-mix(in srgb, var(--brand) 9%, transparent);border:1px solid color-mix(in srgb, var(--brand) 32%, transparent);border-radius:10px;padding:10px 12px;color:var(--fg);font-size:13px}
+.notice{margin-top:10px;border:1px solid #6b2f22;border-left:3px solid #c9543e;border-radius:10px;padding:9px 12px;background:color-mix(in srgb,#c9543e 8%,transparent)}
+.nhead{color:#e0a35c;font-size:12px;letter-spacing:.4px;margin-bottom:4px}
+.notice ul{margin:0;padding-left:18px;color:var(--fg);font-size:12.5px;line-height:1.65}
 .acts{display:flex;gap:10px;margin-top:16px}
 button{flex:1;padding:11px 14px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font-size:14px;cursor:pointer}
 button.ok{background:var(--brand);border-color:var(--brand);color:var(--on-brand);font-weight:600}
@@ -649,7 +652,9 @@ function card(p){
     <div class=kv><div class=k>多久内有效</div><div class=v>${left} 分钟</div></div>
   </div>
   <div class=scope>这次要做的：${E(p.scope)||'（没写）'}</div>
-  <div class=acts><button class=ok>批准，开始跑</button><button class=no>这次不跑</button></div>
+  <div class=notice><div class=nhead>${E((p.notice||{}).headline||'点下去之后')}</div>
+    <ul>${((p.notice||{}).bullets||[]).map(b=>`<li>${E(b)}</li>`).join('')}</ul></div>
+  <div class=acts><button class=ok>${E((p.notice||{}).button||'')}</button><button class=no>这次不跑</button></div>
   <div class=msg></div>`;
   if(!mine)d.style.opacity=.5;
   d.querySelector('.ok').onclick=()=>act(d,'/api/spend/approve',p.id,'已批准');
@@ -2268,6 +2273,9 @@ class H(BaseHTTPRequestHandler):
             rows = [{"id": p["id"], "capability": p["capability"], "purpose": p["purpose"],
                      "account": p["account"], "count": p["count"], "credits": p["credits"],
                      "scope": p.get("scope", ""), "session": p.get("session", ""),
+                     # notice 只有一份（gateway.approval_notice）：页面与置顶窗读的都是它 ⇒
+                     # 不许在 HTML 里再写一句"不能撤回"，那会变成两处漂的文案。
+                     "notice": gateway.approval_notice(p),
                      "left_seconds": max(0, round(float(p["expires"]) - time.time()))}
                     for p in gateway.spend_pending()]
             self._send(200, json.dumps({"pending": rows,
