@@ -212,7 +212,17 @@ def task_restart(wait: float = 30.0) -> str:
     subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, timeout=30)
     if not _wait_healthy(wait):
         return "schtasks-no-answer"
-    new = listener_pid()
+    # 🔴 答话之后还要读得到"是谁在答话"：刚 /run 的那一两秒里监听表可能还没刷出来（实测
+    #    49252->None），此时若直接判"换了人"就是又一次自报成功。读不到就等，等不到就明说。
+    new = None
+    for _ in range(12):
+        new = listener_pid()
+        if new:
+            break
+        time.sleep(0.5)
+    if not new:
+        return ("schtasks-no-listener-pid ⇒ 端口在答话但读不到监听者 pid，"
+                "不能判「换人」，请手动核一次再当生效")
     if old and new == old:
         return ("schtasks-SAME-PID-%s ⇒ 端口还是【重启前那一份】在答话 = 跑的是旧代码，"
                 "别当重启成功" % old)
