@@ -187,8 +187,13 @@ def task_restart(wait: float = 30.0) -> str:
     """【人工/agent 用】把任务那一跳真正重启一次：/end → 确认包装 wscript 退净 → /run → 等健康。
     ⚠️ 看门狗自己【绝不】走这里 —— .cmd 就是任务的动作，ensure 里再 /run 等于自我递归：
        2026-10-11 实测第二层 guard 会把第一层刚起的那份 /end 掉，表现是"报 RESTARTED-OK 然后端口空着"。
-       这条留给人，是因为任务的实例记录会卡（LastTaskResult=0x800710E0=还在跑），
-       不先把 wscript 确认退净，/run 就是白敲。"""
+       这条留给人，是因为任务的实例记录会卡（LastTaskResult=0x800710E0="还在跑"），
+       不先把 wscript 确认退净，/run 就是白敲。
+    🔴 但"端口答话"【不能】当重启成功的判据（2026-10-13 实测）：端口可能被【上一代的孤儿 python】
+       占着 —— 19:11 起的那份 model_admin 父进程已死，`schtasks /end` 根本碰不到它。于是
+       /end → /run 都"成功"，答话的还是那份旧代码，守卫打印 RESTARTED-OK 而新代码一行都没生效。
+       所以这里改判据：**换人**才算重启（结束前记下监听 pid，重启后必须是另一个 pid）。"""
+    old = listener_pid()
     subprocess.run(["schtasks", "/end", "/tn", TASK], capture_output=True, timeout=30)
     for _ in range(8):          # 等包装进程退净，IgnoreNew 才不会再挡下 /run
         left = wrapper_pids()
@@ -197,8 +202,21 @@ def task_restart(wait: float = 30.0) -> str:
         for w in left:
             subprocess.run(["taskkill", "/PID", str(w), "/F"], capture_output=True, timeout=20)
         time.sleep(1.0)
+    if old:                     # 端口还被【/end 管不到的旧进程】占着 ⇒ 指名结束它（只杀命令行确实是
+        for _ in range(4):      #    model_admin 的那一份；命令行对不上就什么都不做，见 kill_wedged）
+            if not cmdline_of(int(old)):
+                break
+            if not kill_wedged(int(old)):
+                break
+            time.sleep(1.0)
     subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, timeout=30)
-    return "schtasks" if _wait_healthy(wait) else "schtasks-no-answer"
+    if not _wait_healthy(wait):
+        return "schtasks-no-answer"
+    new = listener_pid()
+    if old and new == old:
+        return ("schtasks-SAME-PID-%s ⇒ 端口还是【重启前那一份】在答话 = 跑的是旧代码，"
+                "别当重启成功" % old)
+    return "schtasks %s->%s" % (old, new)
 
 
 def kill_wedged(pid: int) -> bool:
@@ -264,8 +282,10 @@ if __name__ == "__main__":
         sys.exit(ensure())
     elif cmd == "restart":
         how = task_restart()
-        ok = probe(tries=1)
-        print(("RESTARTED-OK " if ok else "RESTARTED-STILL-DEAD ") + how)
+        ok = probe(tries=1) and not how.startswith("schtasks-SAME-PID")
+        # 🔴 "答话"不等于"换人"：旧进程还在答话时这里必须红着报，否则调用方（和我）会把
+        #    "RESTARTED-OK" 当成新代码已生效 —— 2026-10-13 就是这么差点收工的。
+        print(("RESTARTED-OK " if ok else "RESTARTED-NOT-EFFECTIVE ") + how)
         sys.exit(0 if ok else 1)
     else:
         print("用法: python svc_8100_guard.py [status|sweep|ensure|restart]")
