@@ -1079,6 +1079,13 @@ def form_gate_view(sid: str) -> dict:
         # 🔴 回填只进 defaults，绝不进 submitted ⇒ 客户仍需自己点【提交这张表】。
         out["defaults"] = pre.get("defaults") or {}
         out["default_files"] = pre.get("media") or {}
+        # 🔴 预填素材的体积一起下发（2026-10-13 现网：agent 归位了 7 张产品图，其中一张 12.91MB
+        #    超过图片槽 8MB ⇒ 客户点【提交】被服务端整单拒，页面只闪一行小字、按钮还亮着，
+        #    他的体感就是"点了没反应"，连点 6 次。体积必须在**点之前**就看得见。）
+        #    读不到大小记 -1（不许记 0 —— 那会被判成"空文件"，把读不到伪装成客户的错）。
+        out["default_file_sizes"] = {
+            k: [(_sz(p)) for p in (v or [])]
+            for k, v in (pre.get("media") or {}).items() if isinstance(v, list)}
         out["prefill_dropped"] = pre.get("dropped") or []
         # 回填依据：页面上挂在「AI 已填 · 可改」的悬停里。客户要能分清哪些是自己填的、
         # 哪些是 agent 猜的 —— 分不清的话，填错的归因会全落到我们头上（2026-10-09 产品的要求）。
@@ -1176,6 +1183,15 @@ def _form_sid_dir(sid: str) -> str:
     # 会话 id 本身是 uuid 形状，但它是【外部输入】⇒ 不进目录名，只进哈希。
     h = hashlib.sha256(str(sid).encode("utf-8")).hexdigest()[:12]
     return os.path.join(FORM_UPLOAD_DIR, h)
+
+
+def _sz(path):
+    """素材体积（字节）；读不到回 -1。🔴 不回 0 —— 0 会被前端判成"空文件"，
+    那是把"我们读不到"伪装成"客户的文件有问题"。"""
+    try:
+        return int(os.path.getsize(path))
+    except (OSError, ValueError, TypeError):
+        return -1
 
 
 def _form_fields_wire(fields):

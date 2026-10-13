@@ -103,6 +103,11 @@ font-size:11px;cursor:pointer;padding:0}
 .th .nm{font-size:10px;color:var(--mut);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .th[data-src="agent"] img,.th[data-src="agent"] .vid{border-color:var(--brand);border-style:dashed}
 .th .agent{position:absolute;top:4px;left:4px;font-size:10px;color:var(--brand);cursor:help}
+/* 超过体积上限的那一张：红边 + 底部一条红字角标（体积数字就在上面，不让人猜）
+   颜色一律走 WS_TOKENS（F6 钉"页面里不许出现裸 hex"） */
+.th[data-big="1"]{outline:2px solid var(--bad);outline-offset:1px;border-radius:var(--radius)}
+.th .big{position:absolute;left:0;right:0;bottom:-2px;font-size:10px;line-height:1.25;color:var(--bg);
+  background:var(--bad);border-radius:0 0 9px 9px;padding:2px 4px;text-align:center;cursor:help}
 /* 吸底操作条 */
 .bar{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--line);
 padding:12px 16px;display:flex;flex-direction:column;gap:6px}
@@ -176,12 +181,47 @@ function isShown(f, values){
   return (c.values || []).indexOf(cur) >= 0;
 }
 function isLocked(f){ return f.type === "locked"; }
+/* 🔴 哪些素材【超过这一槽的体积上限】—— 现网 2026-10-13 23:09：agent 归位了 7 张产品图，
+   其中一张 12.91MB > 图片槽 8MB，客户点【提交】被服务端整单拒，页面只闪一行小字、按钮还亮着
+   ⇒ 他的体感是"点了没反应"，连点 6 次。上限的权威数在字段表（服务端下发 max_bytes），
+   这里只做"点之前看得见"：本地选的用 blob.size，AI 预填的用服务端一起下发的 default_file_sizes。
+   读不到大小（-1）一律不算超限 —— 不许把"我们没量到"当成"客户的文件有问题"。 */
+function overSized(g, f, picked){
+  if (!isMedia(f)) return [];
+  var cap = (f.max_bytes || 0), out = [];
+  if (!cap) return out;
+  (picked || []).forEach(function(it, i){
+    var s = it && it.blob ? it.blob.size : -1;
+    if (s > cap) out.push({i:i, size:s, local:true});
+  });
+  var pref = ((g && g.default_files || {})[f.param] || []);
+  var sizes = ((g && g.default_file_sizes || {})[f.param] || []);
+  if (!Array.isArray(pref)) pref = pref ? [pref] : [];
+  pref.forEach(function(p, i){
+    var s = (Array.isArray(sizes) ? sizes[i] : -1);
+    if (typeof s === "number" && s > cap) out.push({i:i, size:s, local:false, path:p});
+  });
+  return out;
+}
+function mb(n){ return (Math.round(n / 1048576 * 10) / 10) + "MB"; }
+function missText(f){
+  if (f.over && f.over.length){
+    var big = 0;
+    f.over.forEach(function(o){ if (o.size > big) big = o.size; });
+    return f.label + "：有 " + f.over.length + " 个超过 " + mb(f.max_bytes || 0)
+           + "（最大那张 " + mb(big) + "，点它右上角的 × 去掉再交）";
+  }
+  return f.label;
+}
+
 function formIsComplete(g, values, picked, defaults){
   var miss = [];
   ((g && g.fields) || []).forEach(function(f){
     if (isLocked(f) || !isShown(f, values)) return;
     var ok = false;
     if (isMedia(f)){
+      var over = overSized(g, f, picked[f.key]);
+      if (over.length){ miss.push(Object.assign({}, f, {over: over})); return; }
       var n = (picked[f.key] || []).length;
       var d = ((g.default_files || {})[f.param] || []);
       // 🔴 选填的媒体槽【不选也算填完】。漏了这条的后果很实在：商品图设成选填，
@@ -269,6 +309,17 @@ function mediaField(f, sec){
             : (f.type === "video" ? h("div", {class:"vid", text:"已选视频"})
                                   : h("img", {src:thumbUrl({param:f.param, name:base}), alt:""})));
       th.appendChild(media);
+      /* 🔴 超过这一槽体积上限的那一张，当场标出来（红边 + 角标写"12.9MB > 8MB"）。
+         不这么做的话，客户只能在点提交之后从一行小字里猜是哪张 —— 而这张图可能根本不是他选的。 */
+      var capB = f.max_bytes || 0;
+      var szB = e.local ? ((e.it && e.it.blob) ? e.it.blob.size : -1)
+                        : (((gate.default_file_sizes || {})[f.param] || [])[e.i] === undefined
+                            ? -1 : (gate.default_file_sizes[f.param][e.i]));
+      if (capB && typeof szB === "number" && szB > capB){
+        th.setAttribute("data-big", "1");
+        th.appendChild(h("span", {class:"big", text:mb(szB) + " > " + mb(capB),
+          title:"这张超过这一槽的体积上限，提交会被拒；点右上角 × 去掉它，或换一张小一点的"}));
+      }
       if (idx === 0 && f.type === "images") th.appendChild(h("span", {class:"mn", text:"主图"}));
       if (!e.local) th.appendChild(h("span", {class:"agent", text:"AI",
         title:(notes[f.key] || "agent 从你在对话里给的素材/要求预填的 · 可改")}));
@@ -465,8 +516,8 @@ function paint(){
   var miss = formIsComplete(gate, vals, files, aiDefaults);
   go.textContent = busy ? "提交中…" : (miss.length ? "还差 " + miss.length + " 项" : "提交给 agent 分析");
   go.setAttribute("data-on", miss.length ? "0" : "1");
-  if (!busy) hint(miss.length ? "还差：" + miss.map(function(f){ return f.label; }).join("、") : "",
-                 miss.length ? "" : "");
+  if (!busy) hint(miss.length ? "还差：" + miss.map(missText).join("；") : "",
+                  miss.length ? "" : "");
 }
 
 function reportAttempt(missing, reason){
@@ -490,8 +541,8 @@ function submit(){
       if (el) { el.setAttribute("data-miss", "1"); } });
     var first = document.querySelector('[data-miss="1"]');
     if (first && first.scrollIntoView) first.scrollIntoView({behavior:"smooth", block:"center"});
-    hint("还差：" + miss.map(function(f){ return f.label; }).join("、"), "bad");
-    reportAttempt(miss.map(function(f){ return f.label; }), "前端判缺项，未发提交");
+    hint("还差：" + miss.map(missText).join("；"), "bad");
+    reportAttempt(miss.map(missText), "前端判缺项，未发提交");
     return;
   }
   busy = true; paint();
