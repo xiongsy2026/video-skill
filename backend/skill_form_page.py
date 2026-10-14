@@ -144,6 +144,11 @@ padding:5px 0;border-bottom:1px solid var(--line)}
 var QS = new URLSearchParams(location.search), SID = QS.get("session") || "";
 var API = "/api/skills/form";        // 同源相对路径：页面由 8100 自己发，绝不跨口（端口收敛的根据）
 var gate = null, vals = {}, files = {}, aiDefaults = {}, busy = false, sent = false, notes = {};
+// 🔴 stickyErr：服务端/提交环节刚给出的拒因。paint() 每次重算提示位时【先它还留着就还它】，
+//    不许用"还差 N 项 / 空串"盖掉 —— 2026-10-14 现网 15:35：回填记录里的路径已过期，服务端拒了
+//    六次，而 hint(拒因) 后面紧跟的那一句 paint() 把提示清成空串，客户面上就是"点了没反应"
+//    （唯一现场证据只剩 .dsh/form_attempts.json）。
+var stickyErr = "";
 /* 🔴 editing = 人从【已提交摘要卡】点了「改参数」回来。它是"别再拿 done 覆盖这张表"的旗子：
    服务端 submitted 一直是 true（载荷在那儿摆着），轮询每 8 秒就会把整页换回只读卡 ——
    没有这面旗，客户点【改参数】等于什么都不会发生（2026-10-11 现网那句"ai 帮我选了我没法选"）。 */
@@ -367,7 +372,19 @@ function mediaField(f, sec){
 
 function hint(t, kind){ var el = document.getElementById("hint");
   el.className = "hint" + (kind ? " " + kind : ""); el.textContent = t || ""; }
-function refresh(){ applyVis(); drawAll(); paint(); }
+function hintTextFor(sticky, missTexts){
+  /* 提示位该显示哪一句 —— 纯函数，回归 C 组把它抠进 node 跑值表（判据只在这一份）。
+     顺序是死的：① 服务端刚拒过 ⇒ 先还它；② 前端判缺项 ⇒ 说还差哪几格；③ 都没有 ⇒ 清空。
+     🔴 ①必须在最前面：2026-10-14 现网 15:35 就是 paint() 用 ②/③ 的结果盖掉了 ①，
+        客户连点六次拿到的是"什么都没有"，而真实拒因只剩在 .dsh/form_attempts.json 里。 */
+  if (sticky) return [String(sticky), "bad"];
+  if (missTexts && missTexts.length) return ["还差：" + missTexts.join("；"), ""];
+  return ["", ""];
+}
+
+function refresh(){ stickyErr = ""; applyVis(); drawAll(); paint(); }
+   // 🔴 客户动过任何一格（改值、换文件、重排）就把上一次的拒因清掉 —— 粘住的是"那一次的拒绝"，
+   //    不是永久横幅；他改完再点，要么成交、要么拿到一条新的、对得上当前状态的拒因。
 
 /* 🔴 条件显隐要【在每次值变化后重算】。以前 render() 只在打开页面时算一次，
    结果点了 chip 也不会把「参考音频」放出来 —— 表现就是"这格根本不存在"，比假选项更坏。
@@ -516,8 +533,10 @@ function paint(){
   var miss = formIsComplete(gate, vals, files, aiDefaults);
   go.textContent = busy ? "提交中…" : (miss.length ? "还差 " + miss.length + " 项" : "提交给 agent 分析");
   go.setAttribute("data-on", miss.length ? "0" : "1");
-  if (!busy) hint(miss.length ? "还差：" + miss.map(missText).join("；") : "",
-                  miss.length ? "" : "");
+  if (!busy) {
+    var ht = hintTextFor(stickyErr, miss.map(missText));      // 🔴 判据在 hintTextFor 那一份，这里只调它
+    hint(ht[0], ht[1]);
+  }
 }
 
 function reportAttempt(missing, reason){
@@ -545,7 +564,7 @@ function submit(){
     reportAttempt(miss.map(missText), "前端判缺项，未发提交");
     return;
   }
-  busy = true; paint();
+  stickyErr = ""; busy = true; paint();     // 新一轮尝试：先放下上一次的拒因，别拿旧原因判今天
   var payload = {session:SID, skill:gate.skill, values:{}, files:[]};
   (gate.fields || []).forEach(function(f){
     if (isMedia(f) || isLocked(f) || !isShown(f, vals)) return;
@@ -574,11 +593,14 @@ function submit(){
                        body:JSON.stringify(payload)});
   }).then(function(r){ return r.json(); }).then(function(j){
     busy = false;
-    if (!j || !j.ok){ hint((j && j.error) || "提交失败（8100 没接受）", "bad");
-                      reportAttempt([], (j && j.error) || "8100 没接受"); paint(); return; }
+    if (!j || !j.ok){ stickyErr = (j && j.error) || "提交失败（8100 没接受）";
+                      hint(stickyErr, "bad");
+                      reportAttempt([], stickyErr); paint(); return; }
     sent = true; editing = false; showDone(j.params || {}); paint();
-  }).catch(function(e){ busy = false; hint("提交失败：" + ((e && e.message) || e), "bad");
-                        reportAttempt([], "fetch/解析失败：" + ((e && e.message) || e)); paint(); });
+  }).catch(function(e){ busy = false;
+                        stickyErr = "提交失败：" + ((e && e.message) || e);
+                        hint(stickyErr, "bad");
+                        reportAttempt([], stickyErr); paint(); });
 }
 
 /* 已提交 = 整卡转确认态，把最终参数列出来供回看（客户看得见"你到底交了我什么"）*/
