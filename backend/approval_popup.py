@@ -101,7 +101,7 @@ def main(argv):
     nhead = Label(root, text="", fg="#e0a35c", bg="#0f1115", font=("Microsoft YaHei UI", 9, "bold"))
     nhead.pack(padx=18, anchor="w", pady=(10, 2))
     nbody = Label(root, text="", fg=fg, bg="#0f1115", font=("Microsoft YaHei UI", 9),
-                  wraplength=430, justify="left", align="top")
+                  wraplength=430, justify="left")
     nbody.pack(padx=18, anchor="w")
     box = Frame(root, bg="#0f1115")
     box.pack(pady=16)
