@@ -40,6 +40,17 @@ class WanParamError(WanError):
     """参数非法（400）—— 不重试"""
 
 
+class WanApprovalRequired(WanError):
+    """网关批准闸的拒绝（0 分未扣、任务未发起）—— 不重试，也不许被叫成「参数非法（400）」
+    （2026-10-22 sc_9c246af70384 就是把这句拒因印成了 400，人据此以为提交坏了）"""
+
+
+class WanUpstreamUnavailable(WanError):
+    """上游分销商没有可用渠道 / 上游 5xx —— 不是我方参数错。
+    2026-10-22 23:51 现网：`No available channel for model w3-p-c1`（HTTP 500 包着上游 503）
+    被归成「API 参数非法（400）」⇒ 人会去改 prompt，而真正要决定的是等上游还是换一条线。"""
+
+
 class WanContentRejectError(WanError):
     """内容/安全审核拒绝 —— 不通过换 seed 重试"""
     # 触发关键词（按 failed_reason / message 文本匹配）
@@ -182,6 +193,24 @@ def _wan3_submit_guard(count: int = 1, account: str = "local") -> None:
         raise WanParamError("没批准条子，拒绝提交 wan3.0（reason=%s）：先报价并让人在 "
                             "http://127.0.0.1:8100/approval 点一次"
                             % str((ticket or {}).get("reason") if isinstance(ticket, dict) else ticket))
+
+
+def _prime_resolution(resolution) -> str:
+    """wan3-prime 的分辨率档：判据【不抄第二份】，读网关唯一源 `gateway._WAN30_RES_MODEL`。
+
+    以前这里是硬编码 `!= "1080P"` 就拒 ⇒ 网关那侧其实有 720p 的模型档（ME-wan30-720p-1055），
+    但没人能把它送进来；而网关白名单一旦加档，这里不改就变成第二份真相、永远比网关窄。
+    取不到网关那份（导入顺序/网关没起来）按【拒】处理，不退回一份自造的字面量名单。
+    """
+    from backend import gateway as gw
+    res = str(resolution or "1080P").strip().upper().replace(" ", "")
+    allowed = tuple(getattr(gw, "_WAN30_RESOLUTIONS", ()) or ())
+    if not allowed:
+        raise WanParamError("读不到 gateway._WAN30_RESOLUTIONS ⇒ 按拒处理（自检失败不许被当成『闸没拦』）")
+    if res not in allowed:
+        raise WanParamError("wan3-prime 分辨率只认 %s（收到 %r）⇒ 档位唯一源在 gateway._WAN30_RES_MODEL，"
+                            "要别的分辨率是换档名单，不是改这条校验" % ("/".join(allowed), resolution))
+    return res
 
 
 def submit_reference_to_video(
@@ -448,6 +477,32 @@ def download_result(
     return str(out)
 
 
+# 上游「没渠道 / 抖动」的原话特征：命中就不许再报成「参数非法（400）」。
+# 只收【上游自己说的】字样，不收 prompt/ratio/duration 那类我方本地已拦过的形状。
+_UPSTREAM_UNAVAILABLE_MARKERS = ("no available channel", "model_not_found", "upstream",
+                                 "上游创建任务失败", "状态码:503", "http 500", "http 502",
+                                 "http 503", "http 504")
+
+
+def _raise_prime_env_failure(env: dict, jid: str) -> None:
+    """网关信封 ok=false ⇒ 按【网关自己给的理由】分类，两条 prime 腿共用同一个判据。
+
+    🔴 不许一律 raise WanParamError：批准闸的拒绝是「0 分未扣、任务根本没发起」，
+       和「上游回 400 说参数写错」是两件不同的事，印错会让人去改参数。
+    """
+    msg = str(env.get("error") or env)[:700]
+    if str((env.get("approval") or {}).get("reason") or "") == "approval_required":
+        raise WanApprovalRequired("wan3-prime 被批准闸拒绝（0 分未扣、任务未发起）：%s" % msg)
+    if jid or "结果未知" in msg or "不要重发" in msg:
+        raise WanTimeoutError("wan3-prime 结果未知：%s（job_id=%s ⇒ 用 job_id 捞回，别再提交）"
+                              % (msg, jid or "无"))
+    low = msg.lower()
+    if any(m in low or m in msg for m in _UPSTREAM_UNAVAILABLE_MARKERS):
+        raise WanUpstreamUnavailable("wan3-prime 上游没有可用渠道（0 分未扣、任务未发起，"
+                                     "重投=再花一次上游 calls）：%s" % msg)
+    raise WanParamError("wan3-prime 失败：%s" % msg)
+
+
 def run_one_segment_prime(
     prompt: str,
     reference_video_path: str,
@@ -462,7 +517,7 @@ def run_one_segment_prime(
     account: str = "local",
     on_progress: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """超级复刻 wan3.0 的提交腿：走【网关 lane video.generate/wan3-prime】(provider yz-prime)。
+    """超级复刻 wan3.0 的提交腿：走【网关 lane video.generate/wan3-prime】(provider tianyue，2026-10-16 换芯)。
 
     为什么换这条（2026-10-10 排查定案）：
       - 2026-10-09 用户禁令"视频严格杜绝走 RunningHub" ⇒ config.WAN3_RH_ENABLED=False，走入口提交不出去；
@@ -470,21 +525,30 @@ def run_one_segment_prime(
         ⇒ 三处各说各话，agent 才"路由到 RunningHub wan3.0"。现在三处统一指向这条 lane；
       - 只有经 gateway.invoke 才有 预扣→结算→审计（直连厂商那条在账本上对不到人）。
 
-    🔴 不重试、不换 seed：这条上游按【次】计费（billing_unit=call），结果未知一律用 job_id 只捞不重投。
-    ⚠️ 能力差异（不假装支持）：这条 lane 的请求体只有 prompt/duration/resolution/ratio/media，
-       没有 RH 那个 audio 开关；声音只能以 reference_audio 外链送进去，"原声保留/换音色"是否被上游采纳
-       【未实测】⇒ 要动声音却没给参考音频，这里直接拒（0 消耗），不悄悄降级。
+    🔴 本函数只 call 网关一次；**重试环在网关适配器里**（`gateway._yz_prime_run`），一次批准内部重投
+    ⇒ 上限 4 次尝试、退避 45/120/240s，而且每次决定前都先读平台对账口 `/v1/balance`（0 分）：
+    「任务失败但计费 0」或「报未知但平台没建任务」才允许重投；已计费/已出片一律只捞不重发（守双花）。
+    为什么重试不放上层：上层每 call 一次就吃一段批准额度 ⇒ 上游 23% 的成功率会变成"用户点四次批准"。
+    不换 seed（这条 lane 没有 seed 入参）。
+    ⚠️ 能力差异（不假装支持）：上游参数卡（GET /v1/models，2026-10-14 现读）写的是
+       `audio: boolean`、`media_types` 含 `reference_audio` ⇒ **这条 lane 支持传音频、也支持开关声音**，
+       两个参数现在都真送上去（以前 `audio` 被我们丢掉、只在转储里写一句"没送"）。
+       但【送上去会起什么作用没有实测】：reference_audio 到底是"照这条音频念"还是"只取音色"，
+       参数卡没写 ⇒ 出片后必须本地 ASR 复验听到的就是新词，不许凭参数在交付里写"口播已改"。
+       要动声音却不给参考音频，这里仍直接拒（0 消耗），不悄悄降级。
     """
     from backend import gateway as gw
 
     if not str(prompt or "").strip():
         raise WanParamError("wan3-prime 要给 prompt（编译器写出的那一段）")
-    if str(resolution or "").strip().upper() != "1080P":
-        raise WanParamError("wan3-prime 只出 1080P（收到 %r）⇒ 要别的分辨率是换路线，不是改这条校验"
-                            % (resolution,))
+    _res = _prime_resolution(resolution)
+    # 2026-10-20 修：yz-prime 那个适配器 10-16 连常量一起删了（换成 tianyue 的 _WAN30_RATIOS），
+    # 这里还留着一句 gw._PRIME_YZ_RATIOS ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。
+    # 现读网关那份唯一源，取不到才退回同一组字面量（不许改判据、只换名字）。
+    _ratios = tuple(getattr(gw, "_WAN30_RATIOS", ()) or ("adaptive", "16:9", "4:3", "1:1", "3:4", "9:16"))
     ratio = str(aspect_ratio or "adaptive").strip()
-    if ratio not in gw._PRIME_YZ_RATIOS:
-        raise WanParamError("wan3-prime ratio 只认 %s（收到 %r）" % ("/".join(gw._PRIME_YZ_RATIOS), ratio))
+    if ratio not in _ratios:
+        raise WanParamError("wan3-prime ratio 只认 %s（收到 %r）" % ("/".join(_ratios), ratio))
     try:
         dur = int(float(duration))
     except (TypeError, ValueError):
@@ -501,9 +565,9 @@ def run_one_segment_prime(
     ref_url = upload_media(reference_video_path)      # CDN 托管不是视频生成 ⇒ 不碰 RH 视频禁令
 
     out = os.path.join(output_dir, "seg%02d-prime.mp4" % int(segment_index))
-    params = {"prompt": prompt, "duration": dur, "resolution": "1080P", "ratio": ratio,
+    params = {"prompt": prompt, "duration": dur, "resolution": _res, "ratio": ratio,
               "video_urls": [ref_url], "image_urls": [u for u in (image_urls or []) if u],
-              "audio_urls": refs, "output_path": out}
+              "audio_urls": refs, "audio": bool(audio), "output_path": out}
     if on_progress:
         on_progress("prime_submit", 0, "提交网关 video.generate/wan3-prime（预扣→提交→轮询→落盘）")
     env = gw.invoke("video.generate", "wan3-prime", account=account, params=params)
@@ -518,23 +582,104 @@ def run_one_segment_prime(
             json.dump({"job_id": jid, "ok": bool(env.get("ok")), "account": account,
                        "route": "video.generate/wan3-prime", "ts": round(time.time(), 3),
                        "error": str(env.get("error") or "")[:300],
+                       # 🔴 试了几次、每次怎么判的、平台对账读数 —— 全落盘。
+                       #    没有这三格，"提交失败"就只剩一句猜（2026-10-10：连着四次 unknown，
+                       #    其中两次平台其实建了任务，而我们盘上只有一句 job_id=''）。
+                       "attempts": res.get("prime_attempts") or 1,
+                       "tries": res.get("prime_tries") or [],
+                       "reconcile": res.get("prime_reconcile"),
                        "output_path": out}, _jh, ensure_ascii=False, indent=1)
     except OSError:
         pass                      # 落盘失败不许改变提交结果，但下一行的错误信息里会带上 jid
     if not env.get("ok"):
         # 结果未知（超时/断线/已出片没落盘）⇒ 抛超时类，让上层【只捞不重投】；真参数错 ⇒ 抛参数错
-        msg = str(env.get("error") or env)[:220]
-        if jid or "结果未知" in msg or "不要重发" in msg:
-            raise WanTimeoutError("wan3-prime 结果未知：%s（job_id=%s ⇒ 用 job_id 捞回，别再提交）"
-                                  % (msg, jid or "无"))
-        raise WanParamError("wan3-prime 失败：%s" % msg)
+        _raise_prime_env_failure(env, jid)
     local = res.get("path") or out
     if not os.path.isfile(local):
         raise WanTimeoutError("wan3-prime 信封说成功但盘上没有 %s（job_id=%s ⇒ 先捞回再判）" % (local, jid))
-    return {"segment_index": segment_index, "task_id": jid, "provider": "yz-prime",
-            "lane": "video.generate/wan3-prime", "model": res.get("model") or "wan3.0-video-prime",
+    return {"segment_index": segment_index, "task_id": jid, "provider": "tianyue",
+            "lane": "video.generate/wan3-prime",
+            # 🔴 模型名只许现读信封（`_tianyue_deliver` 带的就是真发出去那条）；以前这里写死一个
+            #    "wan3.0-video-prime" 兜底 ⇒ 上游没回 model 字段时台账会印一个【不存在的模型名】冒充出处。
+            #    拿不到就留空，由回执那一格写"没记"，不猜。
+            "model": str(res.get("model") or res.get("model_used") or ""),
             "reference_video_url": ref_url, "result_url": res.get("url") or "",
             "local_path": str(local), "duration": dur, "seed_used": None, "attempts": 1,
+            "bytes": res.get("bytes"), "calls": res.get("calls"), "credits": env.get("credits") or {},
+            "note": res.get("note") or ""}
+
+
+def run_prompt_only_prime(
+    prompt: str,
+    image_urls: List[str],
+    duration: int,
+    output_dir: str,
+    output_name: str = "wan3-prime.mp4",
+    resolution: str = "1080P",
+    aspect_ratio: str = "adaptive",
+    account: str = "local",
+    on_progress: Optional[callable] = None,
+) -> Dict[str, Any]:
+    """账号知识库裂变的出片腿：wan3-prime **prompt 生视频**（无参考视频，仅参考图）。
+
+    与 run_one_segment_prime 同一条网关 lane（video.generate/wan3-prime），三点差别：
+      - 不带 reference_video：成片全靠 Wan3.0 语法 prompt 驱动 + 参考图定产品/人/景；
+      - 时长由调用方给（本工作台缺省 30s，上游 durations.max=null 不设上限）；
+      - 批准闸 2026-10-12 用户口径【免人批】（purpose 级免批登记），但免批 ≠ 免账：
+        预扣→提交→轮询→结算/回滚照旧走 gateway.invoke。
+    🔴 重试环在网关适配器里（对账防双花，最多 4 次尝试），本函数【绝不重复提交】：
+       结果未知（有 job_id / 超时）只抛 WanTimeoutError，由上层拿 job_id 捞回。
+    """
+    from backend import gateway as gw
+
+    if not str(prompt or "").strip():
+        raise WanParamError("wan3-prime 要给 prompt（编译器拼出的 Wan3.0 文本）")
+    _res = _prime_resolution(resolution)
+    # 2026-10-20 修：yz-prime 那个适配器 10-16 连常量一起删了（换成 tianyue 的 _WAN30_RATIOS），
+    # 这里还留着一句 gw._PRIME_YZ_RATIOS ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。
+    # 现读网关那份唯一源，取不到才退回同一组字面量（不许改判据、只换名字）。
+    _ratios = tuple(getattr(gw, "_WAN30_RATIOS", ()) or ("adaptive", "16:9", "4:3", "1:1", "3:4", "9:16"))
+    ratio = str(aspect_ratio or "adaptive").strip()
+    if ratio not in _ratios:
+        raise WanParamError("wan3-prime ratio 只认 %s（收到 %r）" % ("/".join(_ratios), ratio))
+    try:
+        dur = int(float(duration))
+    except (TypeError, ValueError):
+        raise WanParamError("wan3-prime duration 要正整数秒（收到 %r）" % (duration,))
+    if dur <= 0:
+        raise WanParamError("wan3-prime duration 要正整数秒（收到 %r）" % (duration,))
+    imgs = [str(u or "").strip() for u in (image_urls or []) if str(u or "").strip()]
+
+    os.makedirs(output_dir, exist_ok=True)
+    out = os.path.join(output_dir, output_name)
+    params = {"prompt": prompt, "duration": dur, "resolution": _res, "ratio": ratio,
+              "image_urls": imgs, "output_path": out}
+    if on_progress:
+        on_progress("prime_submit", 0, "提交网关 video.generate/wan3-prime（免人批不免账：预扣→提交→轮询→落盘）")
+    env = gw.invoke("video.generate", "wan3-prime", account=account, params=params)
+    res = env.get("result") or {}
+    jid = str(env.get("job_id") or res.get("job_id") or "").strip()
+    # 🔴 job_id 一拿到就落盘（成功失败都写）：进程一死靠它捞回，重投=双花
+    try:
+        with open(os.path.join(output_dir, "_wan3_job.json"), "w", encoding="utf-8") as _jh:
+            json.dump({"job_id": jid, "ok": bool(env.get("ok")), "account": account,
+                       "route": "video.generate/wan3-prime", "ts": round(time.time(), 3),
+                       "error": str(env.get("error") or "")[:300],
+                       "attempts": res.get("prime_attempts") or 1,
+                       "tries": res.get("prime_tries") or [],
+                       "reconcile": res.get("prime_reconcile"),
+                       "output_path": out}, _jh, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+    if not env.get("ok"):
+        _raise_prime_env_failure(env, jid)
+    local = res.get("path") or out
+    if not os.path.isfile(local):
+        raise WanTimeoutError("wan3-prime 信封说成功但盘上没有 %s（job_id=%s ⇒ 先捞回再判）" % (local, jid))
+    return {"task_id": jid, "provider": "tianyue", "lane": "video.generate/wan3-prime",
+            "model": str(res.get("model") or res.get("model_used") or ""),
+            "result_url": res.get("url") or "", "local_path": str(local), "duration": dur,
+            "attempts": res.get("prime_attempts") or 1,
             "bytes": res.get("bytes"), "calls": res.get("calls"), "credits": env.get("credits") or {},
             "note": res.get("note") or ""}
 

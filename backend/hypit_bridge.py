@@ -102,6 +102,11 @@ STUDIO_CLAIM_TTL = 30 * 60.0    # 只用于"心跳多久没来"的展示/运维�
 STUDIO_INTENT_KEEP = 20         # 意图记录是持久的（一条会话属于哪条流水线不该 30 分钟就忘），只保留最近 20 个 run
 # omni 那侧的意图判定也收进 8100（video-ui 没有 CORS 头，插件直连读不到响应）
 OMNI_UI = os.environ.get("VIDEO_UI_URL") or "http://127.0.0.1:8765/"
+# 提示词反推工作台（8090 = D:\video-skill\app.py 的 uvicorn）。第 6 档台，skill 名 prompt-reverse。
+REVERSE_UI = os.environ.get("PROMPT_REVERSE_UI") or "http://127.0.0.1:8090/"
+_REVERSE_CACHE = {"ts": 0.0, "alive": False}
+# 动作迁移（skill 名 motion-transfer）：2026-10-08 引擎从 8091（D:\nzdh）剥离进
+# backend/services/motion_rpa/（网关轨），第 7 档工作台随之【下线】——见 motion_transfer_status。
 VIDEO_RUNS = os.environ.get("VIDEO_UI_RUNS") or r"C:\dsh\video_runs"
 OMNI_RUNS_TTL = 5.0
 _OMNI_CACHE = {"ts": 0.0, "alive": False}
@@ -639,7 +644,24 @@ INTENT_MARK = os.environ.get("HYPIT_INTENT_MARK") or os.path.join(ROOT, ".gatewa
 #   所以意图允许落在 <工作区>/.dsh/intent.json，presence 两个源合并读（同 sid 取 ts 更新的那个）。
 WORKSPACE_INTENT = os.environ.get("HYPIT_WORKSPACE_INTENT") or os.path.join(
     os.environ.get("DSH_WORKSPACE") or r"C:\dsh", ".dsh", "intent.json")
-KNOWN_SKILLS = ("omni", "hypit", "super-clone", "product-video", "film")
+KNOWN_SKILLS = ("omni", "hypit", "super-clone", "product-video", "film", "prompt-reverse",
+                "motion-transfer")
+# 判定口 presence 会回出的【台键】名单（单一源）。KNOWN_SKILLS 里有些档（super-clone/product-video）
+# 只是排他登记、没有右栏台，所以这张表是它的子集。加一档台 = 同时改 presence() 的 out 和这里；
+# 从属方（scripts/check-svc-8100.py 等）读这张表，不许各自再抄一份名单（抄过的那份已经烂过一次）。
+PRESENCE_KEYS = ("omni", "hypit", "film", "prompt-reverse", "motion-transfer", "form")
+# "form" = 输入表单台（2026-10-09，docs/PRD-input-form-single-port.md）。
+# 它不归某个引擎管：台里画的是 8100 自己托管的表单页，"有没有这一档"取决于
+# 【这条会话登记的意图档配了字段表没有】—— 而字段表知识只在 model_admin 那一份（它才解析 SKILL.md）。
+# 所以这里放一个【注册钩子】而不是抄第二份解析器；没注册 ⇒ 这一档恒不弹（fail-closed，不是"当没有"）。
+FORM_VIEW = None
+
+
+def register_form_view(fn):
+    """model_admin 启动时把自己的表单视图挂进来（单向：hypit_bridge 不认识 model_admin）。"""
+    global FORM_VIEW
+    FORM_VIEW = fn
+    return fn
 # 🔴 意图有效期（2026-10-03）：过期 ⇒ 不再弹台，也不再被 viewer_tick 自动起查看器。
 #    为什么必须有：判定口现在会顺手起进程，一条几天前的登记 = 只要那个会话被点开一次就再起一个 studio。
 #    注意这不是"被别的台挤掉"（那条禁令仍然成立：意图只能被显式覆盖/清除），是自己到期。
@@ -698,6 +720,12 @@ def _intent_map() -> dict:
     return _live_only(_intent_cache["data"])
 
 
+def intent_map() -> dict:
+    """公开读口：8100 的『对话内表单』要按这条会话登记了哪条流水线来决定挂不挂卡。
+    合并两个源 + TTL 那套判据只有一份（_intent_map），这里不复制第二份。"""
+    return _intent_map()
+
+
 def _replace_retry(src: str, dst: str, tries: int = 4) -> bool:
     """`os.replace` 在 Windows 上会被杀软/索引器临时占用目标文件撞到 WinError 5（实测偶发）。
     这份登记决定右栏台弹不弹 ⇒ 撞锁不能静默丢登记，重试几次；最终失败让调用方看见 error。
@@ -711,6 +739,9 @@ def _replace_retry(src: str, dst: str, tries: int = 4) -> bool:
                 return False
             time.sleep(0.05 * (i + 1))
     return False
+
+
+atomic_replace = _replace_retry      # 公开别名：8100 写表单载荷走同一套 WinError 5 重试，不另抄一份
 
 
 def set_intent(session: str, skill: str, task: str = "") -> dict:
@@ -850,7 +881,24 @@ def workbench_presence(session: str | None = None) -> dict:
         #    那条命令在 DSH 沙箱里写不了 D 盘，实测发生不了。viewer_tick 自带 120s 冷却。
         viewer_tick(str(session))
     out = {"omni": omni_status(session), "hypit": studio_status(session),
-           "film": film_status(session)}
+           "film": film_status(session), "prompt-reverse": prompt_reverse_status(session),
+           "motion-transfer": motion_transfer_status(session)}
+    # 🔴 这里的键集必须等于 PRESENCE_KEYS（那条名单是单一源，闸与从属方都读它）
+    # "form" = 输入表单台（2026-10-09）。字段表知识在 model_admin 那一份里（它才读得到 SKILL.md 的
+    # form: 段），所以这里用【注册钩子】拿答复，不在 hypit_bridge 抄第二份解析器。没注册 ⇒ 这一档恒不弹。
+    out["form"] = FORM_VIEW(session) if FORM_VIEW else {"intent": False, "up": False,
+                                                        "reason": "form-view-not-registered"}
+    # 🔴 排他规则的延伸：这条会话登记的【这一条线】已经配了输入表 ⇒ 引擎页那一带不再弹。
+    #    不是"关掉别人的台"，是同一条线的输入口从引擎页换成了表单页（omni/hypit 没表 ⇒ 不受影响）。
+    #    判据只认"有表"这一个事实，不认技能名 —— 加一条新线不用改这里。
+    # 🔴 2026-10-10 读的是 `has_input` 不是 `intent`：intent 现在还要再等一步"agent 回填过了"才为真，
+    #    拿它做排他 ⇒ 没回填的那几十秒里，被顶掉的引擎页会【自己弹回来】，就成了两个输入口并存。
+    fs = out.get("form") or {}
+    if fs.get("has_input") and session:
+        take = str(fs.get("intent_skill") or "")
+        for key in [k for k in out if k != "form"]:      # 不写死名单：新加一档引擎台自动被这条规则覆盖
+            if take and key == take and out[key].get("intent"):
+                out[key] = dict(out[key], intent=False, reason="form-is-input", skill=key)
     if session:
         out["hypit"]["progress"] = jobs_progress(str(session))   # 账本里有腿就出进度，与 studio 无关
     return out
@@ -878,6 +926,67 @@ def film_status(session: str | None = None) -> dict:
     url = "http://127.0.0.1:8100/api/film/board" + ("?task=" + task if task else "")
     return {"intent": True, "up": True, "alive": True, "url": url, "task": task,
             "source": "explicit"}
+
+
+def _probe_reverse() -> bool:
+    """8090 反推工作台活没活（缓存 5 秒，同 _probe_omni 的套路）。"""
+    now = time.time()
+    if now - _REVERSE_CACHE["ts"] < STUDIO_CACHE_TTL:
+        return _REVERSE_CACHE["alive"]
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(REVERSE_UI + "prompt-reverse", timeout=2) as r:
+            r.read(64)
+            alive = r.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        alive = False
+    _REVERSE_CACHE.update(ts=now, alive=alive)
+    return alive
+
+
+def prompt_reverse_status(session: str | None = None) -> dict:
+    """提示词反推台（:8090 工作台页）的意图与存活。
+
+    形态照 film：台本身是**引擎页面**（不是 8100 同域托管），所以 up 要真探；
+    触发器只有一个 = 显式登记 prompt-reverse（intent-only 那条铁律不变，盘上痕迹永不触发页签）。
+    这条 skill 只到提示词不出片 ⇒ 台里看的是反推任务与产物，不涉及按条计费的生成腿。
+    """
+    alive = _probe_reverse()
+    if session is None:
+        return {"intent": False, "up": alive, "alive": alive, "reason": "ops-view",
+                "url": REVERSE_UI + "prompt-reverse"}
+    sid = str(session)
+    ex = explicit_only(sid, "prompt-reverse")
+    if ex is False:
+        return {"intent": False, "up": alive, "alive": alive, "url": REVERSE_UI + "prompt-reverse",
+                "reason": "intent-is-" + intent_of(sid)}
+    if ex is not True:
+        return {"intent": False, "up": alive, "alive": alive, "reason": "no-intent"}
+    task = str(((_intent_map().get(sid) or {}).get("task")) or "")
+    return {"intent": True, "up": alive, "alive": alive,
+            "url": REVERSE_UI + "prompt-reverse", "task": task,
+            "how_to_start": "计划任务/终端：python -m uvicorn app:app --host 0.0.0.0 --port 8090（在 D:\\video-skill 下）",
+            "source": "explicit"}
+
+
+def motion_transfer_status(session: str | None = None) -> dict:
+    """动作迁移档：**工作台已下线**（2026-10-08 引擎从 8091 剥离进网关轨）。
+
+    引擎搬进 D:\\video-skill\\backend\\services\\motion_rpa\\，跑动与出片经 gateway.invoke()
+    直接在对话里报（产物落盘 + 直链 + 抽帧），不再有专属工作台 ⇒ 这一档【永远 intent: False】，
+    右栏不弹。motion-transfer 的意图登记**保留**（排他作用：登记了它就把 omni/hypit 等台挡掉），
+    只是不再换台 —— 登记原因也如实说"台已下线"，不骗人说"正在生成"。
+    """
+    if session is None:
+        return {"intent": False, "up": False, "alive": False, "reason": "ops-view"}
+    sid = str(session)
+    ex = explicit_only(sid, "motion-transfer")
+    if ex is False:
+        return {"intent": False, "up": False, "alive": False,
+                "reason": "intent-is-" + intent_of(sid)}
+    return {"intent": False, "up": False, "alive": False,
+            "reason": "workbench-retired" if ex is True else "no-intent"}
 
 
 def omni_status(session: str | None = None) -> dict:
@@ -1679,6 +1788,112 @@ def serve_asset(name: str):
                                                                                                             "application/octet-stream")
 
 
+
+# ── 8090 进程里跑的流水线：不进网关 jobs 表 ⇒ preflight 必须另外问一次盘 ──────────────
+#    2026-10-09 实测形状：preflight 回 active_jobs:0，而 8090 的 tvc 正在 Step1/3（_state.json
+#    刚刚被写过）。漏判 = 带着在途腿重启 = 那段白等并被判死（2026-10-02 已经赔过一次）。
+#    🔴 判据只看【状态文件自己的 mtime + 里面的状态】：拿父目录 mtime 预筛会漏 ——
+#       作业反复重写同一个 _state.json 不碰父目录，那一版就把正在跑的 tvc 报成了 0（假绿）。
+INFLIGHT_STATE_NAMES = ("_state.json", "phase_state.json", "wan3_task.json", "job.json",
+                        # 2026-10-22 补：super-clone 的任务状态文件名不在名单里 ⇒ preflight 报 active_8090=0，
+                        #   而盘上 _super_clone_state.json 每 30 秒在被写（那天我据此重启，差点打断在跑的分镜腿）。
+                        #   僵尸档（进程死了但 status 还写着 RUNNING）不拦重启：它按 mtime 的新鲜度判，超窗即不计。
+                        "_super_clone_state.json")
+INFLIGHT_BUSY = ("running", "queued", "pending", "processing", "submitting", "in_progress",
+                 "generating", "downloading", "waiting")
+# 等人点头的档：不烧钱，但重启会不会丢【要看那条线自己有没有恢复路径】，不许一概而论。
+INFLIGHT_AWAITING = ("awaiting_review", "awaiting", "awaiting_approval", "paused", "needs_review",
+                     "review", "awaiting_input")
+# 🔴 放行名单的合法性 = 那端有【启动即恢复】的代码，不是"感觉没事"。闸 6o 钉这一条。
+#    tvc：backend/services/tvc_agent.py 模块导入时调 _load_all_persisted() ⇒ awaiting_review 直接恢复，
+#         running 才被标 "服务重启导致任务中断"。所以 awaiting 放行、running 照拦。
+RESTART_SAFE_AWAITING_LINES = ("tvc",)
+INFLIGHT_WINDOW_SEC = float(os.environ.get("PREFLIGHT_INFLIGHT_WINDOW_SEC") or 240)
+# 终态：多新鲜都不拦重启。未知状态【不算终态】（fail-closed：拿不准就当还在跑）。
+INFLIGHT_TERMINAL = ("succeeded", "success", "completed", "complete", "done", "failed",
+                     "error", "cancelled", "canceled", "rejected", "timeout", "no_result")
+# "等人点头"的档不靠新鲜度判活（它本来就不写了）；但也不许永远红 ⇒ 超过这个年纪当死档。
+INFLIGHT_AWAITING_MAX_SEC = float(os.environ.get("PREFLIGHT_AWAITING_MAX_SEC") or 21600)
+
+
+def _inflight_roots() -> list:
+    raw = os.environ.get("PREFLIGHT_8090_ROOTS") or ""
+    if raw:
+        return [x for x in raw.split(os.pathsep) if x]
+    B = chr(92)
+    return [os.path.join("D:" + B, "video-skill", "outputs"),
+            os.path.join("D:" + B, "video-skill", "productions"),
+            os.path.join("C:" + B, "dsh", "productions")]
+
+
+def _state_of(d: dict) -> str:
+    for k in ("status", "state", "phase_state", "run_status", "job_status"):
+        v = str(d.get(k) or "").strip().lower()
+        if v:
+            return v
+    return ""
+
+
+def inflight_8090(window_sec: float | None = None, roots=None) -> dict:
+    """回 {ok, count, busy, awaiting, sample, scanned, error}。
+       count = busy + awaiting（两种都不许重启，但原因要分开说）。
+       判活分三种，别一概而论（2026-10-09 实测：awaiting_review 不再写文件，按新鲜度判就成了假绿）：
+         终态 ⇒ 不拦；等人/暂停 ⇒ 只看 INFLIGHT_AWAITING_MAX_SEC；在跑或认不出的非终态 ⇒ 看窗口。
+       读不到/异常 ⇒ count 至少 1 且 ok=False（fail-closed：探针坏了不等于"没在途"）。"""
+    import glob
+    win = float(window_sec if window_sec is not None else INFLIGHT_WINDOW_SEC)
+    # 🔴 预筛只能用【最宽】的存活档（跑腿窗口 与 等人上限 取大），细判留给下面三档；
+    #    拿 240 秒预筛会把 awaiting_review 在它自己的档位之前 just 扔掉 = 假绿。
+    amax = INFLIGHT_AWAITING_MAX_SEC if window_sec is None else max(win, INFLIGHT_AWAITING_MAX_SEC)
+    cutoff = time.time() - max(win, amax)
+    busy, awaiting, parked, bad, scanned = [], [], [], [], 0
+    try:
+        for root in (roots or _inflight_roots()):
+            if not os.path.isdir(root):
+                continue
+            for nm in INFLIGHT_STATE_NAMES:
+                for fp in glob.glob(os.path.join(root, "**", nm), recursive=True):
+                    scanned += 1
+                    try:
+                        if os.path.getmtime(fp) < cutoff:
+                            continue
+                        with open(fp, encoding="utf-8", errors="replace") as f:
+                            d = json.load(f)
+                    except ValueError:
+                        bad.append("%s: bad json" % os.path.basename(os.path.dirname(fp)))
+                        continue
+                    except OSError as e:
+                        bad.append("%s: %s" % (os.path.basename(os.path.dirname(fp)), str(e)[:50]))
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    st = _state_of(d)
+                    if not st or st in INFLIGHT_TERMINAL:
+                        continue                                 # 终态/没状态字段 ⇒ 不拦
+                    age = time.time() - os.path.getmtime(fp)
+                    item = {"dir": os.path.relpath(os.path.dirname(fp), root), "state": st,
+                            "age_sec": round(age, 1)}
+                    rel = os.path.relpath(os.path.dirname(fp), root)
+                    line = rel.split(os.sep)[0].lower()
+                    if st in INFLIGHT_AWAITING:
+                        item["line"] = line
+                        if age > INFLIGHT_AWAITING_MAX_SEC:
+                            parked.append(item)                  # 太老的等审档：当弃档，只报数（别永远红）
+                        elif line in RESTART_SAFE_AWAITING_LINES:
+                            parked.append(item)                  # 那端证明了重启能恢复 ⇒ 不拦
+                        else:
+                            awaiting.append(item)                # 没恢复路径 ⇒ 拦（重启就丢）
+                    elif age <= win:
+                        busy.append(item)                        # 在跑的、以及【认不出的非终态】
+    except Exception as e:                                                      # noqa: BLE001
+        return {"ok": False, "count": 1, "busy": 1, "awaiting": 0, "parked": 0, "sample": [],
+                "parked_sample": [], "scanned": scanned, "error": str(e)[:160]}
+    return {"ok": not bad, "count": len(busy) + len(awaiting) + (1 if bad else 0),
+            "busy": len(busy), "awaiting": len(awaiting), "parked": len(parked),
+            "sample": (busy + awaiting)[:6], "parked_sample": parked[:6],
+            "scanned": scanned, "error": "; ".join(bad[:3])}
+
+
 if __name__ == "__main__":
     # studio 归属登记（契约见 C:\dsh\docs\ADR-workbench-presence.md）：起 studio 前 claim 这个 run。
     #   python backend/hypit_bridge.py studio-claim <DSH会话id> <run源路径或工程名> [端口]
@@ -1704,9 +1919,17 @@ if __name__ == "__main__":
             exp = []
         con.close()
         held = holds_pending()
+        inf = inflight_8090()          # 8090 进程里的腿：只在这一个函数里判
         print(json.dumps({"active_jobs": len(act), "active_exports": len(exp),
+                          "active_8090": inf["count"], "busy_8090": inf["busy"],
+                          "awaiting_8090": inf["awaiting"], "parked_8090": inf["parked"],
+                          "parked_8090_sample": inf["parked_sample"],
+                          "active_8090_sample": inf["sample"],
+                          "inflight_scanned": inf["scanned"],
+                          "inflight_probe_error": inf["error"],
                           "pending_holds": len(held), "pending_credit": sum(h["amount"] or 0 for h in held),
-                          "safe_to_restart": not act and not exp}, ensure_ascii=False))
+                          "safe_to_restart": not act and not exp and not inf["count"]},
+                         ensure_ascii=False))
     elif cmd == "holds-pending":
         rows = holds_pending(args[1] if len(args) > 1 else "")
         print(json.dumps({"pending": rows, "total": sum(r["amount"] or 0 for r in rows)}, ensure_ascii=False))

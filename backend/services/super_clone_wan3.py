@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -52,10 +53,16 @@ def engine_lock_error(engine) -> str:
             "要换引擎 = 换 skill、重新报价，不是在这里传参切换。" % (e, "/".join(LANE_ENGINES), LANE_ENGINE_SPEND))
 
 def _cfg() -> Dict[str, Any]:
+    _sb = _storyboard_lane()          # 分镜腿三元组的唯一源（config 的开关 + 网关路由），调用点与回执都读它
     return {
         "mimo_fps": float(getattr(settings, "REPLICA_WAN3_MIMO_FPS", 4.0)),
         "mimo_resolution": getattr(settings, "REPLICA_WAN3_MIMO_MEDIA_RESOLUTION", "max"),
         "mimo_split_mode": getattr(settings, "REPLICA_WAN3_MIMO_SPLIT_MODE", "scene_cut"),
+        # 分镜腿（step1_mimo_parse）实际用的模型名 —— 🔴 唯一源 = _storyboard_lane()，
+        # 不再写死 TEXT_MODEL_MIMO_PRO（2026-10-20：小米那把 429 死了，切到网关 video.analyze 那条 lane；
+        # 想切回把 .env 的 REPLICA_WAN3_STORYBOARD_ENGINE 写成 mimo）。
+        "mimo_model": str(_sb.get("model") or "").strip(),
+        "storyboard_lane": _sb,
         "llm_engine": getattr(settings, "REPLICA_WAN3_LLM_ENGINE", "gpt"),
         "resolution": getattr(settings, "REPLICA_WAN3_RESOLUTION", "480P"),
         "aspect_ratio": getattr(settings, "REPLICA_WAN3_ASPECT_RATIO", "adaptive"),
@@ -66,10 +73,89 @@ def _cfg() -> Dict[str, Any]:
     }
 
 
-def _compiler_llm():
-    """Step 1.5 编译 / Lint：按 REPLICA_WAN3_LLM_ENGINE 走 GPT 或 Grok。"""
-    engine = str(_cfg().get("llm_engine") or "gpt").strip().lower()
-    if engine == "grok":
+class _GatewayCompletions:
+    """`client.chat.completions` 那一层的替身：真请求经 gateway.invoke 发出去。
+
+    🔴 为什么是壳而不是改调用点：调用点用的是 openai SDK 的形状（`completion.choices[0].message.content`），
+    换成壳 = 两处真请求点一行都不动；直接改写 = 要把编译器里所有取值重写一遍（那才是引入 bug 的地方）。
+    走网关 ⇒ 预扣/结算/台账齐全，`_llm_stamp` 那格因此能如实写 ledger="on"。
+    """
+
+    def __init__(self, outer: "_GatewayChatClient"):
+        self._o = outer
+
+    def create(self, model: str = "", messages: list | None = None,
+               max_tokens: int = 4000, temperature: float = 0.7, **_kw):
+        from backend import gateway as _gw
+        env = _gw.invoke("text.complete", self._o.purpose, "local",
+                         {"messages": messages or [], "max_tokens": int(max_tokens or 4000),
+                          "temperature": float(temperature or 0)}) or {}
+        res = env.get("result") or {}
+        lane = res.get("lane") or {}
+        self._o._gw_lane = lane                                  # 哪条腿真的答了，交给 _llm_stamp 落物证
+        self._o._gw_credits = env.get("credits") or {}
+        text = res.get("text")
+        if not (env.get("ok") and text):
+            raise RuntimeError("网关文本腿失败（%s/%s）：%s" % (
+                "text.complete", self._o.purpose, str(env.get("error") or res.get("error") or "无正文")[:200]))
+        msg = type("_M", (), {"content": text})()
+        ch = type("_C", (), {"message": msg, "finish_reason": "stop"})()
+        return type("_R", (), {"choices": [ch], "usage": res.get("usage") or {},
+                               "model": lane.get("model") or model})()
+
+
+class _GatewayChatClient:
+    """openai client 的替身（只实现编译/Lint 用到的那一条链：`.chat.completions.create`）。
+
+    `create(model=...)` 里那个 model 被**忽略** —— 用哪家由 purpose 决定 ⇒ 调用方点不动型号，
+    引擎唯一源留在 config/网关路由那一份（这条线历史上被"表单锁 yz-prime、agent 念 RunningHub"咬过）。
+    """
+
+    def __init__(self, purpose: str, base_url: str = ""):
+        self.purpose = purpose
+        self.base_url = base_url
+        self._gw_lane: dict = {}
+        self._gw_credits: dict = {}
+        self.chat = type("_Chat", (), {"completions": None})()
+        self.chat.completions = _GatewayCompletions(self)
+
+
+def _compiler_llm(engine: str = ""):
+    """Step 1.5 编译 / Step 2 审查：按 REPLICA_WAN3_LLM_ENGINE 走 magpie / MiMo / Grok / GPT。
+
+    engine 传值 ⇒ 只顶掉这一条腿的全局选择（③审查腿独立选家就走这里），
+      取值仍是那四个引擎名之一；🔴 不接受网关 purpose 名 —— `text.complete/mimo` 是经网关扣账的腿，
+      `engine=mimo` 是直连厂商不扣账的腿，一个字段两种方言就会造出假保险。
+
+    🔴 2026-10-20：默认档换 magpie（用户裁定"按 8099 的模型接法，但这些模型要放到网关上调用"），
+       起因是小米那把 token-plan-cn 整把 429 `quota exhausted`（实测 text.complete/mimo_pro 当场拒）。
+       magpie 这一档经 gateway.invoke ⇒ **进账本**；mimo/grok/gpt 三档仍自己拼 OpenAI client 直连厂商
+       （ledger="off"，如实标）。模型名/base/key 的唯一源：magpie = 网关路由，其余 = config 字段。
+    """
+    engine = (str(engine or "").strip().lower()
+              or str(_cfg().get("llm_engine") or "gpt").strip().lower())
+    if engine == "magpie":
+        from backend import gateway as _gw
+        try:
+            r = _gw.resolve("text.complete", "magpie")
+        except Exception as e:                                    # noqa: BLE001
+            raise RuntimeError("magpie 路由解不出来（config 的 MAGPIE_* 或 .env 没配？）：%s" % str(e)[:160])
+        return _GatewayChatClient("magpie", r.get("base_url") or ""), str(r.get("model") or "")
+    if engine == "mimo":
+        api_key = (
+            os.environ.get("MIMO_API_KEY", "") or str(getattr(settings, "MIMO_API_KEY", ""))
+        ).strip()
+        base_url = (
+            os.environ.get("MIMO_BASE_URL", "") or str(getattr(settings, "MIMO_BASE_URL", ""))
+        ).strip()
+        model = (
+            os.environ.get("MIMO_MODEL", "") or str(getattr(settings, "TEXT_MODEL_MIMO_PRO", ""))
+        ).strip()
+        if not api_key:
+            raise RuntimeError("MIMO_API_KEY 未配置，MiMo 编译器无法运行")
+        if not model:
+            raise RuntimeError("TEXT_MODEL_MIMO_PRO 未配置（MiMo 编译器模型名的唯一源）")
+    elif engine == "grok":
         api_key = (
             os.environ.get("SR_GROK_API_KEY", "") or str(getattr(settings, "SR_GROK_API_KEY", ""))
         ).strip()
@@ -108,10 +194,20 @@ def _llm_stamp(client, model: str) -> dict:
     🔴 为什么必须有（2026-10-10）：返回信封原本只有 `{prompt, source}` —— `source` 只证明
        "走了 step1_5_compile_prompt 这个函数"，不证明用的哪个模型、哪一家、有没有进账本。
        于是交付时问"是不是对应模型跑的"，谁都要重新猜一遍。
-    ⚠️ `ledger` 如实写 "off"：这条腿自己拼 OpenAI/xAI client 直连厂商，【不经 gateway.invoke、
-       不在网关账本上】（接进网关是待办；在这里写成 on 就是假账）。只记 base_url 的 host，绝不带 key。
+    ⚠️ `ledger` 按【这条腿到底走没走网关】写：magpie 档 = "on"（gateway.invoke，有预扣/结算行）；
+       mimo/grok/gpt 三档 = "off"（自己拼 OpenAI/xAI client 直连厂商，不经网关 ⇒ 写成 on 就是假账）。
+       只记 base_url 的 host，绝不带 key。
     """
     import urllib.parse as _up
+    lane = getattr(client, "_gw_lane", None) or {}
+    if lane:
+        # 这条腿经 gateway.invoke ⇒ 台账里真有这一行，所以 ledger 写 on；model 用**真答了的那条腿**的模型名
+        #（腿表会 fallback，入口那条不一定就是干活的那条 —— 写入口名就是假账）。
+        cr = getattr(client, "_gw_credits", None) or {}
+        return {"model": str(lane.get("model") or model or "")[:60],
+                "provider": "magpie@%s" % str(lane.get("purpose") or "?")[:24],
+                "ledger": "on", "lane_attempt": lane.get("attempt"),
+                "tokens": cr.get("tokens"), "charged": cr.get("charged")}
     raw = str(getattr(client, "base_url", "") or "")
     host = (_up.urlsplit(raw).netloc or raw).replace("https://", "").replace("http://", "")[:60]
     return {"model": str(model or "")[:60], "provider": host or "未知", "ledger": "off"}
@@ -133,25 +229,112 @@ def _lane_cell(capability: str, purpose: str = "") -> str:
                                    str(r.get("provider") or "?"))
 
 
-def _mimo_cell() -> str:
-    """Step1 分镜那条腿的模型名 —— 从真函数的签名里读【这次实际会用的默认值】，不抄散文。
+def _storyboard_lane() -> dict:
+    """Step 1 分镜腿（唯一一条【必须吃视频】的腿）用哪家 —— 唯一源 = config.REPLICA_WAN3_STORYBOARD_ENGINE。
 
-    ⚠️ `账本外·直连厂商` 是如实标注：pipeline.step1_mimo_parse 自己拼 HTTP，不经 gateway.invoke
-       （BOUNDARY 整文件保护：只调不改；把它接进网关是待办）。
+    · "gateway"（默认，2026-10-20）⇒ 现读网关 `video.analyze` 的默认路由（agnes-3.0-flash）。
+      依据是实测不是猜：同一种 video_url part 打过去，`video_tokens=240`、答对主体颜色（2026-10-20）。
+    · "mimo" ⇒ 小米 token-plan 那把直连（2026-10-15 定的那款；额度恢复后 .env 一行切回，不动码）。
+    🔴 这一腿不许指 magpie 那三条 free：桥的 chat part 白名单只有 text/image_url/file，
+      带 video_url 时三条腿 prompt_tokens 一字不涨、都答"没收到"（模型卡写着 in=…video 也不算数）。
+      ⇒ 下面那道 provider 守卫是这条禁令唯一的机器形状，别删。
+    ⚠️ api_key 只在调用点用 ⇒ 绝不进物证/回执/日志（这里只带 host）。
+    解不出来 ⇒ 回 `{"error": …}` ⇒ 调用点在发任何请求之前拒，**不静默回落到 step1 签名里的 flash 默认值**。
     """
-    import inspect as _in
     import urllib.parse as _up
+    eng = str(getattr(settings, "REPLICA_WAN3_STORYBOARD_ENGINE", "gateway") or "gateway").strip().lower()
+    if eng in ("mimo", "xiaomimimo"):
+        base = str(getattr(settings, "MIMO_BASE_URL", "") or "").strip()
+        key = str(getattr(settings, "MIMO_API_KEY", "") or "").strip()
+        # 模型名：config 的 REPLICA_WAN3_STORYBOARD_MODEL 优先（2026-10-22 用户点名 flash），
+        #   没写才回落 TEXT_MODEL_MIMO_PRO —— 保持"这一腿用哪个模型"只有一个出处。
+        mdl = (str(getattr(settings, "REPLICA_WAN3_STORYBOARD_MODEL", "") or "").strip()
+               or str(getattr(settings, "TEXT_MODEL_MIMO_PRO", "") or "").strip())
+        if not (base and key and mdl):
+            return {"error": "分镜腿=mimo，但 config/.env 缺 MIMO_BASE_URL / MIMO_API_KEY / "
+                             "REPLICA_WAN3_STORYBOARD_MODEL(或 TEXT_MODEL_MIMO_PRO)"}
+        host = (_up.urlsplit(base).netloc or base)[:60]
+        return {"base_url": base, "api_key": key, "model": mdl,
+                "provider": "mimo·%s" % host, "ledger": "off"}
+    from backend import gateway as _gw
     try:
-        from pipeline.step1_mimo_parse import run as _mimo_run
-        p = _in.signature(_mimo_run).parameters.get("model")
-        mdl = "" if p is None or p.default is _in.Parameter.empty else str(p.default)
+        r = _gw.resolve("video.analyze", _gw.default_purpose("video.analyze"))
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": "分镜腿=gateway，但网关 video.analyze 路由解不出来：%s" % str(e)[:140]}
+    prov = str(r.get("provider") or "")
+    if prov == "magpie":
+        return {"error": "网关的 video.analyze 默认路由现在是 magpie —— 这条腿吃视频，"
+                         "magpie 桥会丢 video part ⇒ 拒（默认路由请指 mimo；agnes 已于 2026-10-22 下架，"
+                         "别拿丢视频的腿做分镜）"}
+    host = (_up.urlsplit(str(r.get("base_url") or "")).netloc or str(r.get("base_url") or ""))[:60]
+    return {"base_url": r.get("base_url"), "api_key": r.get("api_key"), "model": str(r.get("model") or ""),
+            "provider": "%s·%s" % (prov or "?", host),
+            # 🔴 ledger 一律 "off"，即使这条腿的 base/key/model 是从网关路由读来的：
+            #    真发请求的是 step1_mimo_parse（BOUNDARY 整文件保护，只调不改）⇒ 没有预扣/结算行，
+            #    写 on 就是假账。"值取自哪条 lane"记在下面的 lane 字段里，两件事分开。
+            "ledger": "off", "lane": "video.analyze/%s" % (r.get("purpose") or "")}
+
+
+def _analyze_lanes() -> list:
+    """看图腿的【有序链】—— 唯一源 = config.REPLICA_WAN3_ANALYZE_PURPOSE（串形 `purpose[:次数],…`）。
+
+    写一条裸名字（老写法 `mimo_pro`）= 只有一条腿的链，行为与从前一字不差。
+    🔴 名字认错（网关 `video.analyze` 下没有这条路由）⇒ 整条链作废、一条都不发：
+       半条链比空链危险 —— 会悄悄用一条没人指定过的腿跑出来，而回执还把它署成主腿的名字。
+    """
+    from backend import gateway as _gw
+    out = []
+    for piece in str(getattr(settings, "REPLICA_WAN3_ANALYZE_PURPOSE", "") or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        pur, _, n = piece.partition(":")
+        pur, n = pur.strip(), (n.strip() or "1")
+        if ("video.analyze", pur) not in _gw.ROUTES:
+            return []
+        try:
+            out.append({"purpose": pur, "tries": max(1, int(n))})
+        except ValueError:
+            return []
+    return out
+
+
+def _analyze_purpose() -> str:
+    """链的【第一条】（主腿）—— 回执格、面板、报价读它；真发请求走 `_analyze_lanes()`。
+
+    🔴 回执那一格与真 invoke 必须读同一个源：以前两处都写死 "mimo_pro"，那把 key 429 死了之后
+       形状是"每条素材都分析失败 ⇒ 补跑也失败 ⇒ 120 分熔断空转"，而回执只显示一个查不出来的模型名。
+    """
+    _ls = _analyze_lanes()
+    return str(_ls[0]["purpose"]) if _ls else ""
+
+
+def _analyze_lane_model(purpose: str) -> str:
+    """这条腿现在解出来是哪个模型 —— 现读路由，不写第二份型号字面量。"""
+    from backend import gateway as _gw
+    try:
+        return str(_gw.resolve("video.analyze", purpose).get("model") or "")
     except Exception:                                          # noqa: BLE001
-        mdl = ""
-    if not mdl.strip():
         return ""
-    raw = str(getattr(settings, "MIMO_BASE_URL", "") or "")
-    host = (_up.urlsplit(raw).netloc or raw).replace("https://", "").replace("http://", "")[:60]
-    return "%s@%s · 账本外·直连厂商" % (mdl[:60], host or "未知")
+
+
+def _mimo_cell() -> str:
+    """Step1 分镜那条腿的模型名 —— 与调用点【同一份来源】：都读 `_storyboard_lane()`。
+
+    🔴 不抄散文、不写第二份型号字面量：这一格是"分镜到底是哪个模型跑的"的唯一出处。
+    解不出来 ⇒ 回空串 ⇒ `skill_contract.tick()` 拒绝打钩 ⇒ 花钱那一刀之前拒（编一个名字比空着更坏）。
+    ledger 按这条腿真走没走网关写：mimo 档那一份文件（BOUNDARY 整文件保护、只调不改）自己拼 HTTP ⇒ off；
+    gateway 档取的是网关路由的三元组，但**发请求的仍是那份受保护文件** ⇒ 仍如实写"账本外·直连厂商"，
+    换成"网关账本内"就是假账（预扣/结算确实没发生）。
+    """
+    lane = _storyboard_lane()
+    if lane.get("error"):
+        return ""
+    mdl = str(lane.get("model") or "").strip()
+    if not mdl:
+        return ""
+    return "%s@%s · 账本外·直连厂商（值取自 %s）" % (mdl[:60], str(lane.get("provider") or "未知"),
+                                                    str(lane.get("lane") or "config 的 MIMO_* 三键"))
 
 
 # ── ffprobe 工具（本地副本，避免跨模块依赖）──
@@ -251,46 +434,119 @@ def validate_trim(
 def plan_15s_windows(
     total: float,
     chunk: float = 15.0,
-    min_last: float = 2.0,
+    ref_min: float = 5.0,
     slack: float = 0.05,
 ) -> List[Dict[str, float]]:
-    """把总时长切成连续的 ≤15s 窗口；尾段短于 2s 时向前一段借时。"""
+    """把总时长切成【输出连续、参考可重叠】的窗口（每段两个窗口，各管各的事）：
+
+    · `start`/`end`       = 这一段在**成片时间轴上负责**的那一段 ⇒ 连续、不重叠、每段 ≤15s，
+                            拼起来就是整条片子。批准条子的段数与窗口指纹认的是这一份。
+    · `ref_start`/`ref_end` = 这一段**喂给模型看的参考窗口** ⇒ 默认等于本段；只有尾段太短才向前借。
+
+    为什么要借（2026-10-22 用户定：**一条片子只走 `ME-WAN3-prime-1080p-1055` 一条模型**，原话"不然会乱"
+    —— 两段用两个模型、两种计费口径，画面与账都会漂）：尾巴这一段在时间轴上常常只多出 0.13 秒这种量级，
+    而参考窗口只给 0.13 秒 = 模型看不见任何动作事实，只能猜。所以**只借参考窗口**（`10.13-15.13`），
+    生成 5 秒、**只留多出来的那 0.13 秒** ⇒ 重复的那 4.87 秒不会进成片（拼接按 start/end 裁）。
+    旧写法是"尾段短于 2s 就向前一段借时"（改的是 start/end，整条重排）：它把 15.13s 切成 13.13+2.00，
+    于是①批准条子上写明的窗口（0-15s）在盘上不成立了，②本该满 15 秒的主段被压成 13.13 秒 = 白丢复刻质量。
+    """
     total = round(float(total or 0.0), 3)
     if total <= 0:
         return []
+
+    def _w(a: float, b: float) -> Dict[str, float]:
+        return {"start": round(a, 3), "end": round(b, 3), "ref_start": round(a, 3), "ref_end": round(b, 3)}
+
     if total <= chunk + slack:
-        return [{"start": 0.0, "end": total}]
+        return [_w(0.0, total)]
     windows: List[Dict[str, float]] = []
     t = 0.0
     while t < total - 1e-6:
         end = min(round(t + chunk, 3), total)
         if end <= t:
             break
-        windows.append({"start": round(t, 3), "end": end})
+        windows.append(_w(t, end))
         t = end
-    if len(windows) >= 2:
-        last = windows[-1]
-        last_dur = last["end"] - last["start"]
-        if last_dur < min_last - slack:
-            steal = round(min_last - last_dur, 3)
-            prev = windows[-2]
-            new_prev_end = round(prev["end"] - steal, 3)
-            if new_prev_end - prev["start"] >= min_last - slack:
-                prev["end"] = new_prev_end
-                last["start"] = new_prev_end
-            elif (last["end"] - prev["start"]) <= chunk + slack:
-                prev["end"] = last["end"]
-                windows.pop()
+    # 只有最后一段可能短于 ref_min：借参考窗口（不动 start/end ⇒ 时间轴仍然连续、不重复）
+    last = windows[-1]
+    if (last["end"] - last["start"]) < ref_min - slack:
+        last["ref_start"] = round(max(0.0, last["end"] - ref_min), 3)
     return windows
 
 
-def fit_clip_duration(video_path: str, duration: float, output_path: str) -> str:
-    """把成片裁到目标时长，便于按窗口精准拼接。"""
+SUBMIT_PLAN_NAME = "_submit_plan.json"
+
+
+def write_submit_plan(output_dir: str, *, task_id: str, windows, target_duration: float,
+                      trim_range, source_video: str, as_duration_chunk: bool,
+                      log=None) -> dict:
+    """把"这一次到底提交几段、每段是哪条时间窗口"落在盘上（Step 0 那一跳，0 分、不调模型）。
+
+    🔴 为什么必须有主人（2026-10-13 现网两条事故同一个根因）：
+       ① 段数没有主人 —— 批准条子的 count 此前只认 `TIMELINE.md` 和 `outputs/seg*`，
+          而这条线不产 TIMELINE、段目录嵌在 `outputs/step2_wan3/chunk_01…03`，网关数不到就
+          回落"按单段" ⇒ 人批了 1 段的量，机器花了 3 段的钱。
+       ② 时间窗口没有主人 —— 客户写「0-15s」，agent 自己挑了一个 `chunk_03`（6.3s 尾段）提交，
+          盘上没有任何一份"这次要做的窗口"能被机器读，所以也没有任何一道闸能对得上它。
+       现在由【算窗口的那一手】直接写下来：批准读它算段数，提交读它核窗口，两边同一份事实。
+    """
+    wins = []
+    for w in (windows or []):
+        a, b = round(float(w["start"]), 3), round(float(w["end"]), 3)
+        item = {"start": a, "end": b}
+        # 参考窗口只有和"这一段负责的时间"不一样时才写（一样就不制造第二种读法）
+        rs, re_ = w.get("ref_start"), w.get("ref_end")
+        if rs is not None and re_ is not None and (round(float(rs), 3), round(float(re_), 3)) != (a, b):
+            item["ref_start"], item["ref_end"] = round(float(rs), 3), round(float(re_), 3)
+        wins.append(item)
+    if not wins:
+        wins = [{"start": 0.0, "end": round(float(target_duration or 0.0), 3)}]
+    import time as _t
+    from backend import skill_contract as _skc
+    plan = {
+        "count": len(wins),
+        "windows": wins,
+        "target_duration": round(float(target_duration or 0.0), 3),
+        "trim": dict(trim_range) if isinstance(trim_range, dict) else None,
+        "as_duration_chunk": bool(as_duration_chunk),
+        "task_id": str(task_id or ""),
+        "source_video": str(source_video or ""),
+        "source_sha8": (_skc.sha8(str(source_video)) if source_video else ""),
+        "written_at": _t.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    d = Path(output_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / SUBMIT_PLAN_NAME
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    if log:
+        def _desc(w: dict) -> str:
+            tw = "%.2f-%.2fs" % (w["start"], w["end"])
+            if "ref_start" in w:
+                tw += "（参考 %.2f-%.2fs）" % (w["ref_start"], w["ref_end"])
+            return tw
+        log("★ 本次提交计划落盘 → %s（%d 段：%s）"
+            % (path, plan["count"], "、".join(_desc(w) for w in wins)))
+    plan["plan_path"] = str(path)
+    return plan
+
+
+def fit_clip_duration(video_path: str, duration: float, output_path: str, offset: float = 0.0) -> str:
+    """把成片裁到目标时长，便于按窗口精准拼接。
+
+    `offset` > 0 用于【参考窗口比本段长】的那种段（尾段把参考窗口借满 5 秒）：
+    模型生成的是整条参考窗口，这一段的贡献只是其中靠后的一截 ⇒ 先跳到 offset 再取 duration。
+    `-ss` 放在 `-i` **之后**（解码后定位）：放前面是关键帧取整，0.13s 这种短尾会被切歪。
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     dur = max(0.1, float(duration))
+    off = max(0.0, float(offset or 0.0))
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", video_path,
+    ]
+    if off > 0.0:
+        cmd += ["-ss", f"{off:.3f}"]
+    cmd += [
         "-t", f"{dur:.3f}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "aac", "-b:a", "128k",
@@ -833,7 +1089,8 @@ async def step1_5_compile_prompt(
     def log(msg: str) -> None:
         if on_log:
             on_log(msg)
-        print(f"  [Step1.5·Grok编译器] {msg}", flush=True)
+        print(f"  [Step1.5·编译器] {msg}", flush=True)   # 不写厂商标：这条腿现在是 magpie/deepseek，
+        #   前缀里挂"Grok"会让 agent 和客户照着一句假话念引擎（同"报价不许凭记忆写厂商标"一条规矩）。
 
     product_paths = [path for path in (product_image_paths or []) if path]
     if not product_paths or any(not os.path.isfile(path) for path in product_paths):
@@ -1017,7 +1274,7 @@ async def step1_5_compile_prompt(
         raw = raw.strip()
 
     if not raw:
-        raise RuntimeError("Grok 编译器输出为空")
+        raise RuntimeError("编译器输出为空（这条腿的模型=%s）" % model)
 
     # 强制语法已要求单段 prompt，不再拆分视觉/口播
     full_prompt = raw
@@ -1254,6 +1511,55 @@ def fit_prompt_to_wan3_limit(prompt: str, max_chars: int = _WAN3_PROMPT_MAX) -> 
     return body[:budget].rstrip() + constraint
 
 
+def canonical_prompt_tail(prompt: str) -> tuple:
+    """把稿子的【最后一行】钉成 STEP1_5_GLOBAL_CONSTRAINT 的精确版本。返回 `(稿子, 改过吗, 说明)`。
+
+    🔴 为什么由系统钉、不让模型保证：`_validate_prompt_deterministic` 要求尾行**逐字等于**这句常量
+       （合同行不许少），而编译/审查腿是语言模型 —— 2026-10-22 实测 agnes/mimo/千问/deepseek 四家
+       都会把它复述成 206 字的近似版。旧形状下后果是连锁的：Layer2 输出被"尾行不一致"判失败并【整份丢弃】
+       ⇒ 审查等于没跑，但流程照绿、照打钩、照花钱（静默降级）。
+    安全边界：只替换"以常量前 12 字开头"的行（那是在复述它）；其余内容一个字不删，缺就补。
+    """
+    text = (prompt or "").rstrip()
+    if not text:
+        return text, False, "空稿"
+    lines = text.split("\n")
+    probe = STEP1_5_GLOBAL_CONSTRAINT[:12]
+    if lines[-1].strip() == STEP1_5_GLOBAL_CONSTRAINT:
+        return text, False, "尾行已是精确合同行"
+    if lines[-1].strip().startswith(probe):
+        old_len = len(lines[-1].strip())
+        lines[-1] = STEP1_5_GLOBAL_CONSTRAINT
+        return "\n".join(lines), True, "尾行是模型的复述版（%d 字）⇒ 钉回精确合同行" % old_len
+    kept = [l for l in lines if not l.strip().startswith(probe)]
+    removed = len(lines) - len(kept)
+    new = "\n".join(kept).rstrip() + "\n" + STEP1_5_GLOBAL_CONSTRAINT
+    return new, True, ("补上精确合同行（另移除 %d 行复述）" % removed) if removed else "补上精确合同行"
+
+
+def shot_lines_needing(prompt: str, needles: List[str]) -> List[int]:
+    """稿子里哪些 `Shot N` 行命中了给定片段 —— 背景判红时只重发这几镜，不再整段重编译。"""
+    hits: List[int] = []
+    for line in (prompt or "").splitlines():
+        m = re.match(r"^Shot\s+(\d+)", line.strip())
+        if m and any(n and n in line for n in needles):
+            hits.append(int(m.group(1)))
+    return hits
+
+
+def replace_shot_line(prompt: str, shot_no: int, new_line: str) -> str:
+    """按 Shot 号整行替换（只替换第一条同号行；Shot 号在稿内本应唯一）。"""
+    out, done = [], False
+    for line in (prompt or "").splitlines():
+        m = re.match(r"^Shot\s+(\d+)", line.strip())
+        if (not done) and m and int(m.group(1)) == int(shot_no):
+            out.append((new_line or "").strip())
+            done = True
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def split_shots_by_product_appearance(
     storyboard: List[Dict[str, Any]],
     first_product_time: float,
@@ -1372,7 +1678,10 @@ def _rebase_shots_for_segment(
     return out
 
 
-_SHOT_LINE_RE = re.compile(r"^(Shot\s+(\d+)\s+\[[^\]]+\]:\s*)(.*)$")
+# 🔴 名字不许再叫 _SHOT_LINE_RE：上面 1322 行那份钉的是 [开始-结束] 两个时间组，
+#    这一份钉的是「前缀 + 正文」。同名两个写者 ⇒ 后者盖掉前者，slice_prompt_for_shots
+#    拿 group(3) 当时间解析就变成 ValueError（HEAD 里就是坏的，测试里现形）。
+_SHOT_HEAD_RE = re.compile(r"^(Shot\s+(\d+)\s+\[[^\]]+\]:\s*)(.*)$")
 _QUOTED_SPEECH_RE = re.compile(r';\s*"[^"]*"\s*(?:\[[^\]]*\])?')
 _QUOTED_ONLY_RE = re.compile(r'"[^"]*"\s*(?:\[[^\]]*\])?')
 
@@ -1442,6 +1751,143 @@ def apply_voiceover_script(
     return storyboard
 
 
+def _norm_speech(s: Any) -> str:
+    """口播比对用的归一形：去掉所有空白（客户一行一句，换行/空格不算差异）。"""
+    return re.sub(r"\s+", "", str(s or ""))
+
+
+def narration_coverage(want: str, got: str) -> float:
+    """新稿实际落位比例 0–1（按字符顺序对齐，不看空格）。"""
+    a, b = _norm_speech(want), _norm_speech(got)
+    if not a:
+        return 1.0
+    m = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    return round(sum(blk.size for blk in m.get_matching_blocks()) / float(len(a)), 4)
+
+
+_PUNCH_BOUNDARY = "，。！？；、,.!?;:\n"
+
+
+def split_script_by_durations(text: str, durations) -> List[str]:
+    """按每镜【时长占比】把整篇新稿切成连续片段：拼回去正好等于原稿（一字不多一字不少）。
+    切点优先吸附到最近的标点/换行（±14 字窗口），避免把词从中间切开。
+
+    🔴 为什么不用 `apply_voiceover_script` 那种字符 diff 比例（2026-10-14 现网抓到）：
+       它在"原片 ASR 全集 vs 新稿全集"上取比例区间，一旦**段数与行数不等**（那次是 ASR 7 段、
+       客户稿 6 行）尾部那镜就分不到字 ⇒ 盘上出现"最后一镜还在说原片旧词"，残留 19.3%。
+       而客户约定就是"一行一句、句序对齐成片口播"⇒ 顺序必须保持行序，只有"哪一镜说多少"
+       由镜头时长决定（时间轴是原片锁死的，SKILL 硬规则 9）。
+    """
+    raw = str(text or "")
+    durs = [max(0.0, float(d or 0.0)) for d in (durations or [])]
+    n = len(durs)
+    if n == 0 or not raw:
+        return [""] * n
+    total = sum(durs) or 1.0
+    L = len(raw)
+    out: List[str] = []
+    pos = 0
+    for i, d in enumerate(durs):
+        if i == n - 1:
+            out.append(raw[pos:])
+            break
+        cut = min(L, pos + max(0, int(round(L * d / total))))
+        if pos >= cut >= L:
+            out.append("")
+            continue
+        best = None
+        for j in range(cut, min(L, cut + 14)):
+            if raw[j] in _PUNCH_BOUNDARY:
+                best = j + 1
+                break
+        if best is None:
+            for j in range(cut - 1, max(pos, cut - 14), -1):
+                if raw[j] in _PUNCH_BOUNDARY:
+                    best = j + 1
+                    break
+        cut = int(best) if best is not None else cut
+        out.append(raw[pos:cut])
+        pos = max(pos, cut)
+    return out
+
+
+def apply_customer_narration(
+    storyboard: List[Dict[str, Any]],
+    voice_script: Optional[str],
+    output_dir: str,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """把客户改稿灌进各镜「口播」位 ⇒ 编译器与 `force_verbatim_speech` 会把新词【逐字】送进 prompt。
+
+    🔴 这一步就是那根没接的线（2026-10-14 定案"wan3.0 能不能直出改口播"）：
+       这条 lane 的请求体只有 prompt/duration/resolution/ratio/media，台词位 = prompt 里那句引号，
+       而 `apply_voiceover_script`（按原文 diff 把新稿对齐回各镜）在全仓【零调用点】⇒ 进 prompt 的
+       永远是 FunASR 抄下来的原片旧词，于是"改口播"只能靠后处理换轨。接上之后 wan3 一枪出片就念新词。
+    🔴 必须覆盖在 FunASR 写回【之后】：ASR 那份是"原片到底说了什么"，正是 diff 对齐的底子；
+       在它之前改会被整段盖掉（那才是静默冒充"改好了"）。
+    ⚠️ 这条校验只保证"新词逐字进了分镜、也就进了 prompt"，【不保证】模型念得准、嘴形对得上 ——
+       念词与口型是审帧那一刀 + lip-sync 那条腿的事，别把它当已经验收过。
+    对不齐 ⇒ 抛（在编译与提交之前，0 分），不许悄悄拿旧词出片。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    text = str(voice_script or "").strip()
+    if not text:
+        return None                       # 不改口播 ⇒ 什么都不做（空稿不等于"已按新稿改好"）
+    if not storyboard:
+        raise RuntimeError("改口播直出：storyboard 是空的 ⇒ 没有可落位的镜，不提交")
+    orig = [str(s.get("口播") or "").strip() for s in storyboard]
+    slots = [i for i, o in enumerate(orig) if o and o != "无"]
+    if not slots:
+        raise RuntimeError(
+            "改口播直出：各镜口播位全空 ⇒ 没有原句可以做对齐底子（先查 FunASR 有没有识别到口播），"
+            "不许把新稿整段塞进第一镜蒙过去")
+    spans = []
+    for i in slots:
+        a, b = _shot_time_range(storyboard[i])
+        spans.append(max(0.0, float(b) - float(a)))
+    pieces = split_script_by_durations(text, spans)
+    for i, piece in zip(slots, pieces):
+        storyboard[i]["口播"] = str(piece).strip() or "无"
+    after = [str(s.get("口播") or "").strip() for s in storyboard]
+    joined = "".join(o for o in after if o and o != "无")
+    cover = narration_coverage(text, joined)
+    stale = narration_coverage(joined, text)      # 反方向：落进去的词有多少真属于新稿（残留检测）
+    problems = []
+    if cover < 0.999:
+        problems.append("新稿只落位 %.1f%%" % (cover * 100))
+    if stale < 0.999:
+        problems.append("台词位里还残留 %.1f%% 不属于新稿的字（漏改比没改更坏）" % ((1 - stale) * 100))
+    rec = {
+        "voice_script": text,
+        "chars_script": len(_norm_speech(text)),
+        "chars_landed": len(_norm_speech(joined)),
+        "coverage": cover,
+        "stale": stale,
+        "shots": [{"shot": s.get("shot"), "时间区间": s.get("时间区间"), "原口播": o, "新口播": n,
+                  "分配字数": len(_norm_speech(n))}
+                 for s, o, n in zip(storyboard, orig, after)],
+        "method": "按镜时长占比切新稿（split_script_by_durations），切点吸附标点；行序=客户稿行序",
+        "slot_spans": [round(x, 2) for x in spans],
+        "problems": problems,
+        "executor": "pipeline:apply_customer_narration",
+        "note": "覆盖在 FunASR 写回之后；只证明新词逐字进了 prompt 的台词位，不证明念得准/嘴形对",
+    }
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "voice_script_binding.json").write_text(
+        json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    if problems:
+        raise RuntimeError(
+            "改口播直出校验没过：%s ⇒ 不提交、0 分未扣。逐镜对齐见 %s"
+            % ("；".join(problems), out / "voice_script_binding.json"))
+    log("✓ 改口播已灌进各镜口播位：%d 镜 / %d 字，覆盖 %.3f、残留 %.3f（逐字进 prompt 由 force_verbatim_speech 钉）"
+        % (len(after), rec["chars_script"], cover, stale))
+    return rec
+
+
 def force_verbatim_speech(prompt: str, shots: List[Dict[str, Any]]) -> str:
     """把编译后每镜引号口播钉回 storyboard 原文，避免商品类口播被改写。"""
     by_num: Dict[int, Dict[str, Any]] = {}
@@ -1453,7 +1899,7 @@ def force_verbatim_speech(prompt: str, shots: List[Dict[str, Any]]) -> str:
     unused = list(shots)
     out_lines: List[str] = []
     for line in (prompt or "").splitlines():
-        match = _SHOT_LINE_RE.match(line)
+        match = _SHOT_HEAD_RE.match(line)
         if not match:
             out_lines.append(line)
             continue
@@ -1938,6 +2384,70 @@ def validate_prompt_time_against_storyboard(prompt: str, storyboard: List[Dict[s
             )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 「换背景」这件事的判定 —— 全部抽成纯函数，入口(8090)与 Layer1 闸读同一份，别抄两遍。
+# 事故（2026-10-22 sc_9c246af70384）：客户把整段任务说明写进「换背景」栏，里面明写着
+# 「背景、动作、口播全部保留原片」，而旧写法 `swap_scene = bool(scene_text)` 只看非空，
+# 于是替他打开两道他从未要求的闸（新背景落实 + 原背景残留），且两道在这种输入下必红，
+# 每红一次就整段重编译一次（9 镜实测 173-226s，换到 Cloudflare 那家就是 524）⇒ 循环失败。
+# ─────────────────────────────────────────────────────────────────────────
+_KEEP_BG_PHRASES = ("保留原片", "保留原背景", "背景不变", "不要换背景", "不换背景", "背景全部保留")
+# 背景判定的虚词表（唯一源；Layer1 里不许再抄一份）
+_BG_STOP = {"背景", "必须", "严禁", "复刻", "参考", "视频", "原背景", "环境", "场景",
+             "室内", "居家", "不得", "出现", "画面", "可见", "无其他物体"}
+# 否定/空值型开头：这些不是"元素"，换成任何背景都还会存在，禁它等于禁如实描述
+_BG_NEGATIVE_HEADS = ("无", "没有", "不含", "未见", "仅有", "只有")
+
+
+def scene_swap_decision(scene_text: str) -> tuple:
+    """非空 ≠ 要换背景。返回 `(要不要换, 原因)`——原因要能印到日志上，别让人猜。"""
+    t = str(scene_text or "").strip()
+    if not t:
+        return False, "换背景栏为空"
+    hit = [p for p in _KEEP_BG_PHRASES if p in t]
+    if hit:
+        return False, "换背景栏里写着「%s」，按【不换】处理" % "、".join(hit)
+    return True, "文本是背景描述，未见保留原片类否定"
+
+
+def _bg_fragments(text: str) -> List[str]:
+    """按标点切片段（≥4 字），用来判"新背景原话有没有进稿"——比数碎词出现次数可靠。"""
+    parts = [p.strip() for p in re.split(r"[，、；;。\n,]", str(text or ""))]
+    return [p for p in parts if len(p) >= 4]
+
+
+def background_landed(bg_text: str, prompt: str) -> tuple:
+    """新背景是否落实：最长片段整段进稿，或 ≥2 个不同片段进稿。返回 `(落实吗, 拒因)`。"""
+    frags = _bg_fragments(bg_text)
+    if not frags:
+        return True, "无 ≥4 字的背景片段可判"
+    longest = max(frags, key=len)
+    hits = [f for f in frags if f in prompt]
+    if longest in prompt or len(hits) >= 2:
+        return True, "命中 %d/%d 段" % (len(hits), len(frags))
+    return False, "新背景原话没进稿（仅命中 %d 段，最长片段=%r）" % (len(hits), longest[:40])
+
+
+def original_bg_residue(bg_text: str, storyboard: Optional[List[Dict[str, Any]]],
+                        prompt: str, new_bg_words: Optional[List[str]] = None) -> List[str]:
+    """原背景残留：只数 ≥6 字、非否定/空值型、且不在新背景描述里的片段。"""
+    leaked: List[str] = []
+    bg = str(bg_text or "")
+    allow_skip = set(new_bg_words or [])
+    for shot in (storyboard or []):
+        env = shot.get("场景环境") or {}
+        det = str((env.get("背景细节") or env.get("场景") or "")).strip()
+        if not det:
+            continue
+        for w in re.findall(r"[一-鿿]{6,}", det):
+            if w in _BG_STOP or w in allow_skip or w.startswith(_BG_NEGATIVE_HEADS):
+                continue
+            if w in bg or w not in prompt or w in leaked:
+                continue
+            leaked.append(w)
+    return leaked
+
+
 async def validate_and_fix_prompt(
     prompt: str,
     target_duration: float,
@@ -1970,7 +2480,9 @@ async def validate_and_fix_prompt(
         - 无未知占位符
         - protected signature 未变（口播/台词/character/Image 引用/转场/运镜/音效 BGM & SFX）
         - Prompt ≤ 20,000 字符
-      失败 → 丢弃 Layer2 输出 → 使用 Layer1 prompt（保证最终 prompt 始终可执行）
+      失败 → 【同一份稿重问一次】→ 再失败就抛异常大声停。
+        🔴 旧形状是"丢弃 Layer2 输出、改用 Layer1 结果"——那是假绿：审查没跑，流程却全绿、照打钩、照花钱
+        （2026-10-22 实测三家模型都有概率栽在 repair-JSON 契约上，尾行复述也曾整份丢弃审查结果）。
 
     Args:
         target_duration: Step 0 锁死的全局时间事实源（float 秒），全流程唯一变量名。
@@ -1993,6 +2505,12 @@ async def validate_and_fix_prompt(
 
     fixes: List[str] = []
     out_prompt = prompt or ""
+    # 🔴 第一件事就是钉合同行（尾行逐字等于 STEP1_5_GLOBAL_CONSTRAINT）：
+    #    否则后面 Layer2 的确定性复验会因"模型复述了这句"而【整份丢弃审查结果】——静默没审查。
+    out_prompt, tailed, tail_note = canonical_prompt_tail(out_prompt)
+    if tailed:
+        fixes.append("尾行钉回精确合同行：%s" % tail_note)
+        log("  ⓘ %s" % tail_note)
 
     # ★target_duration：Step 0 后端锁死的全局硬参数，Lint 不得改变此值
     # （仅校验 prompt 时间轴是否以此为边界，不做 clamp 修改）
@@ -2154,65 +2672,41 @@ async def validate_and_fix_prompt(
 
     # 注：原"多余空行清理"已删除 —— Linter 核心原则是"尽可能不碰正确 Prompt"，格式美化不属于校验
 
-    # ★Plan C：背景一致性校验（仅当 background_override 非空时触发）
-    #   - 关键词出现 ≥3 次
-    #   - 必须含"严禁复刻参考视频原背景"或等价禁令
-    #   - 不得含 storyboard 原背景关键词
-    # 失败 → 抛异常，触发上层重跑 Compiler（不交 Layer 2 修复，因为语义校验需确定性）
+    # ★Plan C：背景一致性校验 —— 只有这道闸【真的该开】时才跑，且判据全走上面的纯函数。
+    #   校验1 新背景原话是否进了稿（不再数"前 6 个碎词出现 ≥3 次"）
+    #   校验2 是否有"严禁复刻参考视频原背景"或等价禁令
+    #   校验3 原背景元素是否残留（≥6 字、非否定/空值型；"无其他物体"这类不算元素）
+    # 失败 ⇒ 抛异常让流程【大声停】。不再默认整段重编译：2026-10-22 那单每次红就重发 9 镜一发
+    # （实测 173-226s；换到 Cloudflare 那家直接 524），输入一字不变 ⇒ 同一个红必然再来。
     if background_override and background_override.strip():
         bg_text = background_override.strip()
-        # 提取关键名词片段（粗粒度：≥2 字的连续中文/英文/数字词）
-        bg_keywords = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]{2,}", bg_text)
-        # 去常见虚词
-        _stop = {"背景", "必须", "严禁", "复刻", "参考", "视频", "原背景", "环境", "场景", "室内", "居家", "不得", "出现"}
-        bg_keywords = [w for w in bg_keywords if w not in _stop]
-        # 唯一关键词，限制最多取前 6 个避免过严
-        bg_keywords = list(dict.fromkeys(bg_keywords))[:6]
-        # 校验1：关键词 ≥3 次出现（至少 1 个核心词出现 ≥3 次；若客户只给短描述放宽到总出现次数）
-        if bg_keywords:
-            total_hits = sum(out_prompt.count(w) for w in bg_keywords)
-            if total_hits < 3:
+        swap, why = scene_swap_decision(bg_text)
+        if not swap:
+            log("  ⓘ 背景闸本不该开（%s）⇒ 本次按【保留原片背景】处理，不要求新背景原话、也不禁原背景元素" % why)
+        else:
+            landed, landed_detail = background_landed(bg_text, out_prompt)
+            if not landed:
                 raise RuntimeError(
-                    f"background_override 校验失败：关键词 {bg_keywords} 在 prompt 出现 {total_hits} 次（<3）。"
-                    f"Compiler 未落实背景描述前置 + 闭环，请重跑 Step 1.5。"
+                    "background_override 校验失败：%s。Compiler 未落实背景描述，请重跑 Step 1.5。" % landed_detail)
+            forbid_patterns = [
+                r"严禁复刻参考视频原背景",
+                r"严禁复刻.*?原背景",
+                r"不得.*?原背景",
+                r"禁止.*?原背景",
+                r"不复刻.*?原背景",
+            ]
+            if not any(re.search(p, out_prompt) for p in forbid_patterns):
+                raise RuntimeError(
+                    "background_override 校验失败：prompt 缺少'严禁复刻参考视频原背景'或等价禁令。"
+                    "请重跑 Step 1.5 Compiler。"
                 )
-        # 校验2：必须含禁令字样（接受等价表达）
-        forbid_patterns = [
-            r"严禁复刻参考视频原背景",
-            r"严禁复刻.*?原背景",
-            r"不得.*?原背景",
-            r"禁止.*?原背景",
-            r"不复刻.*?原背景",
-        ]
-        if not any(re.search(p, out_prompt) for p in forbid_patterns):
-            raise RuntimeError(
-                "background_override 校验失败：prompt 缺少'严禁复刻参考视频原背景'或等价禁令。"
-                "请重跑 Step 1.5 Compiler。"
-            )
-        # 校验3：原背景关键词残留检测
-        if storyboard:
-            original_bg_keywords: List[str] = []
-            for shot in storyboard:
-                env = shot.get("场景环境") or {}
-                if isinstance(env, dict):
-                    details = env.get("背景细节") or env.get("场景") or ""
-                    if isinstance(details, str) and details.strip():
-                        original_bg_keywords.append(details.strip())
-            # 提取原背景中的独有名词（≥3 字的连续中文词）
-            orig_words = set()
-            for d in original_bg_keywords:
-                for w in re.findall(r"[\u4e00-\u9fa5]{3,}", d):
-                    if w not in _stop and w not in bg_keywords:
-                        orig_words.add(w)
-            # 例外：若 orig_word 也出现在 background_override 描述里，跳过（用户明确要保留的同名元素）
-            orig_words = {w for w in orig_words if w not in bg_text}
-            leaked = [w for w in orig_words if w in out_prompt]
+            leaked = original_bg_residue(bg_text, storyboard, out_prompt, _bg_fragments(bg_text))
             if leaked:
                 raise RuntimeError(
                     f"background_override 校验失败：prompt 仍含原背景元素 {leaked}，"
-                    f"未落实禁令。请重跑 Step 1.5 Compiler。"
+                    "未落实禁令。请重跑 Step 1.5 Compiler。"
                 )
-        log(f"Layer1 背景一致性校验通过：keywords={bg_keywords}, hits≥3, 禁令存在, 无原背景残留")
+            log("Layer1 背景一致性校验通过：新背景原话已落实（%s）、禁令存在、原背景元素无残留" % landed_detail)
 
     if fixes:
         log(f"Layer1 规则校验修复 {len(fixes)} 项: {', '.join(fixes)}")
@@ -2220,6 +2714,7 @@ async def validate_and_fix_prompt(
         log("Layer1 规则校验通过，无需修复")
 
     # === Layer 2: LLM 二次审查 ===
+    llm_ran = False        # 审查到底跑没跑，要能在返回里被看见（别让人对着一条绿钩子猜）
     try:
         review_result = await _llm_review_prompt(out_prompt, out_target_duration, media_manifest, storyboard, on_log)
         reviewed_prompt = review_result.get("repaired_prompt", "").strip()
@@ -2236,20 +2731,43 @@ async def validate_and_fix_prompt(
                     baseline_prompt=out_prompt,
                     layer2_fixes=layer2_repairs,
                 )
+            llm_ran = True   # 走到这里 = 审查真跑了且复验通过
             if reviewed_prompt != out_prompt.strip():
-                out_prompt = reviewed_prompt
+                out_prompt, t2, note2 = canonical_prompt_tail(reviewed_prompt)
+                if t2:
+                    log("  ⓘ Layer2 动过尾行 ⇒ 重新钉回精确合同行（%s）" % note2)
                 fixes.append("Layer2 LLM 审查修正分镜逻辑/物理规律问题")
                 log("Layer2 LLM 审查已输出修正版")
             else:
                 log("Layer2 LLM 审查通过，分镜逻辑合理")
     except Exception as e:
-        log(f"⚠ Layer2 LLM 审查失败（跳过，用 Layer1 结果）: {e}")
+        # 🔴 不再静默降级成「用 Layer1 结果」——那形状是"审查没跑却照样打钩、照样花钱"（假绿）。
+        #    同一份稿重问一次（只是一发审查请求，不是整段重编译），再不行就大声停。
+        first_err = str(e)[:200]
+        log(f"⚠ Layer2 审查第一次没跑成（{first_err}），同一份稿重问一次...")
+        try:
+            retry = await _llm_review_prompt(out_prompt, out_target_duration, media_manifest,
+                                             storyboard, on_log)
+            rp = (retry.get("repaired_prompt") or "").strip()
+            if rp and rp != out_prompt.strip():
+                out_prompt, t3, note3 = canonical_prompt_tail(rp)
+                if t3:
+                    log("  ⓘ 重问那发的尾行也钉回精确合同行（%s）" % note3)
+                fixes.append("Layer2 LLM 审查修正分镜逻辑/物理规律问题（重问一次后）")
+            llm_ran = True
+        except Exception as e2:                              # noqa: BLE001
+            raise RuntimeError(
+                "审查腿（Layer2）两次都没跑成，已停止 —— 不再用 Layer1 结果冒充「审查通过」。\n"
+                "第一次：%s\n第二次：%s\n"
+                "自救：给 config 的 REPLICA_WAN3_LINT_ENGINE 换一条活腿（magpie/mimo/grok/gpt），"
+                "或修审查的输出契约。" % (first_err, str(e2)[:200])) from e2
 
     return {
         "prompt": out_prompt,
         "target_duration": out_target_duration,
         "fixes": fixes,
         "llm_reviewed": "Layer2 LLM 审查修正分镜逻辑/物理规律问题" in fixes,
+        "lint_ran": llm_ran,     # 审查真跑过没有（False = 这稿没经过 Layer2，别再往下花钱）
     }
 
 
@@ -2271,12 +2789,16 @@ async def _llm_review_prompt(
     返回结构化结果：{"repaired_prompt": str, "repairs": list}。
     若无需修改或审查失败，repaired_prompt 原样返回，repairs 为空。
     """
+    # ③审查腿可以独立选家（config.REPLICA_WAN3_LINT_ENGINE，取值 magpie/mimo/grok/gpt）；空=跟②同一条。
+    lint_engine = str(getattr(settings, "REPLICA_WAN3_LINT_ENGINE", "") or "").strip()
     try:
-        client, model = _compiler_llm()
+        client, model = _compiler_llm(lint_engine)
     except RuntimeError as exc:
-        if on_log:
-            on_log(f"⚠ {exc}，跳过 Grok 审查")
-        return {"repaired_prompt": prompt, "repairs": []}
+        # 不 swallow：起不来就是起不来，让上层重问一次或大声停（见 validate_and_fix_prompt 的 Layer2 分支）
+        raise RuntimeError("审查腿起不来：%s" % exc) from exc
+    if on_log:
+        on_log("审查腿=%s（model=%s，与编译腿%s）" % (
+            lint_engine or "同编译腿", model or "未知", "分开" if lint_engine else "共用"))
 
     system = """你是 Wan3.0 视频生成提示词审查员（Linter / Sanitizer）。
 你不是第二个创作者，不优化、不润色、不重写。你只做"客观错误的最小修复"。
@@ -2489,10 +3011,8 @@ canonical storyboard 商品可见性摘要（唯一权威来源）：
             temperature=0.1,
         )
         content = (completion.choices[0].message.content or "").strip()
-    except Exception as e:
-        if on_log:
-            on_log(f"⚠ Grok 审查失败，保留原 prompt: {e}")
-        return {"repaired_prompt": prompt, "repairs": []}
+    except Exception as e:                              # noqa: BLE001
+        raise RuntimeError("审查腿这一发没跑成：%s" % str(e)[:200]) from e
 
     # Layer 2 必须返回结构化 JSON，不接受纯文本或任何前后缀。
     def reject_duplicate_keys(pairs: List[tuple]) -> Dict[str, Any]:
@@ -2538,9 +3058,10 @@ canonical storyboard 商品可见性摘要（唯一权威来源）：
             else:
                 raise ValueError("repair type 必须是 image_reference 或 physical_text")
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        if on_log:
-            on_log(f"⚠ Layer2 输出不是合法 repair JSON，保留 MiMo 原版: {e}")
-        return {"repaired_prompt": prompt, "repairs": []}
+        # 🔴 2026-10-22 实测：千问 3 发里 2 发、deepseek 1 发都栽在这条 repair-JSON 契约上
+        #    （old 不是整串 图N / 输出里带裸控制字符）。旧形状是"整份丢弃、保留原版"⇒ 审查静默没跑。
+        #    现在如实抛，让上层重问一次或大声停；宁可不改，不许假绿。
+        raise RuntimeError("审查输出不是合法 repair JSON：%s" % str(e)[:200]) from e
     content = content.strip()
 
     # 反啰嗦兜底：检测推理引导词，命中直接保留原版
@@ -2554,9 +3075,8 @@ canonical storyboard 商品可见性摘要（唯一权威来源）：
     ]
     verbose_hits = [m for m in VERBOSE_MARKERS if m in content[:200]]  # 只检查开头 200 字
     if verbose_hits:
-        if on_log:
-            on_log(f"⚠ GPT 输出含推理引导词 {verbose_hits}，保留 MiMo 原版")
-        return {"repaired_prompt": prompt, "repairs": []}
+        raise RuntimeError("审查输出含推理引导词 %s ⇒ 判不可用（宁可不改，不拿一份没审的稿冒充审过）"
+                           % "、".join(verbose_hits))
 
     # ═══════════ 2 道结构性保险栓（只防结构改坏，不干预内容修正）═══════════
     fallback_reasons = []
@@ -2571,16 +3091,44 @@ canonical storyboard 商品可见性摘要（唯一权威来源）：
     # 缺失引用不由 Layer 2 补写，由后端 Validator 触发回退或重跑。
 
     if fallback_reasons:
-        if on_log:
-            on_log(f"⚠ GPT 审查触发结构性保险栓，保留 MiMo 原版: {', '.join(fallback_reasons)}")
-        return {"repaired_prompt": prompt, "repairs": []}
+        raise RuntimeError("审查触发结构性保险栓：%s ⇒ 判不可用" % "，".join(fallback_reasons))
 
     if on_log and content != prompt:
         delta = len(content) - len(prompt)
         sign = "+" if delta >= 0 else ""
-        on_log(f"✓ GPT 审查通过，采用 GPT 修正版（{len(prompt)} → {len(content)} 字，{sign}{delta}）")
+        on_log(f"✓ 审查通过，采用修正版（{len(prompt)} → {len(content)} 字，{sign}{delta}）")
 
     return {"repaired_prompt": content or prompt, "repairs": repairs}
+
+
+def _storyboard_system_prompt(target_duration: float, split_mode: str) -> str:
+    """分镜腿的 system prompt = 受保护那份原文 + 一段调用侧补强。
+
+    🔴 pipeline/step1_mimo_parse.py 是 BOUNDARY.md 整文件保护（一个字不动），补强只能经
+       `system_prompt=` 这个它自己开着的参数传进来；正文用 import 引用、不复制，
+       复制一份 = 第二个事实源，必然和原文漂移。
+    🔴 补的是什么：原文【固定空值规则】要求「无主体商品时产品/产品动作/商品交互三格全填无」，
+       校验器（_validate_result）也照这条判红，但从没告诉模型「判无之后，这一格里对道具的真实动作
+       写去哪」。模型只剩两条路：谎报无动作，或把道具改写成产品 —— 于是按下 Shot 4 就冒出 Shot 9。
+       实测 2026-10-22 sc_5a859fb5c1f1：第一轮 Shot 4「产品=无 / 产品动作=从收纳状态变为展开状态」，
+       管线自带的那一次纠错重试把它修好了，第二轮换成 Shot 9「产品=无 / 交互=涂抹·肩背部·使用过程」，
+       而第二轮的原文不落盘（mimo_raw.json 只写第一轮）⇒ 看着像随机死亡。
+    ⚠️ 传自定义 prompt 会让 run() 走 _is_custom_prompt 分支，user 消息里「当前视频目标时长为 X 秒」和
+       「输出一个 source_storyboard JSON 数组」两句一起消失 ⇒ 这两件必须在这里补回来，
+       否则时间轴覆盖不到 target_duration，Checkpoint A 判红。
+    """
+    from pipeline.step1_mimo_parse import SYSTEM_PROMPT
+    return SYSTEM_PROMPT + f"""
+
+====================
+【超级复刻·调用侧补强】与上文冲突时以本节为准。
+====================
+1. 分镜切分模式 = 「{split_mode}」（scene_cut 即上文模式A，action_grained 即上文模式B）。上文提到的「分镜切分模式」由这一句给出，不要猜。
+2. target_duration = {target_duration:.2f} 秒，是后端 ffprobe 实测的唯一权威时长。第一个 Shot 从 00:00.00 开始，最后一个 Shot 的结束时间必须等于 {target_duration:.2f} 秒，Shot 之间不留空洞、不重叠。
+3. 主体原商品在整段视频里只有一件。先按【主体原商品识别规则】定下这一件，此后每个 Shot 的「产品」字段都用同一个称呼指同一件东西；不要因为某镜头里被操作的是别的道具（毛巾、器皿、包装盒、家具），就把那件道具写成产品。
+4. 某 Shot 里这件主体原商品确实不可见时，「产品」「产品动作」「交互方式」「交互部位」「营销功能」五格全填「无」；该镜头里对道具的真实操作改写进「画面动作.画面内容」和「画面动作.人物动作」两格。真实动作不得因为判了无就删掉，也不得留在「产品动作」里。
+5. 只输出一个顶层 JSON 数组，逐 Shot 只含【唯一输出 Schema】列出的字段：不要 gen_mode，不要时间轴数组，不要解析依据和合并段表，不要 Markdown、代码块或任何解释文字。
+"""
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2614,12 +3162,22 @@ async def step1_mimo_director(
     def log(msg: str) -> None:
         if on_log:
             on_log(msg)
-        print(f"  [Step1·MiMo] {msg}", flush=True)
+        print(f"  [Step1·分镜腿] {msg}", flush=True)
 
     cfg = _cfg()
     # 同步 settings.MIMO_API_KEY 到环境变量（pipeline.step1_mimo_parse 用 os.environ.get）
     os.environ["MIMO_API_KEY"] = settings.MIMO_API_KEY
     from pipeline.step1_mimo_parse import run as mimo_run
+
+    # 🔴 分镜腿用哪家 = config 的开关（唯一源 _storyboard_lane），解不出来就在这里拒：
+    #    不拒就会静默落回那份受保护文件签名里的 `mimo-v2.6-flash` 默认值 —— 那是"回执写 A、实跑 B"的形状。
+    _sb = cfg.get("storyboard_lane") or {}
+    if _sb.get("error"):
+        raise RuntimeError("Step1 分镜腿起不来：%s" % _sb["error"])
+    if not (_sb.get("base_url") and _sb.get("api_key") and _sb.get("model")):
+        raise RuntimeError("Step1 分镜腿三元组不全（base_url/api_key/model）⇒ 不发请求；当前 provider=%s"
+                           % _sb.get("provider"))
+    log("分镜腿=%s（model=%s，ledger=%s）" % (_sb.get("provider"), _sb.get("model"), _sb.get("ledger")))
 
     mimo_out = str(Path(output_dir) / "step1_mimo")
     Path(mimo_out).mkdir(parents=True, exist_ok=True)
@@ -2627,7 +3185,9 @@ async def step1_mimo_director(
     # ★Step 1 只解析原视频，不输入任何新素材（产品图/模特图/场景图/customer_request/product_name）
     #   - 避免新素材污染原视频解析（例如新场景是咖啡店 → MiMo 可能误把原视频白色卧室解析成咖啡店）
     #   - 新素材的迁移统一由 Step 1.5 GPT 编译器处理
-    log("启动 MiMo（纯视频解析器）解析原视频 → storyboard JSON")
+    log("启动分镜腿（纯视频解析器）解析原视频 → storyboard JSON")
+    log("分镜腿 prompt = 受保护原文 + 调用侧补强（无主体商品时把道具动作改写进画面内容/人物动作；"
+        "重申 target_duration=%s 与只出一个数组、不出 gen_mode）" % ("%.2f" % target_duration))
     # #region debug-point A:mimo-asr-path
     try:
         import urllib.request
@@ -2654,11 +3214,17 @@ async def step1_mimo_director(
         fps=cfg["mimo_fps"],
         media_resolution=cfg["mimo_resolution"],
         split_mode=cfg["mimo_split_mode"],
+        base_url=_sb["base_url"],   # 🔴 显式传：step1 的签名默认值是小米那个域名，
+        api_key=_sb["api_key"],     #    不传就只能跑默认那一家（config 的 MIMO_BASE_URL 也救不回来 —— 它在 api_key 非空时不参与）
+        model=cfg["mimo_model"],   # 唯一源 = _storyboard_lane()（2026-10-20 起按开关指 agnes 或小米），
+                                   #    不用 step1_mimo_parse 签名里的 flash 默认值（那份 BOUNDARY 只调不改）
         target_duration=target_duration,  # Step 0 唯一权威时长，供局部时间轴校验
         product_image_paths=None,   # ★不传产品图
         model_image_path=None,      # ★不传模特图
         scene_image_path=None,      # ★不传场景图
         customer_request=None,      # ★不传客户需求
+        # 🔴 受保护文件里唯一开着的注入口；正文 import 自那份 SYSTEM_PROMPT，只在尾部补一段（见 _storyboard_system_prompt）
+        system_prompt=_storyboard_system_prompt(target_duration, cfg["mimo_split_mode"]),
     )
 
     storyboard = result.get("storyboard") or []
@@ -3041,6 +3607,14 @@ async def step2_wan3_execute(
         "resolution": eff_resolution,
         "aspect_ratio": eff_aspect_ratio,
         "audio": eff_audio,
+        # 2026-10-14 更正：上游参数卡（GET /v1/models 现读）明写 `audio: boolean`、
+        # `media_types` 含 `reference_audio` ⇒ 这两个都【真的送上去了】，不再是丢掉的参数。
+        # 留这两格是为了看得见"送没送"与"验没验"——送了不等于生效，语义仍未实测。
+        "audio_param_sent_to_lane": True,
+        "reference_audio_sent": bool(audio_urls),
+        "audio_note": ("audio 与 reference_audio 均已上送；但上游拿 reference_audio 做什么"
+                       "（照它念 / 只取音色）未实测 ⇒ 出片必须本地 ASR 复验听到的就是新词，"
+                       "复验不过不许在交付里写『口播已改』"),
         "audio_urls": audio_urls,
         "voice_audio_count": len(audio_urls),
         "target_duration": target_duration,
@@ -3103,18 +3677,19 @@ async def step2_wan3_execute(
     final_output_duration: Optional[float] = None
     duration_status = "generation_failed"  # 默认失败，只有 PASS/trim 成功才会改写
     attempt_failure_reason: Optional[str] = None  # attempt 内部失败原因（trim_failed / regenerate / ffprobe_failed 等）
+    last_submit_error: Optional[str] = None       # 提交这一步【网关/上游自己说的原话】，交付层拿它写拒因
 
     while total_attempts < max_generation_attempts:
         current_seed = base_seed + total_attempts
         log(f"=== Wan3.0 生成 attempt {total_attempts + 1}/{max_generation_attempts}（wan3-prime 无 seed 概念：每次重试都是上游一次新计费 calls=1）===)")
 
         try:
-            # 🔴 路由唯一源（2026-10-10 定）：wan3.0 = 网关 lane video.generate/wan3-prime（provider yz-prime）。
+            # 🔴 路由唯一源（2026-10-10 定）：wan3.0 = 网关 lane video.generate/wan3-prime（provider tianyue）。
             #    不再走 RunningHub（2026-10-09 禁令 + WAN3_RH_ENABLED=False），也不再靠"agent 直调网关"绕开入口。
-            if str(eff_resolution or "").strip().upper() != "1080P":
-                log(f"⚠ 路由 wan3-prime 只出 1080P：调用方给的 {eff_resolution!r} 不适用这条 lane"
-                    "（表单里分辨率是锁定的 1080P；要别的分辨率是换路线，不是改这里）")
-            log(f"=== 提交走网关 video.generate/wan3-prime（yz-prime · account=local · 按次计费 calls=1）===")
+            #    分辨率在这一层【原样递下去】：以前这里印一句"只出 1080P"然后把调用方给的档位丢掉、
+            #    硬写 1080P ⇒ 客户点名 720P 时既没拒也没换档，只是悄悄出了 1080P（悄悄改参数）。
+            #    现在交给 lane 自己的档位校验（gateway._WAN30_RES_MODEL）：名单外 0 分本地拒。
+            log(f"=== 提交走网关 video.generate/wan3-prime（account=local · resolution={eff_resolution} · 按次计费 calls=1）===")
             result = await asyncio.to_thread(
                 wan3_client.run_one_segment_prime,
                 prompt=prompt,
@@ -3124,7 +3699,7 @@ async def step2_wan3_execute(
                 duration=wan_duration,
                 output_dir=output_dir,
                 segment_index=total_attempts + 1,
-                resolution="1080P",
+                resolution=eff_resolution,
                 aspect_ratio=eff_aspect_ratio,
                 audio=eff_audio,
                 audio_urls=audio_urls,
@@ -3140,6 +3715,7 @@ async def step2_wan3_execute(
             err_type_name = type(e).__name__
             err_module = type(e).__module__
             is_wan_error = "Wan" in err_type_name or "wan3" in err_module.lower()
+            last_submit_error = "%s：%s" % (err_type_name, str(e)[:700])
 
             # 判断是否为永久错误（不可重试）
             is_permanent = False
@@ -3147,12 +3723,15 @@ async def step2_wan3_execute(
             if is_wan_error:
                 # WanAuthError（401/403）、WanParamError（400）、WanContentRejectError（内容审核）
                 # 这些类在 wan3_client.py 中已定义，这里按类名匹配避免循环依赖
-                if err_type_name in ("WanAuthError", "WanParamError", "WanContentRejectError"):
+                if err_type_name in ("WanAuthError", "WanParamError", "WanContentRejectError",
+                                     "WanApprovalRequired", "WanUpstreamUnavailable"):
                     is_permanent = True
                     permanent_reason = {
                         "WanAuthError": "鉴权/权限失败（401/403）",
                         "WanParamError": "API 参数非法（400）",
                         "WanContentRejectError": "内容/安全审核拒绝",
+                        "WanApprovalRequired": "网关批准闸拒绝（0 分未扣、任务未发起）",
+                        "WanUpstreamUnavailable": "上游没有可用渠道（渠道池空/上游抖动，不是参数问题）",
                     }[err_type_name]
 
             if is_permanent:
@@ -3211,6 +3790,24 @@ async def step2_wan3_execute(
         last_task_id = current_task_id
         local_out = result.get("local_path", "")
         log(f"✓ Wan3.0 生成完成 (seed={seed_used}, attempt {total_attempts}/{max_generation_attempts}) → {local_out}")
+
+        # 🔴 回执这一格拿到结果后【按现读重打一次】：提交前那一钩只能写路由配置上的主模型，
+        #    而这条 lane 现在会在【同分辨率候选链】里换线（2026-10-21 现网 17:03：客户要 720P，
+        #    ME-wan30-720p-1055 与其下一条候选都被渠道回"上游余额不足"⇒ 真出片的是 S-Wan30-prime-720p-1050-se，
+        #    而表上印的是 ME-wan30-1080p-1055）。交付表写一条没跑过的模型 = 台账作废，所以以信封为准。
+        try:
+            from backend import skill_contract as _skc3
+            _m_real = str(result.get("model") or "").strip() or "没记"
+            _r3 = _skc3.tick("super-clone", str(output_dir), "submit-package",
+                             evidence=str(Path(output_dir) / "wan3_job.json"),
+                             model="%s@tianyue · 网关账本内" % _m_real,
+                             impl="gateway:invoke:video.generate/wan3-prime")
+            if not _r3.get("ok"):
+                log("⚠️ 回执 submit-package 没改成现读模型名：%s" % _r3.get("error"))
+            else:
+                log(f"  ✓ 回执 submit-package 的模型名已按信封改口 → {_m_real}")
+        except Exception as _te3:                            # noqa: BLE001
+            log("⚠️ 回执 submit-package 重打异常（不影响这次交付）：%s" % _te3)
 
         # ── Step 3.5: 时长验收（每次 Wan 成功后立即 validate_generated_video）──
         # ★基准 = target_duration（Step 0 ffprobe 锁死的全流程唯一时间事实源）
@@ -3342,9 +3939,32 @@ async def step2_wan3_execute(
         #   trim_failed / regenerate / ffprobe_failed 等仅作为 attempt_failure_reason 出现
         "duration_status": duration_status,
         "attempt_failure_reason": attempt_failure_reason,  # attempt 内部失败原因（仅诊断用）
+        "submit_error": last_submit_error,  # 提交这一步的原话拒因（交付层用它写"为什么没有成片"）
         "seed_used": seed_used,
         "total_attempts": total_attempts,
     }
+
+
+def delivery_problems(step2: dict) -> list:
+    """单段路径的验收判据（纯函数）：「跑完了」必须等于【盘上有一支能播的片子】。
+
+    2026-10-22 sc_9c246af70384：提交被批准闸拒了（0 分未扣、上游任务根本没建），执行器回
+    final_path=None / duration_status=generation_failed，而这里原来什么都不查就
+    on_phase("completed") ⇒ 状态写 SUCCESS、日志打「工作流完成 → None」。
+    「该发生却没发生」必须能红，所以判据抽成函数、由交付层调用。
+    """
+    if not isinstance(step2, dict):
+        return ["执行器没返回信封，无从判定交付"]
+    problems: list = []
+    status = str(step2.get("duration_status") or "")
+    if status not in ("pass", "trimmed"):
+        problems.append("最终状态=%s（不是 pass/trimmed）" % (status or "空"))
+    final = str(step2.get("final_path") or "")
+    if not final:
+        problems.append("没有成片路径")
+    elif not Path(final).is_file():
+        problems.append("成片文件不在盘上：%s" % final)
+    return problems
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -3365,9 +3985,70 @@ MATERIAL_ANALYZE_TOKENS = int(os.environ.get("SUPER_CLONE_ANALYZE_TOKENS") or "9
 MATERIAL_ANALYZE_CREDIT_CAP = int(os.environ.get("SUPER_CLONE_ANALYZE_CAP") or "120")
 
 
+# ── 编译产物缓存（2026-10-14 需求单：把"编译一次、多次复用"焊死）───────────────────
+# 为什么要有这一份：`--stage submit` 的语义是"从头跑到提交"，run_pipeline 里原来没有任何复用开关
+# ⇒ 同一条 14s 输入今晚被完整编译了 4 遍，其中两遍纯白烧（一遍提交被身份问题拒、一遍 MiMo 截断后整条重跑）。
+# 指纹覆盖【所有会影响 storyboard / prompt 的输入】：命中 = 输入一字没变 = 重编译也是同样结果 ⇒ 零语义损失。
+_COMPILE_FP_KEYS = ("trim_start", "trim_end", "target_duration", "resolution", "aspect_ratio",
+                    "voice_mode", "voice_script", "extra_note", "customer_request", "product_name",
+                    "media_manifest", "source_sha8")
+
+
+def compile_fingerprint(facts: Dict[str, Any]) -> str:
+    """纯本地 sha8 —— 0 模型、0 分、不发请求。
+    🔴 少列一个会影响 prompt 的输入 = 会把旧提示词当成新的复用掉，所以加字段必须同时过闸 CP 组。"""
+    parts = []
+    for k in _COMPILE_FP_KEYS:
+        v = (facts or {}).get(k)
+        parts.append("%s=%s" % (k, json.dumps(v, ensure_ascii=False, sort_keys=True)
+                                if isinstance(v, (list, dict)) else v))
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:8]
+
+
+def compile_cache_state(seg_dir, facts: Dict[str, Any]) -> tuple:
+    """(命中?, 说得出名字的原因)。三件齐才算命中 —— 只比指纹会被"盘上躺着旧 prompt"骗
+    （2026-10-10 深夜：v3 那轮把已交付成片的 prompt.txt 原地盖掉，就是这个形状）。
+    ① 指纹相同 ② 两份物证的 sha8 就是指纹里记的那两份 ③ 回执必需步全打钩。
+    🔴 任何一条不满足一律判【未命中】⇒ 宁可多烧一次编译，也不能拿错的那份提示词去花 60 分。
+    ⚠️ 只有【单段路径】会写 compile_fp；多段（按分镜切 chunk）那条不写 ⇒ 永远不命中、照旧全量重编译。"""
+    d = Path(seg_dir)
+    pm, pt, sb, rc = (d / "prompt_meta.json", d / "prompt.txt",
+                      d / "storyboard.json", d / ".skill_receipt.json")
+    from backend import skill_contract as _skc            # 模块层没有这个名字，见上方注释
+    if not (pm.is_file() and pt.is_file() and sb.is_file()):
+        return False, "缺编译产物（prompt.txt / storyboard.json / prompt_meta.json 有一样不在）"
+    if not pt.read_text(encoding="utf-8", errors="replace").strip():
+        return False, "prompt.txt 是空的"
+    try:
+        meta = json.loads(pm.read_text(encoding="utf-8"))
+    except Exception:                                          # noqa: BLE001
+        return False, "prompt_meta.json 读不出来/坏 JSON"
+    fp = compile_fingerprint(facts)
+    if str(meta.get("compile_fp") or "") != fp:
+        return False, "指纹不符（输入改过，或这一份是旧版本产物、根本没写指纹）"
+    if _skc.sha8(str(sb)) != str(meta.get("storyboard_sha8") or ""):
+        return False, "storyboard.json 与指纹里记的那份不一致（被改过）"
+    if _skc.sha8(str(pt)) != str(meta.get("prompt_sha8") or ""):
+        return False, "prompt.txt 与指纹里记的那份不一致（被改过）"
+    try:
+        rec = json.loads(rc.read_text(encoding="utf-8"))
+        steps = rec.get("steps") or []
+        if not isinstance(steps, list):
+            raise ValueError("steps 不是列表")
+    except Exception:                                          # noqa: BLE001
+        return False, "回执读不出来/形状不对（缺回执 = 那次没走完，不许复用）"
+    miss = [str(s.get("id")) for s in steps if isinstance(s, dict)
+            and s.get("required") and not s.get("ok")]
+    if miss:
+        return False, "回执必需步没齐：%s" % "、".join(miss)
+    return True, "命中（compile_fp=%s）" % fp
+
+
 def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_duration,
                        ref_video, seg_product_paths, source_fit=None,
                        extra_note: Optional[str] = None,
+                       narration_binding: Optional[str] = None,
+                       compile_facts: Optional[Dict[str, Any]] = None,
                        log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """物证三件（prompt.txt / storyboard.json / prompt_meta.json）+ 回执 + 花钱前的合同核验。
 
@@ -3399,7 +4080,7 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
             _l("⚠️ 这一格打钩了但没写进盘：%s" % r.get("error"))
 
     # 🔴 模型名现读，三家一次读齐（不写死、不凭记忆）：看图腿 / Step1 分镜腿 / 编译器腿
-    _cell_analyze = _lane_cell("video.analyze")
+    _cell_analyze = _lane_cell("video.analyze", _analyze_purpose())   # 2026-10-20：purpose 唯一源在 config（默认 magpie 带图腿；mimo_pro 那把 key 现在 429 死着）
     _cell_mimo = _mimo_cell()
     # 开工即落骨架（含输入指纹）。素材没看过而 raise 时，盘上留下的就是这张【全 ⬜ 的打钩单】——
     # 它不是"脏盘"，正是用户要的东西：一眼看出这次跑到第几步、卡在哪一格。
@@ -3417,31 +4098,51 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
     #    gateway.analysis_missing_paths，这里不解析错误字符串）。范围只含产品图 —— 原片的动作与时间轴
     #    事实由 Step1 MiMo 那条腿承担，再花一次看图分是重复消耗（用户 2026-10-12 定"最可靠"）。
     _spent, _auto = 0, []
+    _lanes = _analyze_lanes()
+    if not _lanes:
+        raise RuntimeError("看图腿的链读不出来：config/.env 的 REPLICA_WAN3_ANALYZE_PURPOSE 串形不对，"
+                           "或里面点名了网关 `video.analyze` 没有的 purpose ⇒ 0 分、一条都不发"
+                           "（半条链比空链危险：会拿一条没人指定的腿跑，再把回执署成主腿的名字）")
     for _round in (1, 2):
         _miss = _gw.analysis_missing_paths(_mats, _gw.media_analysis_rows(), _sid)
         if not _miss or _round == 2 or _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
             break
         for one in _miss:
-            env = _gw.invoke("video.analyze", None, "local",
-                             {"path": one, "question": MATERIAL_ANALYZE_QUESTION,
-                              "max_tokens": MATERIAL_ANALYZE_TOKENS}) or {}
-            _cr = int(((env.get("credits") or {}).get("charged")) or 0)
-            _spent += _cr
-            _auto.append({"name": os.path.basename(one), "ok": bool(env.get("ok")), "charged": _cr,
-                          "error": str(env.get("error") or "")[:160]})
+            # 链：主腿挂了才往下走一条，但【挂在哪条、花了多少】必须留在物证里（看不见=查不着）
+            row = {"name": os.path.basename(one), "ok": False, "charged": 0, "error": "",
+                   "lane": "", "model": "", "tried": []}
+            for ln in _lanes:
+                for _t in range(int(ln["tries"])):
+                    env = _gw.invoke("video.analyze", ln["purpose"], "local",
+                                     {"path": one, "question": MATERIAL_ANALYZE_QUESTION,
+                                      "max_tokens": MATERIAL_ANALYZE_TOKENS}) or {}
+                    _cr = int(((env.get("credits") or {}).get("charged")) or 0)
+                    _spent += _cr
+                    row["charged"] += _cr
+                    _txt = str(((env.get("result") or {}).get("text")) or "").strip()
+                    _good = bool(env.get("ok")) and bool(_txt)
+                    row["tried"].append({"purpose": ln["purpose"], "ok": _good, "charged": _cr,
+                                         "error": str(env.get("error") or ("正文为空" if not _txt else ""))[:160]})
+                    if _good:
+                        row.update({"ok": True, "lane": ln["purpose"],
+                                    "model": _analyze_lane_model(ln["purpose"])})
+                        break
+                    row["error"] = str(env.get("error") or "正文为空")[:160]
+                    if _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
+                        break
+                if row["ok"] or _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
+                    break
+            _auto.append(row)
             if _spent >= MATERIAL_ANALYZE_CREDIT_CAP:
                 break
+    # 回执那一格的模型名 = 【真的答了这些素材的那条腿】；混着答或一条没答就保留主腿（不许猜）
+    _used = sorted({str(a.get("lane") or "") for a in _auto if a.get("ok")})
+    if len(_used) == 1:
+        _cell_analyze = _lane_cell("video.analyze", _used[0])
     if _auto and log:
         log("素材分析由管线自动补跑 %d 条、实扣 %d 分（免批不免账，已计入这次消耗）"
             % (len(_auto), _spent))
     _missing = _gw.analysis_coverage_problems(_mats, _gw.media_analysis_rows(), _sid)
-    if _missing:
-        raise RuntimeError(
-            "素材没看过 ⇒ 不提交（本轮管线自动补跑 %d 次、实扣 %d 分）。缺 %d 项：%s"
-            % (len(_auto), _spent, len(_missing), "；".join(_missing)[:400])
-            + ("｜熔断在 %d 分（SUPER_CLONE_ANALYZE_CAP 可调），不是闸坏了" % MATERIAL_ANALYZE_CREDIT_CAP
-               if _spent >= MATERIAL_ANALYZE_CREDIT_CAP else
-               "｜多半是这条腿本身跑不通（看 material_analysis.json 的 auto_ran 里的 error）"))
     _ma = seg_dir / "material_analysis.json"
     _ma.write_text(json.dumps({
         "session": _sid or "未知",
@@ -3451,10 +4152,25 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
         # 🔴 谁跑的、花了多少：交付表与报价都读这一份，不靠 agent 自述
         "executor": "pipeline:invoke:video.analyze",   # 与合同 手段= 同一个 token：交付表与合同对得上
         "auto_ran": _auto, "auto_spent": _spent,
+        # 这次按的是哪条链（顺序=试的先后）+ 每条现在解出来的模型名 —— 没有这份，"为什么答的是这家"只能猜
+        "analyze_chain": [{"purpose": ln["purpose"], "tries": ln["tries"],
+                           "model": _analyze_lane_model(ln["purpose"])} for ln in _lanes],
+
         # 这一格的模型名从【这条腿现在的路由】现读；台账行只记 sha8 不记型号（要改网关那份才行）
         "model_cell": _cell_analyze,
         "credit_cap": MATERIAL_ANALYZE_CREDIT_CAP,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
+    if _missing:
+        # 🔴 这份物证必须在 raise 【之前】落盘：拒因原话让人"去看 material_analysis.json 的 auto_ran"，
+        #    而它写在 raise 之后 ⇒ 真被拒时那文件物理上不存在，等于让人去查一个没写出来的东西
+        #    （2026-10-22 sc_9c246af70384 就是这么让我抓不到补跑失败原因的）。
+        raise RuntimeError(
+            "素材没看过 ⇒ 不提交（本轮管线自动补跑 %d 次、实扣 %d 分）。缺 %d 项：%s"
+            % (len(_auto), _spent, len(_missing), "；".join(_missing)[:400])
+            + ("｜熔断在 %d 分（SUPER_CLONE_ANALYZE_CAP 可调），不是闸坏了" % MATERIAL_ANALYZE_CREDIT_CAP
+               if _spent >= MATERIAL_ANALYZE_CREDIT_CAP else
+               "｜多半是这条腿本身跑不通（看 %s 的 auto_ran 里的 error）" % _ma.name)
+            + "｜注意：会话=%s，台账里【没有 hold_id 的行不算证据】" % (_sid or "未知"))
     _tk("material-analysis", str(_ma), _cell_analyze, impl="pipeline:invoke:video.analyze")
 
     cs = compiled_seg or {}
@@ -3471,12 +4187,22 @@ def _contract_evidence(seg_dir, *, seg_board, seg_prompt, compiled_seg, seg_dura
     sb.write_text(json.dumps(seg_board, ensure_ascii=False, indent=2), encoding="utf-8")
     _tk("storyboard", str(sb), _cell_mimo)
 
+    # 改口播直出那一格：这次真带了客户改稿才有物证（合同 required=0）。
+    # 🔴 【没有物证也要走一遍 tick】—— tick 打不上时会把那格抹成 ⬜（连旧物证/指纹一起清）。
+    #    跳过不调 = 留着上一次那条真片子的 ✅ 冒充这次做过（2026-10-14 闸 N12 当场抓到这个形状）。
+    # 模型名写 NO_MODEL —— 这一步是纯字符串对齐，真念词的是 wan3 那条腿。
+    _tk("narration-direct", str(narration_binding or ""), _skc.NO_MODEL,
+        impl="pipeline:apply_customer_narration")
+
     _pm = seg_dir / "prompt_meta.json"
     _pm.write_text(json.dumps({
         "source": str(cs.get("source") or ""),
         # 🔴 模型身份单独记：source 只证明"走了编译器这个函数"，答不出"哪个模型跑的"
         "model": mdl, "provider": prov, "ledger": led,
         "storyboard_sha8": _skc.sha8(str(sb)),
+        "prompt_sha8": _skc.sha8(str(_pt)),
+        # 复用缓存的那把钥匙：只有【单段路径】带 facts 进来才写（多段不写 ⇒ 永不命中，宁可重编）
+        "compile_fp": (compile_fingerprint(compile_facts) if compile_facts else ""),
         "prompt_chars": len(seg_prompt),
         "target_duration": float(seg_duration)}, ensure_ascii=False, indent=1), encoding="utf-8")
     _tk("compile-bound", str(_pm), cell)
@@ -3553,7 +4279,11 @@ async def run_pipeline(
     as_duration_chunk: bool = False,
     background_override: Optional[str] = None,
     voice_audio_paths: Optional[List[str]] = None,
+    voice_script: Optional[str] = None,
     stop_after: Optional[str] = None,
+    reuse_compile: bool = False,
+    reuse_compile_strict: bool = True,
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """超级复刻 Wan3.0/H3 - 4 步工作流顶层编排。
 
@@ -3579,6 +4309,8 @@ async def run_pipeline(
         model_image_path: 模特参考图本地路径（可选，用于人物替换）
         scene_image_path: 场景参考图本地路径（可选，用于背景替换）
         stop_after: None=照常提交；"compile"=只走到"物证+回执+合同核验"就返回（不提交、不建 hold、0 分）
+        resume: True=断点继续模式：已落盘且校验通过的步骤产物自动复用（裁剪视频/分镜/编译/Lint/
+                已完成的分段），缺失或校验不过才重跑
 
     Returns:
         {
@@ -3633,10 +4365,13 @@ async def run_pipeline(
     if trim_start is not None and trim_end is not None:
         trimmed_path = str(Path(output_dir) / "trimmed_source.mp4")
         requested_duration = round(float(trim_end) - float(trim_start), 3)
-        log(f"=== Step 0: 精准裁剪原视频 [{trim_start:.2f}s → {trim_end:.2f}s] (requested={requested_duration:.3f}s) ===")
-        trim_video(video_path, float(trim_start), float(trim_end), trimmed_path)
+        if resume and Path(trimmed_path).is_file():
+            log(f"=== Step 0: ↻ 断点继续，复用已裁剪视频 → {trimmed_path} ===")
+        else:
+            log(f"=== Step 0: 精准裁剪原视频 [{trim_start:.2f}s → {trim_end:.2f}s] (requested={requested_duration:.3f}s) ===")
+            trim_video(video_path, float(trim_start), float(trim_end), trimmed_path)
+            log(f"✓ 裁剪完成 → {trimmed_path}")
         trim_range = {"start": float(trim_start), "end": float(trim_end)}
-        log(f"✓ 裁剪完成 → {trimmed_path}")
     else:
         # 无裁剪时也明确指定实际送入 MiMo/Wan 的参考视频路径。
         trimmed_path = video_path
@@ -3688,14 +4423,30 @@ async def run_pipeline(
         trim_video(trimmed_path, 0.0, float(max_input_dur), cap_path)
         trimmed_path = cap_path
         target_duration = round(_ffprobe_duration(cap_path) or float(max_input_dur), 2)
+    write_submit_plan(
+        output_dir, task_id=task_id, windows=windows, target_duration=target_duration,
+        trim_range=trim_range, source_video=trimmed_path, as_duration_chunk=as_duration_chunk,
+        log=log,
+    )
+    if voice_script and len(windows) > 1:
+        raise RuntimeError(
+            "改口播直出这条只接【一段一条稿】：这次会自动切成 %d 段，而客户给的那份稿是对整条的，"
+            "按段各灌一遍 = 每段都念整稿（重复与漏词），比不改更坏。"
+            "两条合法走法：① 按难单逐段跑（每段一次 run.py + 那一段自己的稿，0 分先 --stage compile 看对齐）；"
+            "② 整条一次出片、改口播走后处理换轨（narration-swap，每句一次克隆、不在网关账本上）。"
+            "⇒ 现在拒：0 分未扣、任务未发起" % len(windows))
     if len(windows) > 1:
         log(
             f"=== Step 0: 原片 {target_duration:.2f}s，按 15s 切成 {len(windows)} 段自动拼接 ==="
         )
         for i, win in enumerate(windows, start=1):
+            _ref = ""
+            if (win.get("ref_start"), win.get("ref_end")) != (win["start"], win["end"]):
+                _ref = "｜参考 %.2f-%.2fs（尾巴太短看不出动作者，参考窗口借满 5s；重复的那截不进成片）" % (
+                    float(win["ref_start"]), float(win["ref_end"]))
             log(
                 f"  段 {i}/{len(windows)}: {win['start']:.2f}-{win['end']:.2f}s "
-                f"({win['end'] - win['start']:.2f}s)"
+                f"({win['end'] - win['start']:.2f}s){_ref}"
             )
         split_root = Path(output_dir) / ("step2_h3" if engine == "h3" else "step2_wan3")
         split_root.mkdir(parents=True, exist_ok=True)
@@ -3705,9 +4456,29 @@ async def run_pipeline(
             seg_dir = split_root / f"chunk_{i:02d}"
             seg_dir.mkdir(parents=True, exist_ok=True)
             ref_video = str(seg_dir / "source.mp4")
-            trim_video(trimmed_path, float(win["start"]), float(win["end"]), ref_video)
-            want = float(win["end"]) - float(win["start"])
-            log(f"▶ 第 {i}/{len(windows)} 段 [{win['start']:.2f}-{win['end']:.2f}s] 开始生成")
+            # 🔴 断点继续：整段已生成过（fitted.mp4 + chunk_result.json 齐全）⇒ 直接复用，不重投 Wan
+            _cres_path = seg_dir / "chunk_result.json"
+            if resume and _cres_path.is_file():
+                try:
+                    _saved = json.loads(_cres_path.read_text(encoding="utf-8"))
+                    _saved_fitted = str(_saved.get("fitted") or "")
+                    if _saved_fitted and Path(_saved_fitted).is_file():
+                        log(f"↻ 第 {i}/{len(windows)} 段已完成，复用 {_saved_fitted}（不重新提交）")
+                        return _saved
+                except Exception as _re:                     # noqa: BLE001
+                    log(f"⚠ 第 {i}/{len(windows)} 段复用失败（{_re}），改走重新生成")
+            # 🔴 两个窗口各管各的：喂模型的是 ref_*（尾段会把参考窗口借满 5 秒，见 plan_15s_windows），
+            #    这一段在成片里负责的只有 start/end ⇒ 拼接时按 offset 丢掉重复的那一截。
+            ref_a = float(win.get("ref_start", win["start"]))
+            ref_b = float(win.get("ref_end", win["end"]))
+            out_dur = round(float(win["end"]) - float(win["start"]), 3)
+            if resume and Path(ref_video).is_file():
+                log(f"↻ 第 {i}/{len(windows)} 段复用已裁剪参考视频 → {ref_video}")
+            else:
+                trim_video(trimmed_path, ref_a, ref_b, ref_video)
+            want = round(ref_b - ref_a, 3)
+            log(f"▶ 第 {i}/{len(windows)} 段 [出 {win['start']:.2f}-{win['end']:.2f}s"
+                f"｜参考 {ref_a:.2f}-{ref_b:.2f}s（生成 {want:.2f}s，取其中 {out_dur:.2f}s）] 开始")
             if on_phase:
                 on_phase(
                     "step3_h3" if engine == "h3" else "step3_wan3",
@@ -3745,6 +4516,7 @@ async def run_pipeline(
                 stop_after=stop_after,
                 background_override=background_override,
                 voice_audio_paths=voice_audio_paths,
+                resume=resume,
             )
             if chunk_result.get("compiled_only"):
                 # 🔴 档位必须一路传到底（2026-10-12 现网 super-clone-20261012-1824）：按长度切段的递归
@@ -3757,13 +4529,22 @@ async def run_pipeline(
             if not part or not Path(str(part)).exists():
                 raise RuntimeError(f"第 {i}/{len(windows)} 段生成失败，无法拼接")
             fitted = str(seg_dir / "fitted.mp4")
-            fit_clip_duration(str(part), want, fitted)
-            return {
+            fit_clip_duration(str(part), out_dur, fitted,
+                              offset=round(float(win["start"]) - ref_a, 3))
+            _outcome = {
                 "index": i,
                 "win": win,
                 "fitted": fitted,
                 "chunk_result": chunk_result,
             }
+            # 🔴 断点继续的落盘凭据：这一段落盘后才算「完成」，下次 resume 直接复用
+            try:
+                _cres_path.write_text(
+                    json.dumps(_outcome, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception as _we:                         # noqa: BLE001
+                log(f"⚠ 第 {i}/{len(windows)} 段完成凭据落盘失败（不影响本次拼接）：{_we}")
+            return _outcome
 
         # 多段并发（受 REPLICA_WAN3_CONCURRENCY 限流），不再逐段串行等待
         concurrency = max(1, int(_cfg().get("concurrency") or 1))
@@ -3796,10 +4577,16 @@ async def run_pipeline(
                     _d["seg"] = item["index"]
                     _segs.append(_d)
             log("档位=只编译 ⇒ %d 段全部只走到【物证 + 回执 + 合同核验】，一条都没提交、0 分" % len(ordered))
+            # 多段路径下 media_manifest 局部变量尚未赋值（它在后面的 Step 0 块才建），
+            # 这里就地用入参重建同一份清单，避免 UnboundLocalError
+            _mm = _build_media_manifest(
+                product_image_paths, model_image_path, scene_image_path, extra_model_image_paths
+            )
             return {
                 "compiled_only": True, "stop_after": "compile", "success": True,
                 "duration_status": "not_submitted", "segments": _segs,
-                "prompt": None, "storyboard": None, "media_manifest": media_manifest,
+                "prompt": None, "storyboard": None,
+                "media_manifest": _mm,
                 "task_id": None, "result_url": None, "local_path": None,
                 "final_path": None, "output_duration": None, "duration": None,
             }
@@ -3956,36 +4743,95 @@ async def run_pipeline(
     # ── Step 1: MiMo 纯视频解析 → storyboard JSON（不输入新素材，不拼装 prompt）──
     if on_phase:
         on_phase("step1_mimo", {})
-    log("=== Step 1/4: MiMo（纯视频解析器）→ storyboard JSON ===")
-    log("  ★只看原视频，不输入产品图/模特图/场景图/customer_request/product_name（避免污染解析）")
-    # ★MiMo 解析有随机性，有时会漏掉最后一段（end < target_duration）；
-    #   Checkpoint A 校验失败时自动重试，最多 3 次
-    max_mimo_retries = 3
-    storyboard = None
-    for attempt in range(1, max_mimo_retries + 1):
-        step1 = await step1_mimo_director(
-            video_path=trimmed_path,
-            output_dir=output_dir,
-            target_duration=target_duration,
-            on_log=log,
-        )
-        storyboard = step1["storyboard"]
-        try:
-            storyboard = normalize_storyboard_time(storyboard, target_duration)
-            break  # 校验通过
-        except RuntimeError as exc:
-            if attempt < max_mimo_retries:
-                log(f"⚠ 第 {attempt}/{max_mimo_retries} 次解析校验失败：{exc}，重试中…")
-            else:
-                raise RuntimeError(
-                    f"Step 1 MiMo 解析 {max_mimo_retries} 次均未通过 Checkpoint A：{exc}"
-                ) from exc
-    log("✓ Checkpoint A 通过：已生成 canonical storyboard，时间只在此处规范化一次")
+    # 🔴 编译产物缓存（2026-10-14 需求单 1+2）：先算一次指纹（0 模型 0 分），命中就整段跳过
+    #    MiMo + FunASR + Grok，直接读盘上的 storyboard/prompt 进提交。
+    #    为什么必须在这儿：`--stage submit` 原来一律从头跑一遍，同一条输入今晚被编译了 4 遍，
+    #    其中两遍纯白烧（提交被身份问题拒一次、MiMo 截断后整条重跑一次）。
+    _cc_dir = Path(output_dir) / "step2_wan3"
+    # 🔴 `_skc` 在这个模块里【没有模块层导入】（都是各函数内延迟 import）。这一段是我 10-14 深夜加的
+    #    指纹缓存，当时漏了这句 import ⇒ `NameError: name '_skc' is not defined` 直接打死每一段，
+    #    10-15 09:05 那次【批准即点火】起的提交腿就是这么死的（submit.log 尾部三行同名错），
+    #    后果是"人点了批准、系统没投，agent 醒来自己重跑" —— 同一个文件为这件事崩过三次（os、json、这次）。
+    from backend import skill_contract as _skc
+    _cc_facts = {
+        "trim_start": float(trim_start or 0.0), "trim_end": float(trim_end or 0.0),
+        "target_duration": float(target_duration), "resolution": resolution,
+        "aspect_ratio": aspect_ratio, "voice_mode": None,
+        "voice_script": str(voice_script or ""), "extra_note": str(extra_compile_note or ""),
+        "customer_request": str(customer_request or ""), "product_name": str(product_name or ""),
+        "media_manifest": [{"image_id": m.get("image_id"), "path": m.get("path"),
+                            "sha8": _skc.sha8(str(m.get("path")))} for m in media_manifest],
+        "source_sha8": _skc.sha8(str(trimmed_path)),
+    }
+    _cc_hit, _cc_why = compile_cache_state(_cc_dir, _cc_facts)
+    if reuse_compile and not _cc_hit:
+        if reuse_compile_strict:
+            raise RuntimeError(
+                "--reuse-compile 但编译缓存不命中（%s）⇒ 去掉这个开关全量重编译。"
+                "这一档不许「半复用」：拿一份对不上号的旧 prompt 去花 60 分，比多烧一次编译坏得多。"
+                % _cc_why)
+        # 软档（服务端【批准即点火】用的那条）：不命中不是错误，是"这次没有可复用的产物"。
+        # 🔴 为什么不照硬档拒：条子批的是【提交】，缓存恰好失效（批完之后又改过 extra_note / 物证被重写）
+        #    时拒掉 = 一张已生效的批准花不出去、也没人重新报价 = 卡死。日志必须出声，别让人以为复用了。
+        log("⚠ 编译缓存不命中（%s）⇒ 不复用，照常从 Step1 全量重编译后再投（软复用档，服务端点火用的就是这条）"
+            % _cc_why)
+    if _cc_hit:
+        log("=== Step 1/4: 【复用编译产物】%s ⇒ 跳过 MiMo 视频解析与 FunASR 写回（0 token、0 分）===" % _cc_why)
+        storyboard = json.loads((_cc_dir / "storyboard.json").read_text(encoding="utf-8"))
+    else:
+        # 🔴 断点继续：MiMo 已落盘的分镜先复验 Checkpoint A，通过就整段复用（0 token），
+        #    不通过（截断/时间轴不合规）才重新解析 —— 复用只认校验过的产物。
+        _sb_path = Path(output_dir) / "step1_mimo" / "storyboard.json"
+        storyboard = None
+        if resume and _sb_path.is_file():
+            try:
+                _cand = json.loads(_sb_path.read_text(encoding="utf-8"))
+                storyboard = normalize_storyboard_time(_cand, target_duration)
+                log("=== Step 1/4: 【断点继续】复用已解析分镜（Checkpoint A 复验通过，0 token）===")
+            except Exception as _sb_err:                     # noqa: BLE001
+                log(f"⚠ 盘上分镜未通过 Checkpoint A（{_sb_err}），重新调用 MiMo 解析")
+                storyboard = None
+        if storyboard is None:
+            log("=== Step 1/4: 分镜腿（纯视频解析）→ storyboard JSON ===")
+            log("  ★只看原视频，不输入产品图/模特图/场景图/customer_request/product_name（避免污染解析）")
+            # ★MiMo 解析有随机性，有时会漏掉最后一段（end < target_duration）；
+            #   Checkpoint A 校验失败时自动重试，最多 3 次
+            max_mimo_retries = 3
+            storyboard = None
+            for attempt in range(1, max_mimo_retries + 1):
+                step1 = await step1_mimo_director(
+                    video_path=trimmed_path,
+                    output_dir=output_dir,
+                    target_duration=target_duration,
+                    on_log=log,
+                )
+                storyboard = step1["storyboard"]
+                try:
+                    storyboard = normalize_storyboard_time(storyboard, target_duration)
+                    break  # 校验通过
+                except RuntimeError as exc:
+                    if attempt < max_mimo_retries:
+                        log(f"⚠ 第 {attempt}/{max_mimo_retries} 次解析校验失败：{exc}，重试中…")
+                    else:
+                        raise RuntimeError(
+                            f"Step 1 MiMo 解析 {max_mimo_retries} 次均未通过 Checkpoint A：{exc}"
+                        ) from exc
+            log("✓ Checkpoint A 通过：已生成 canonical storyboard，时间只在此处规范化一次")
     # media_manifest 已在 Step 0 固定，此处不再从 Step 1 重新取（防止被覆盖）
     image_count = len(media_manifest)
     # ★Step 1 不再输出 mimo_detected_duration：ffprobe 得到的就是 target_duration
     #   全流程唯一时间事实源 = target_duration（Step 0 锁死）
     log(f"✓ Step 1 完成：解析出 {len(storyboard)} 个分镜，target_duration={target_duration:.2f}s（Step 0 锁死）")
+
+    # 🔴 改口播直出（2026-10-14 接的那根线）：客户改稿必须在【编译之前】进 storyboard 的口播位，
+    #    这样 Step 1.5 编译器把它当台词写进 prompt，末尾 force_verbatim_speech 再逐字钉回去 ⇒
+    #    wan3 一次出片就念新词。判据只证"新词进了台词位"，念得准不准、嘴形对不对仍归审帧 + lip-sync。
+    #    命中复用时【不再灌第二遍】：盘上那份 storyboard.json 已经是灌过之后的（指纹里含 voice_script，
+    #    所以命中就意味着是同一条稿），再灌一次等于拿新词去比新词、把物证算成满分。
+    if _cc_hit:
+        log("  · 改口播：复用命中，跳过 apply_customer_narration（盘上那份已灌过，指纹含 voice_script）")
+    else:
+        apply_customer_narration(storyboard, voice_script, output_dir, on_log=log)
 
     if split_by_shots:
         log("⚠ 超级复刻不允许组段生成，已忽略 split_by_shots=True")
@@ -4010,7 +4856,7 @@ async def run_pipeline(
     else:
         if on_phase:
             on_phase("step1_5_gpt_compile", {"shots": len(storyboard)})
-        log("=== Step 1.5/4: Grok 编译器 → storyboard JSON → Wan3.0 prompt ===")
+        log("=== Step 1.5/4: 编译器 → storyboard JSON → Wan3.0 prompt ===")
         compile_kwargs = dict(
             storyboard=storyboard,
             target_duration=target_duration,
@@ -4026,7 +4872,17 @@ async def run_pipeline(
             background_override=background_override,
             on_log=log,
         )
-        if len(storyboard) > 1:
+        if _cc_hit:
+            prompt = (_cc_dir / "prompt.txt").read_text(encoding="utf-8")
+            _meta = json.loads((_cc_dir / "prompt_meta.json").read_text(encoding="utf-8"))
+            compiled = {"prompt": prompt,
+                        "source": str(_meta.get("source") or "step1_5_gpt_compiler"),
+                        "model": str(_meta.get("model") or "没记"),
+                        "provider": str(_meta.get("provider") or "没记"),
+                        "ledger": str(_meta.get("ledger") or "off")}
+            log("=== Step 1.5/4: 【复用编译产物】跳过逐镜编译与合并（0 token）；"
+                "下面时间轴校验与不可见镜引用校验照跑，不因复用而免 ===")
+        elif len(storyboard) > 1:
             log(f"整段传：逐镜编译再合并（{len(storyboard)} 镜，一次送 Wan3）")
             shot_prompts: List[str] = []
             shot_stamps: List[Dict[str, Any]] = []
@@ -4078,32 +4934,64 @@ async def run_pipeline(
 
         if on_phase:
             on_phase("step2_gpt_lint", {"target_duration": target_duration})
-        log("=== Step 2/4: GPT Lint → 规则校验 + LLM 二次审查 ===")
+        log("=== Step 2/4: 审查（Lint）→ 规则校验 + LLM 二次审查 ===")
+        # 🔴 断点继续：Lint 产物按【输入 prompt 指纹】复用；prompt 变过（重编译过）就不复用
+        _lint_path = _cc_dir / "lint_result.json"
+        _lint_key = _skc.sha8(prompt)
+        check = None
+        if resume and _lint_path.is_file():
+            try:
+                _lint_saved = json.loads(_lint_path.read_text(encoding="utf-8"))
+                if (_lint_saved.get("input_prompt_sha8") == _lint_key
+                        and isinstance(_lint_saved.get("check"), dict)):
+                    check = _lint_saved["check"]
+                    log("=== Step 2/4: 【断点继续】复用上次 Lint 结果（输入 prompt 指纹一致，0 token）===")
+            except Exception as _lint_err:                    # noqa: BLE001
+                log(f"⚠ 盘上 Lint 结果不可用（{_lint_err}），重新执行 Lint")
+                check = None
         # ★Plan C 失败重试：背景一致性校验失败 → 重跑 Compiler 一次（强化 note）→ 重跑 Lint
-        try:
-            check = await validate_and_fix_prompt(
-                prompt=prompt,
-                target_duration=target_duration,
-                media_manifest=media_manifest,
-                product_name=product_name,
-                storyboard=storyboard,
-                background_override=background_override,
-                on_log=log,
-            )
-        except RuntimeError as lint_exc:
-            if background_override and "background_override 校验失败" in str(lint_exc):
-                log(f"⚠ Step 2 背景校验失败：{lint_exc}，重跑 Compiler 一次")
-                bg_retry_note = (
-                    f"上次编译违规：{lint_exc}。"
-                    f"必须严格执行任务4强化策略：1)新背景描述放每个 Shot 行最前面；"
-                    f"2)显式禁令'严禁复刻参考视频原背景'+列出原背景元素禁词；"
-                    f"3)末尾闭环'背景必须为新场景，严禁复刻参考视频原背景'。"
-                    f"用户指定背景：{background_override.strip()}"
+        if check is None:
+            try:
+                check = await validate_and_fix_prompt(
+                    prompt=prompt,
+                    target_duration=target_duration,
+                    media_manifest=media_manifest,
+                    product_name=product_name,
+                    storyboard=storyboard,
+                    background_override=background_override,
+                    on_log=log,
                 )
-                compiled_retry = await step1_5_compile_prompt(
-                    **{**compile_kwargs, "extra_compile_note": bg_retry_note}
-                )
-                prompt = compiled_retry["prompt"]
+            except RuntimeError as lint_exc:
+                if not (background_override and "background_override 校验失败" in str(lint_exc)):
+                    raise
+                # 🔴 只重发【判红的那几镜】，不再整段重编译：2026-10-22 sc_9c246af70384 实测 9 镜整段一发
+                #   要 173-226s（经 Cloudflare 那家直接 524），而输入一字不变 ⇒ 同一个红必然再来。
+                _bg = (background_override or "").strip()
+                _frags = _bg_fragments(_bg)
+                leak = original_bg_residue(_bg, storyboard, prompt, _frags)
+                landed_ok, landed_detail = background_landed(_bg, prompt)
+                bad_shots = shot_lines_needing(prompt, leak) if leak else []
+                if not bad_shots:
+                    raise RuntimeError(
+                        "背景一致性校验没过，且【定位不到该重发哪几镜】⇒ 不猜、直接停。\n"
+                        "拒因：%s\n残留元素=%s 新背景落实=%s" % (lint_exc, leak, landed_detail)) from lint_exc
+                log(f"⚠ 背景校验失败：残留={leak} ⇒ 只重发这几镜 {bad_shots}（整段不重发，省一发 9 镜）")
+                for _n in bad_shots:
+                    shot = next((s for s in storyboard if int(s.get("shot") or 0) == _n), None)
+                    if shot is None:
+                        continue
+                    one = await step1_5_compile_prompt(
+                        **{**compile_kwargs, "storyboard": [shot],
+                           "extra_compile_note": "本镜严禁保留这些原背景元素：%s；新场景按 %s 描述。"
+                                                 % ("、".join(leak), (_frags[0] if _frags else _bg))})
+                    new_line = next((l for l in (one.get("prompt") or "").splitlines()
+                                     if l.strip().startswith("Shot 1")), "")
+                    old_line = next((l for l in prompt.splitlines() if l.strip().startswith("Shot %d " % _n)), "")
+                    m_old = re.match(r"^(Shot\s+\d+\s+\[[^\]]+\])", old_line.strip())
+                    body = re.sub(r"^Shot\s+\d+(\s*\[[^\]]*\])?\s*[:：]?\s*", "", new_line.strip(), count=1)
+                    if m_old and body:
+                        # 时间括号一律沿用原行（canonical 时间轴由 Checkpoint A 定，编译器无权改）
+                        prompt = replace_shot_line(prompt, _n, "%s: %s" % (m_old.group(1), body))
                 prompt = force_verbatim_speech(prompt, storyboard)
                 compiled["prompt"] = prompt
                 check = await validate_and_fix_prompt(
@@ -4115,8 +5003,14 @@ async def run_pipeline(
                     background_override=background_override,
                     on_log=log,
                 )
-            else:
-                raise
+            # 🔴 Lint 通过后落盘，供下次断点继续直接复用（键 = 送入 Lint 的 prompt 指纹）
+            try:
+                _lint_path.parent.mkdir(parents=True, exist_ok=True)   # step2_wan3 目录这时可能还没建
+                _lint_path.write_text(json.dumps(
+                    {"input_prompt_sha8": _lint_key, "check": check},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as _lw:                          # noqa: BLE001
+                log(f"⚠ Lint 结果落盘失败（不影响本次运行）：{_lw}")
         prompt = check["prompt"]
         target_duration = check["target_duration"]
         if check["fixes"]:
@@ -4237,7 +5131,9 @@ async def run_pipeline(
             _contract_evidence(
                 seg_dir, seg_board=seg_board, seg_prompt=seg_prompt, compiled_seg=compiled_seg,
                 seg_duration=seg_duration, ref_video=ref_video,
-                seg_product_paths=seg_product_paths, extra_note=extra_compile_note, log=log,
+                seg_product_paths=seg_product_paths, extra_note=extra_compile_note,
+                narration_binding=str(Path(output_dir) / "voice_script_binding.json"),
+                log=log,
             )
             log(
                 f"段 {index}/{len(segments)} "
@@ -4303,48 +5199,85 @@ async def run_pipeline(
         #    合同核验也就从没跑过 ⇒ "回执呢？提示词呢？"当时没有答案可给（2026-10-10 实测）。
         #    现在与多段共用同一个写者：交出去的那条 prompt 先落盘，再核验，再执行。
         _whole_dir = str(Path(output_dir) / ("step2_h3" if engine == "h3" else "step2_wan3"))
-        _contract_evidence(_whole_dir, seg_board=storyboard, seg_prompt=prompt,
-                           compiled_seg=compiled, seg_duration=float(target_duration),
-                           ref_video=trimmed_path, seg_product_paths=list(product_image_paths),
-                           source_fit=trimmed_path, extra_note=extra_compile_note, log=log)
-        if stop_after == "compile":
-            log("档位=只编译 ⇒ 不提交、不建 hold、0 分（提示词/分镜/回执已落在 %s）" % _whole_dir)
-            return {
-                "compiled_only": True, "stop_after": "compile",
-                "prompt": prompt, "storyboard": storyboard, "media_manifest": media_manifest,
-                "target_duration": target_duration, "trimmed_path": trimmed_path,
-                "task_id": None, "result_url": None, "local_path": None,
-                "final_path": None, "output_duration": None, "duration": None,
-                "duration_status": "not_submitted",
-                "segments": [{"seg": 1, "dir": _whole_dir,
-                              "prompt_path": str(Path(_whole_dir) / "prompt.txt"),
-                              "window": [0.0, float(target_duration)]}],
-            }
-        if engine == "h3":
-            log("=== Step 3/4: 满雪 H3 全能参考（执行器）→ 原视频 + 产品图 + 原提示词 ===")
-            step2 = await _run_executor(
-                exec_prompt=prompt,
-                exec_video=trimmed_path,
-                exec_duration=float(target_duration),
-                exec_product_paths=product_image_paths,
-                exec_model_path=model_image_path,
-                exec_scene_path=scene_image_path,
-                exec_manifest=media_manifest,
-                exec_dir=_whole_dir,
-            )
-        else:
-            log("=== Step 3/4: Wan3.0（执行器）→ 生成成品视频 ===")
-            step2 = await _run_executor(
-                exec_prompt=prompt,
-                exec_video=trimmed_path,
-                exec_duration=float(target_duration),
-                exec_product_paths=product_image_paths,
-                exec_model_path=model_image_path,
-                exec_scene_path=scene_image_path,
-                exec_manifest=media_manifest,
-                exec_dir=_whole_dir,
-            )
+        # 🔴 断点继续：Step 3 已交付过（结果文件 + 成片都在，且 prompt 指纹一致）⇒ 直接复用，不重投
+        _step2_path = Path(_whole_dir) / "step2_result.json"
+        step2 = None
+        if resume and _step2_path.is_file():
+            try:
+                _saved_step2 = json.loads(_step2_path.read_text(encoding="utf-8"))
+                _saved_result = _saved_step2.get("result") or {}
+                _saved_path = str(_saved_result.get("final_path") or "")
+                if (_saved_step2.get("prompt_sha8") == _skc.sha8(prompt)
+                        and _saved_path and Path(_saved_path).is_file()):
+                    step2 = _saved_result
+                    log(f"=== Step 3/4: 【断点继续】复用已完成成品 → {_saved_path}（不重新提交）===")
+                else:
+                    log("⚠ 盘上成片与本次 prompt 指纹不一致或文件缺失，重新生成")
+            except Exception as _s2e:                         # noqa: BLE001
+                log(f"⚠ 盘上成片结果不可用（{_s2e}），重新生成")
+                step2 = None
+        if step2 is None:
+            _contract_evidence(_whole_dir, seg_board=storyboard, seg_prompt=prompt,
+                               compiled_seg=compiled, seg_duration=float(target_duration),
+                               ref_video=trimmed_path, seg_product_paths=list(product_image_paths),
+                               source_fit=trimmed_path, extra_note=extra_compile_note,
+                               narration_binding=str(Path(output_dir) / "voice_script_binding.json"),
+                               compile_facts=_cc_facts,
+                               log=log)
+            if stop_after == "compile":
+                log("档位=只编译 ⇒ 不提交、不建 hold、0 分（提示词/分镜/回执已落在 %s）" % _whole_dir)
+                return {
+                    "compiled_only": True, "stop_after": "compile",
+                    "prompt": prompt, "storyboard": storyboard, "media_manifest": media_manifest,
+                    "target_duration": target_duration, "trimmed_path": trimmed_path,
+                    "task_id": None, "result_url": None, "local_path": None,
+                    "final_path": None, "output_duration": None, "duration": None,
+                    "duration_status": "not_submitted",
+                    "segments": [{"seg": 1, "dir": _whole_dir,
+                                  "prompt_path": str(Path(_whole_dir) / "prompt.txt"),
+                                  "window": [0.0, float(target_duration)]}],
+                }
+            if engine == "h3":
+                log("=== Step 3/4: 满雪 H3 全能参考（执行器）→ 原视频 + 产品图 + 原提示词 ===")
+                step2 = await _run_executor(
+                    exec_prompt=prompt,
+                    exec_video=trimmed_path,
+                    exec_duration=float(target_duration),
+                    exec_product_paths=product_image_paths,
+                    exec_model_path=model_image_path,
+                    exec_scene_path=scene_image_path,
+                    exec_manifest=media_manifest,
+                    exec_dir=_whole_dir,
+                )
+            else:
+                log("=== Step 3/4: Wan3.0（执行器）→ 生成成品视频 ===")
+                step2 = await _run_executor(
+                    exec_prompt=prompt,
+                    exec_video=trimmed_path,
+                    exec_duration=float(target_duration),
+                    exec_product_paths=product_image_paths,
+                    exec_model_path=model_image_path,
+                    exec_scene_path=scene_image_path,
+                    exec_manifest=media_manifest,
+                    exec_dir=_whole_dir,
+                )
+            # 🔴 Step 3 交付凭据：prompt 指纹 + 成片结果，下次断点继续直接复用
+            try:
+                _step2_path.write_text(json.dumps(
+                    {"prompt_sha8": _skc.sha8(prompt),
+                     "target_duration": float(target_duration),
+                     "result": step2}, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as _s2w:                         # noqa: BLE001
+                log(f"⚠ Step 3 结果落盘失败（不影响本次交付）：{_s2w}")
 
+    _bad = delivery_problems(step2)
+    if _bad:
+        _why = str(step2.get("submit_error") or "").strip()
+        raise RuntimeError(
+            "Step 3 没有交付物 ⇒ 不算跑完（%s）。拒因：%s｜"
+            "这一单 0 分未扣、上游任务没建，把拒因原话贴回来再决定下一步。"
+            % ("；".join(_bad), _why or "没记")
+        )
     if on_phase:
         on_phase("completed", {"final_path": step2.get("final_path", "")})
     log(f"=== 工作流完成 → {step2.get('final_path', '')} ===")

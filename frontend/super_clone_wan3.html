@@ -1,0 +1,1464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>超级复刻 Wan3.0</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f0f1a; color: #e0e0e0; min-height: 100vh;
+        }
+        /* Topbar */
+        .topbar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 14px 24px; background: #16162a;
+            border-bottom: 1px solid #2a2a5c; position: sticky; top: 0; z-index: 10;
+        }
+        .topbar-left { display: flex; align-items: center; gap: 16px; }
+        .topbar a {
+            color: #888; text-decoration: none; font-size: .85em;
+            padding: 6px 12px; border: 1px solid #2a2a5c; border-radius: 8px;
+        }
+        .topbar a:hover { color: #fff; border-color: #6c3ce0; }
+        .topbar-title {
+            font-size: 1.1em; color: #fff; font-weight: 600;
+            letter-spacing: 1px; text-transform: uppercase;
+        }
+        .topbar-tag {
+            font-size: .7em; color: #22d3ee; padding: 3px 8px;
+            background: rgba(34, 211, 238, .1); border: 1px solid rgba(34, 211, 238, .3);
+            border-radius: 4px; letter-spacing: 1px;
+        }
+
+        /* Main 双栏布局 */
+        .main {
+            display: grid;
+            grid-template-columns: 440px 1fr;
+            gap: 20px; padding: 20px;
+            max-width: 1600px; margin: 0 auto;
+        }
+        @media (max-width: 1100px) {
+            .main { grid-template-columns: 1fr; }
+        }
+
+        /* 通用面板 */
+        .panel-card {
+            background: #16162a; border: 1px solid #2a2a5c;
+            border-radius: 12px; padding: 16px; margin-bottom: 16px;
+        }
+        .section-title {
+            font-size: .9em; color: #aaa; margin-bottom: 10px;
+            display: flex; align-items: center; gap: 8px;
+            text-transform: uppercase; letter-spacing: .5px;
+        }
+        .dot { width: 6px; height: 6px; border-radius: 50%; background: #555; }
+        .dot-required { background: #f87171; }
+
+        /* 上传卡 */
+        .upload-card {
+            border: 2px dashed #2a2a5c; border-radius: 10px;
+            padding: 16px; text-align: center; cursor: pointer;
+            transition: all .2s; background: #0f0f1a;
+            margin-bottom: 8px; position: relative;
+        }
+        .upload-card:hover { border-color: #6c3ce0; background: rgba(108, 60, 224, .05); }
+        .upload-card.has-file { border-color: #22d3ee; border-style: solid; }
+        .upload-card .icon { font-size: 1.8em; margin-bottom: 4px; }
+        .upload-card .label { font-size: .85em; color: #aaa; }
+        .upload-card.has-file .label { color: #22d3ee; }
+        .upload-card .filename {
+            font-size: .75em; color: #666; margin-top: 4px;
+            word-break: break-all;
+        }
+        .upload-card input[type=file] { display: none; }
+        .upload-card .preview {
+            margin-top: 8px; max-width: 100%; max-height: 120px;
+            border-radius: 6px; border: 1px solid #2a2a5c;
+        }
+        .upload-card .multi-list {
+            display: flex; flex-wrap: wrap; gap: 6px;
+            margin-top: 8px; justify-content: center;
+        }
+        .upload-card .multi-list .thumb-wrap {
+            position: relative;
+        }
+        .upload-card .multi-list img {
+            width: 50px; height: 50px; object-fit: cover;
+            border-radius: 4px; border: 1px solid #2a2a5c;
+        }
+        .upload-card .multi-list .remove-btn {
+            position: absolute; top: -4px; right: -4px;
+            width: 16px; height: 16px; border-radius: 50%;
+            background: #ef4444; color: #fff; font-size: 10px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; border: none; line-height: 1;
+        }
+        .upload-card .multi-list .remove-btn:hover { background: #f87171; }
+
+        /* 表单控件 */
+        .text-field, textarea.text-field {
+            width: 100%; padding: 10px 12px; background: #0f0f1a;
+            border: 1px solid #2a2a5c; border-radius: 8px; color: #e0e0e0;
+            font-family: inherit; font-size: .85em;
+        }
+        textarea.text-field { min-height: 80px; resize: vertical; font-family: "Cascadia Code", Consolas, monospace; }
+        .text-field:focus { outline: none; border-color: #6c3ce0; }
+
+        /* 时长提示 */
+        .duration-hint {
+            font-size: .72em; color: #fbbf24; margin-top: 6px;
+            padding: 4px 8px; background: rgba(251, 191, 36, .08);
+            border-radius: 4px; display: none;
+        }
+        .duration-hint.ok { color: #34d399; background: rgba(52, 211, 153, .08); }
+        .duration-hint.bad { color: #f87171; background: rgba(248, 113, 113, .08); }
+
+        /* 视频剪辑尺 */
+        .trim-box {
+            display: none; margin-top: 12px; padding: 12px;
+            background: #0a0a14; border: 1px solid #2a2a5c; border-radius: 8px;
+        }
+        .trim-box.show { display: block; }
+        .trim-title {
+            font-size: .8em; color: #aaa; margin-bottom: 8px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .trim-title .trim-duration {
+            color: #22d3ee; font-family: "Cascadia Code", Consolas, monospace;
+            font-size: .95em;
+        }
+        .trim-title .trim-duration.bad { color: #f87171; }
+        .trim-track {
+            position: relative; height: 56px; background: #16162a;
+            border-radius: 4px; margin: 10px 0; cursor: pointer;
+            border: 1px solid #2a2a5c; user-select: none;
+            overflow: hidden;
+        }
+        .trim-track .trim-filmstrip {
+            position: absolute; inset: 0;
+            background-size: 100% 100%; background-repeat: no-repeat;
+            opacity: .55; pointer-events: none;
+        }
+        .trim-track .trim-bar {
+            position: absolute; top: 0; bottom: 0;
+            background: rgba(108, 60, 224, .35);
+            border-left: 2px solid #6c3ce0;
+            border-right: 2px solid #6c3ce0;
+        }
+        .trim-track .trim-handle {
+            position: absolute; top: 50%; transform: translate(-50%, -50%);
+            width: 14px; height: 28px; background: #6c3ce0; border-radius: 3px;
+            cursor: ew-resize; box-shadow: 0 0 6px rgba(108, 60, 224, .6);
+        }
+        .trim-track .trim-handle:hover { background: #8b5cf6; }
+        .trim-track .trim-ticks {
+            position: absolute; inset: 0; pointer-events: none;
+            display: flex; justify-content: space-between;
+            padding: 0 2px;
+        }
+        .trim-track .trim-ticks span {
+            width: 1px; background: #2a2a5c; align-self: stretch;
+        }
+        .trim-row {
+            display: flex; gap: 10px; margin-top: 6px;
+            font-size: .75em; color: #888; align-items: center;
+        }
+        .trim-row .trim-num {
+            background: #0f0f1a; border: 1px solid #2a2a5c; border-radius: 4px;
+            padding: 3px 8px; color: #22d3ee;
+            font-family: "Cascadia Code", Consolas, monospace;
+            min-width: 56px; text-align: center;
+        }
+        .trim-row .trim-num.bad { color: #f87171; }
+        .trim-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+        .trim-actions button {
+            font-size: .75em; padding: 5px 10px; background: #16162a;
+            border: 1px solid #2a2a5c; border-radius: 5px; color: #ccc;
+            cursor: pointer;
+        }
+        .trim-actions button:hover { border-color: #6c3ce0; color: #fff; }
+        .trim-actions button.active { background: rgba(108, 60, 224, .25); border-color: #6c3ce0; color: #fff; }
+        .trim-actions .trim-reset { color: #f87171; border-color: rgba(248, 113, 113, .3); }
+        .trim-hint {
+            font-size: .72em; color: #888; margin-top: 8px; line-height: 1.5;
+        }
+        .trim-hint b { color: #fbbf24; }
+
+        /* 裁剪弹窗（上传视频后弹出） */
+        .trim-overlay {
+            display: none; position: fixed; inset: 0; z-index: 9999;
+            background: rgba(0, 0, 0, .82); backdrop-filter: blur(4px);
+            align-items: center; justify-content: center; padding: 20px;
+        }
+        .trim-overlay.show { display: flex; }
+        .trim-modal {
+            background: #0f0f1a; border: 1px solid #2a2a5c; border-radius: 12px;
+            padding: 20px; width: min(92vw, 760px); max-height: 92vh; overflow: auto;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, .6);
+        }
+        .trim-modal-head {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 12px; font-size: .95em; color: #ccc;
+        }
+        .trim-modal-head .trim-duration {
+            color: #22d3ee; font-family: "Cascadia Code", Consolas, monospace;
+            font-size: 1.05em;
+        }
+        .trim-modal-head .trim-duration.bad { color: #f87171; }
+        .trim-modal-video {
+            width: 100%; max-height: 380px; background: #000;
+            border-radius: 8px; margin-bottom: 14px; display: block;
+        }
+        .trim-modal-foot {
+            display: flex; gap: 10px; margin-top: 14px; justify-content: flex-end;
+        }
+        .trim-modal-foot button {
+            padding: 8px 22px; border-radius: 6px; cursor: pointer;
+            font-size: .85em; border: 1px solid #2a2a5c; background: #16162a; color: #ccc;
+        }
+        .trim-modal-foot .btn-confirm {
+            background: #6c3ce0; border-color: #6c3ce0; color: #fff; font-weight: 600;
+        }
+        .trim-modal-foot .btn-confirm:hover { background: #7d4af0; }
+        .trim-modal-foot .btn-cancel:hover { border-color: #f87171; color: #f87171; }
+        /* 主页面的"调整裁剪"触发条 */
+        .trim-trigger {
+            display: none; margin-top: 10px; padding: 10px 14px;
+            background: rgba(108, 60, 224, .12); border: 1px solid rgba(108, 60, 224, .4);
+            border-radius: 8px; cursor: pointer; font-size: .82em; color: #c4b5fd;
+            align-items: center; gap: 10px;
+        }
+        .trim-trigger.show { display: flex; }
+        .trim-trigger:hover { background: rgba(108, 60, 224, .22); }
+        .trim-trigger .tt-range {
+            margin-left: auto; color: #22d3ee;
+            font-family: "Cascadia Code", Consolas, monospace;
+        }
+
+        /* Run 按钮 */
+        .run-btn {
+            width: 100%; padding: 12px; border: none; border-radius: 10px;
+            font-size: 1em; font-weight: 600; cursor: pointer; color: #fff;
+            background: linear-gradient(90deg, #6c3ce0, #3b82f6);
+            transition: all .2s; margin-top: 8px;
+        }
+        .run-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(108, 60, 224, .3); }
+        .run-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+        /* 提示词下面的「生成视频」：花钱那一刀，报价印在按钮上（现读价目表，前端不硬编码分数） */
+        .gen-row { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .gen-btn {
+            padding: 10px 18px; border: none; border-radius: 10px; cursor: pointer;
+            font-size: .92em; font-weight: 600; color: #fff;
+            background: linear-gradient(90deg, #6c3ce0, #3b82f6); transition: all .2s;
+        }
+        .gen-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(108, 60, 224, .3); }
+        .gen-btn:disabled { opacity: .45; cursor: not-allowed; }
+        .gen-cost { font-weight: 500; opacity: .85; margin-left: 6px; }
+        .gen-hint { font-size: .8em; color: #888; }
+        .gen-hint.err { color: #f87171; }
+
+        /* 状态面板 */
+        .status-panel { margin-bottom: 16px; }
+        .status-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 14px; padding-bottom: 10px;
+            border-bottom: 1px solid #2a2a5c;
+        }
+        .status-header > span:first-child { font-size: .95em; color: #fff; font-weight: 600; }
+        .status-badge {
+            font-size: .75em; padding: 4px 10px; border-radius: 12px;
+            font-weight: 500; letter-spacing: .5px;
+        }
+        .badge-idle { background: #2a2a5c; color: #888; }
+        .badge-pending { background: rgba(100,100,100,.2); color: #aaa; }
+        .badge-running { background: rgba(251, 191, 36, .15); color: #fbbf24; }
+        .badge-completed { background: rgba(52, 211, 153, .15); color: #34d399; }
+        .badge-failed { background: rgba(248, 113, 113, .15); color: #f87171; }
+        .badge-interrupted { background: rgba(249, 115, 22, .15); color: #fb923c; }
+
+        /* 步骤条（4 步） */
+        .steps-bar {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+            margin-bottom: 8px;
+        }
+        .step-item {
+            height: 4px; background: #2a2a5c; border-radius: 2px;
+            transition: all .3s;
+        }
+        .step-item.active { background: #fbbf24; }
+        .step-item.done { background: #34d399; }
+        .step-labels {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+            font-size: .68em; color: #888; text-align: center;
+            margin-bottom: 14px;
+        }
+        .step-labels span.active { color: #fbbf24; font-weight: 600; }
+        .step-labels span.done { color: #34d399; }
+
+        /* 日志框 */
+        .log-box {
+            background: #0a0a14; border: 1px solid #2a2a5c; border-radius: 8px;
+            padding: 10px; max-height: 240px; overflow-y: auto;
+            font-family: "Cascadia Code", Consolas, monospace; font-size: .75em;
+            color: #aaa; line-height: 1.6;
+        }
+        .log-line { padding: 2px 0; word-break: break-word; white-space: pre-wrap; }
+        .log-line.success { color: #34d399; }
+        .log-line.error { color: #f87171; }
+        .log-line.warn { color: #fbbf24; }
+        .log-line.info { color: #22d3ee; }
+        .log-line .ts { color: #555; margin-right: 8px; }
+
+        /* 结果区 */
+        .result-block { margin-top: 16px; }
+        .result-block h3 { font-size: .95em; color: #fff; margin-bottom: 12px; }
+        .video-placeholder {
+            padding: 60px 20px; text-align: center;
+            background: #0a0a14; border: 1px dashed #2a2a5c;
+            border-radius: 8px; color: #555; font-size: .85em;
+        }
+        #videoArea video { max-width: 100%; border-radius: 8px; border: 1px solid #2a2a5c; }
+        .result-links { margin-top: 10px; display: flex; gap: 12px; flex-wrap: wrap; }
+        .result-links a {
+            font-size: .8em; color: #22d3ee; text-decoration: none;
+            padding: 6px 12px; border: 1px solid rgba(34, 211, 238, .3);
+            border-radius: 6px;
+        }
+        .result-links a:hover { background: rgba(34, 211, 238, .1); }
+
+        /* 中间产品：MiMo 提示词展示 */
+        .storyboard-section { margin-top: 16px; }
+        .storyboard-section h3 { font-size: .95em; color: #fff; margin-bottom: 12px; }
+        .storyboard-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+        }
+        @media (max-width: 700px) {
+            .storyboard-grid { grid-template-columns: 1fr; }
+        }
+        .storyboard-item {
+            background: #0a0a14; border: 1px solid #2a2a5c;
+            border-radius: 8px; padding: 12px;
+        }
+        .sb-label {
+            font-size: .8em; color: #aaa; margin-bottom: 8px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .pill {
+            font-size: .7em; padding: 2px 8px; border-radius: 10px;
+            background: #2a2a5c; color: #888;
+        }
+        .pill.active { background: rgba(251, 191, 36, .15); color: #fbbf24; }
+        .pill.done { background: rgba(52, 211, 153, .15); color: #34d399; }
+        .storyboard-item pre {
+            font-family: "Cascadia Code", Consolas, monospace;
+            font-size: .72em; color: #ccc; white-space: pre-wrap;
+            max-height: 320px; overflow-y: auto; word-break: break-word;
+        }
+
+        /* 历史记录 */
+        .history-list { max-height: 200px; overflow-y: auto; }
+        .history-item {
+            padding: 8px 10px; border: 1px solid #2a2a5c; border-radius: 6px;
+            margin-bottom: 6px; font-size: .78em; cursor: pointer;
+            transition: all .15s;
+        }
+        .history-item:hover { border-color: #6c3ce0; background: rgba(108, 60, 224, .05); }
+        .history-item .h-row { display: flex; justify-content: space-between; align-items: center; }
+        .history-item .h-id { color: #22d3ee; font-family: "Cascadia Code", Consolas, monospace; }
+        .history-item .h-status { font-size: .9em; }
+        .history-item .h-meta { color: #666; margin-top: 4px; font-size: .9em; }
+        .history-item .h-foot {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-top: 6px; gap: 8px;
+        }
+        .history-item .h-resume {
+            font-size: .95em; padding: 2px 8px; cursor: pointer;
+            background: rgba(251, 146, 60, .12); color: #fb923c;
+            border: 1px solid rgba(251, 146, 60, .4); border-radius: 5px;
+            white-space: nowrap;
+        }
+        .history-item .h-resume:hover { background: rgba(251, 146, 60, .28); color: #fff; }
+        .history-item .h-resume:disabled { opacity: .5; cursor: not-allowed; }
+        .history-empty { color: #555; font-size: .8em; text-align: center; padding: 20px; }
+        .opt-row {
+            display: flex; align-items: flex-start; gap: 10px;
+            background: #0f0f1a; border: 1px solid #2a2a5c; border-radius: 8px;
+            padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
+        }
+        .opt-row:hover { border-color: #6c3ce0; }
+        .opt-row input { width: 16px; height: 16px; margin-top: 2px; accent-color: #22d3ee; }
+        .opt-row b { color: #fff; font-size: .88em; }
+        .opt-desc { display: block; color: #888; font-size: .75em; margin-top: 2px; }
+        .choice-block { margin-bottom: 14px; }
+        .choice-title { font-size: .82em; color: #ccc; margin-bottom: 8px; }
+        .choice-opts { display: flex; gap: 8px; margin-bottom: 8px; }
+        .choice-opts label {
+            flex: 1; display: flex; align-items: center; gap: 6px;
+            background: #0f0f1a; border: 1px solid #2a2a5c; border-radius: 8px;
+            padding: 8px 10px; cursor: pointer; font-size: .82em; color: #aaa;
+        }
+        .choice-opts label:has(input:checked) {
+            border-color: #22d3ee; color: #fff; background: rgba(34, 211, 238, .08);
+        }
+        .choice-opts input { accent-color: #22d3ee; }
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <div class="topbar-left">
+            <a href="/">← 首页</a>
+            <span class="topbar-title">超级复刻 Wan3.0</span>
+            <span class="topbar-tag">SUPER CLONE · 不限时长 · 15s 切段拼接</span>
+        </div>
+    </div>
+
+    <div class="main">
+        <!-- ───── 左侧：输入面板 ───── -->
+        <div class="input-panel">
+            <!-- 爆款视频（任意时长；>15s 后端按 15s 切段生成后自动拼接） -->
+            <div class="panel-card">
+                <div class="section-title"><span class="dot dot-required"></span> 爆款视频（必选，不限时长）</div>
+                <div class="upload-card" id="videoCard" onclick="document.getElementById('videoInput').click()">
+                    <div class="icon">🎬</div>
+                    <div class="label" id="videoLabel">点击上传爆款视频（不限时长，超过 15s 自动切段拼接）</div>
+                    <input type="file" id="videoInput" accept="video/*">
+                    <div class="filename" id="videoFilename"></div>
+                    <video class="preview" id="videoPreview" style="display:none;" controls onclick="event.stopPropagation()"></video>
+                </div>
+                <div class="duration-hint" id="durationHint"></div>
+                <!-- 裁剪区间触发条：上传视频后显示，点击重新打开剪辑弹窗 -->
+                <div class="trim-trigger" id="trimTrigger" onclick="openTrimModal()">
+                    <span>✂️ 点击调整裁剪区间</span>
+                    <span class="tt-range" id="trimTriggerRange">0.0s - 0.0s</span>
+                </div>
+            </div>
+
+            <!-- 产品图（多张） -->
+            <div class="panel-card">
+                <div class="section-title"><span class="dot dot-required"></span> 产品图（必选，1-10 张）</div>
+                <div class="upload-card" id="productCard" onclick="document.getElementById('productInput').click()">
+                    <div class="icon">📦</div>
+                    <div class="label" id="productLabel">点击添加产品图（可多次点击，逐张或批量选）</div>
+                    <input type="file" id="productInput" accept="image/*" multiple>
+                    <div class="multi-list" id="productPreview"></div>
+                </div>
+            </div>
+
+            <!-- 产品名（必填，传给 GPT 编译器做产品识别） -->
+            <div class="panel-card">
+                <div class="section-title"><span class="dot dot-required"></span> 产品名（必填）</div>
+                <input type="text" class="text-field" id="productName" placeholder="如：顺风顺水航空杯">
+                <div class="hint-text" style="margin-top:6px;color:#888;font-size:12px;">
+                    填写产品名让 GPT 编译器使用此名称替换原视频产品；自然语言说明为可选。
+                </div>
+            </div>
+
+            <!-- 换脸 / 换背景：有模特图=换脸，有背景文字=换背景 -->
+            <div class="panel-card">
+                <div class="section-title"><span class="dot"></span> 换脸 / 换背景（可选）</div>
+                <div class="hint-text" style="margin-bottom:12px;color:#888;font-size:12px;">
+                    不填则只换产品。上传面部图即换脸；填写背景文字即换背景。成片默认无字幕、无花字、无账号水印。
+                </div>
+
+                <div class="choice-block">
+                    <div class="choice-title">换脸（上传面部图）</div>
+                    <div class="upload-card" id="modelCard" onclick="document.getElementById('modelInput').click()">
+                        <div class="icon">👤</div>
+                        <div class="label" id="modelLabel">上传清晰面部图片（只取脸/发型，忽略身上衣服）</div>
+                        <input type="file" id="modelInput" accept="image/*">
+                        <div class="multi-list" id="modelPreview"></div>
+                    </div>
+                </div>
+
+                <div class="choice-block">
+                    <div class="choice-title">换背景（文字描述）</div>
+                    <textarea class="text-field" id="sceneText" placeholder="用文字描述背景，例如：绿色足球运动场，草坪开阔，户外日光。不要上传背景图。"></textarea>
+                </div>
+            </div>
+
+            <!-- 客户需求说明（可选） -->
+            <div class="panel-card">
+                <div class="section-title"><span class="dot"></span> 客户需求说明（可选）</div>
+                <textarea class="text-field" id="customerRequest" placeholder="可选，如：户外露营场景背景、突出三个塑料杯的不同图案特征、要展示产品韧性、三杯并列展示时三个图案都要出现..."></textarea>
+            </div>
+
+            <button class="run-btn" id="btnRun" onclick="startPipeline()" disabled>🚀 开始超级复刻</button>
+
+            <!-- 历史记录 -->
+            <div class="panel-card" style="margin-top: 16px;">
+                <div class="section-title">📋 历史记录</div>
+                <div class="history-list" id="historyList">
+                    <div class="history-empty">暂无任务</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ───── 右侧：输出面板 ───── -->
+        <div class="output-panel">
+            <!-- 状态面板 -->
+            <div class="panel-card status-panel">
+                <div class="status-header">
+                    <span>工作流状态</span>
+                    <span class="status-badge badge-idle" id="statusBadge">等待输入</span>
+                </div>
+                <div class="steps-bar">
+                    <div class="step-item" id="step1"></div>
+                    <div class="step-item" id="step2"></div>
+                    <div class="step-item" id="step3"></div>
+                    <div class="step-item" id="step4"></div>
+                </div>
+                <div class="step-labels">
+                    <span id="label1">分镜解析</span>
+                    <span id="label2">提示词编译</span>
+                    <span id="label3">审查校验</span>
+                    <span id="label4">Wan3.0 执行</span>
+                </div>
+                <div class="log-box" id="logBox">
+                    <div class="log-line">等待启动工作流...</div>
+                </div>
+            </div>
+
+            <!-- 视频输出 -->
+            <div class="panel-card result-block">
+                <h3>📺 成品视频</h3>
+                <div id="videoArea">
+                    <div class="video-placeholder">工作流完成后视频将在此展示</div>
+                </div>
+                <div class="result-links" id="resultLinks" style="display:none;"></div>
+            </div>
+
+            <!-- 中间产品：MiMo 提示词 -->
+            <div class="panel-card storyboard-section" id="storyboardArea" style="display:none;">
+                <h3>🎬 工作流中间产品</h3>
+                <div class="storyboard-grid">
+                    <div class="storyboard-item">
+                        <div class="sb-label">
+                            📋 分镜解析
+                            <span class="pill" id="sb1Pill">待运行</span>
+                        </div>
+                        <pre id="sb1Text"></pre>
+                    </div>
+                    <div class="storyboard-item">
+                        <div class="sb-label">
+                            🤖 Wan3.0 提示词（编译生成）
+                            <span class="pill" id="sb2Pill">待运行</span>
+                        </div>
+                        <pre id="sb2Text"></pre>
+                        <div class="gen-row" id="genRow" style="display:none;">
+                            <button class="gen-btn" id="btnGenerate" onclick="generateVideo()">🎬 生成视频<span class="gen-cost" id="genCost"></span></button>
+                            <span class="gen-hint" id="genHint"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+const MIN_CLONE_SEC = 1;
+const SEGMENT_SEC = 15;
+// ─────────────────────────────────────
+// 全局状态
+// ─────────────────────────────────────
+let currentTaskId = null;
+let pollTimer = null;
+let lastLogCount = 0;
+let selectedProductFiles = [];   // 产品图累积数组（支持多次添加）
+let videoFilePath = null;        // 上传后的本地路径
+let videoDuration = 0;           // 视频时长（秒）
+let videoObjectUrl = null;       // 上传视频的 object URL（供弹窗预览 + filmstrip 截图）
+
+// ─────────────────────────────────────
+// 文件选择处理
+// ─────────────────────────────────────
+const videoInput = document.getElementById('videoInput');
+const productInput = document.getElementById('productInput');
+
+videoInput.addEventListener('change', e => handleVideoSelect(e.target.files[0]));
+productInput.addEventListener('change', e => handleProductSelect(e.target.files));
+
+async function handleVideoSelect(file) {
+    if (!file) return;
+    // 预览
+    const url = URL.createObjectURL(file);
+    videoObjectUrl = url;
+    const preview = document.getElementById('videoPreview');
+    preview.src = url;
+    preview.style.display = 'block';
+    document.getElementById('videoFilename').textContent = file.name;
+    document.getElementById('videoCard').classList.add('has-file');
+    document.getElementById('videoLabel').textContent = '已选择：' + file.name;
+
+    // 上传到服务端
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+        document.getElementById('durationHint').style.display = 'block';
+        document.getElementById('durationHint').textContent = '⏳ 上传中...';
+        document.getElementById('durationHint').className = 'duration-hint';
+        const resp = await fetch('/api/upload/video', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (!data.success) throw new Error('上传失败');
+        videoFilePath = data.file_path;
+        // 探测时长
+        const durResp = await fetch(`/api/super-clone-wan3/probe-duration?path=${encodeURIComponent(data.file_path)}`);
+        const durData = await durResp.json();
+        videoDuration = durData.duration || 0;
+        const hint = document.getElementById('durationHint');
+        if (videoDuration > 0) {
+            const n = estimateSegments(videoDuration);
+            if (n <= 1) {
+                hint.textContent = `✓ 视频时长 ${videoDuration.toFixed(1)}s，整段一次送 Wan3`;
+            } else {
+                hint.textContent = `✓ 视频时长 ${videoDuration.toFixed(1)}s，将按 15s 切成 ${n} 段自动拼接`;
+            }
+            hint.className = 'duration-hint ok';
+        } else {
+            hint.textContent = '⚠ 无法探测视频时长';
+            hint.className = 'duration-hint';
+        }
+        // 上传成功后自动弹出剪辑弹窗
+        if (videoDuration > 0) openTrimModal();
+    } catch (e) {
+        document.getElementById('durationHint').textContent = '✗ 上传失败: ' + e.message;
+        document.getElementById('durationHint').className = 'duration-hint bad';
+        videoFilePath = null;
+    }
+    updateRunBtn();
+}
+
+async function handleProductSelect(files) {
+    if (!files || !files.length) return;
+    for (const f of files) {
+        selectedProductFiles.push(f);
+    }
+    renderProductPreview();
+    document.getElementById('productCard').classList.add('has-file');
+    document.getElementById('productLabel').textContent = `已选择 ${selectedProductFiles.length} 张产品图（可继续点击添加）`;
+    updateRunBtn();
+}
+
+function renderProductPreview() {
+    const wrap = document.getElementById('productPreview');
+    wrap.innerHTML = '';
+    selectedProductFiles.forEach((f, idx) => {
+        const div = document.createElement('div');
+        div.className = 'thumb-wrap';
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(f);
+        const btn = document.createElement('button');
+        btn.className = 'remove-btn';
+        btn.textContent = '×';
+        btn.title = '移除';
+        btn.onclick = function(ev) {
+            ev.stopPropagation();
+            selectedProductFiles.splice(idx, 1);
+            renderProductPreview();
+            if (selectedProductFiles.length === 0) {
+                document.getElementById('productCard').classList.remove('has-file');
+                document.getElementById('productLabel').textContent = '点击添加产品图（可多次点击，逐张或批量选）';
+            } else {
+                document.getElementById('productLabel').textContent = `已选择 ${selectedProductFiles.length} 张产品图（可继续点击添加）`;
+            }
+            updateRunBtn();
+        };
+        div.appendChild(img);
+        div.appendChild(btn);
+        wrap.appendChild(div);
+    });
+}
+
+function updateRunBtn() {
+    // 基础条件：视频已上传 + 时长 ≥1s + 至少 1 张产品图
+    let ok = videoFilePath && selectedProductFiles.length > 0 && videoDuration >= MIN_CLONE_SEC - 0.05;
+    if (ok && trimEnabled) {
+        const span = trimEnd - trimStart;
+        ok = span >= MIN_CLONE_SEC - 0.05 && trimStart >= 0 && trimEnd <= videoDuration + 0.05;
+    }
+    document.getElementById('btnRun').disabled = !ok;
+}
+
+// ─────────────────────────────────────
+// 模特图 + 场景图（可选，单张）
+// ─────────────────────────────────────
+let modelImageFile = null;
+let modelImagePath = null;
+
+const modelInput = document.getElementById('modelInput');
+modelInput.addEventListener('change', e => handleSingleImageSelect(e.target.files[0], 'model'));
+
+async function handleSingleImageSelect(file, kind) {
+    if (!file) return;
+    const cardId = kind + 'Card';
+    const labelId = kind + 'Label';
+    const previewId = kind + 'Preview';
+    document.getElementById(cardId).classList.add('has-file');
+    document.getElementById(labelId).textContent = '已选择：' + file.name;
+    // 预览
+    const wrap = document.getElementById(previewId);
+    wrap.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'thumb-wrap';
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(file);
+    const btn = document.createElement('button');
+    btn.className = 'remove-btn';
+    btn.textContent = '×';
+    btn.title = '移除';
+    btn.onclick = function(ev) {
+        ev.stopPropagation();
+        modelImageFile = null;
+        modelImagePath = null;
+        wrap.innerHTML = '';
+        document.getElementById(cardId).classList.remove('has-file');
+        document.getElementById(labelId).textContent = '上传清晰面部图片（换脸必传，只取脸/发型，忽略身上衣服）';
+    };
+    div.appendChild(img);
+    div.appendChild(btn);
+    wrap.appendChild(div);
+    // 上传到服务端
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+        const resp = await fetch('/api/upload/image', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (!data.success) throw new Error('上传失败');
+        modelImageFile = file;
+        modelImagePath = data.file_path;
+    } catch (e) {
+        document.getElementById(labelId).textContent = '✗ 上传失败: ' + e.message;
+        modelImageFile = null;
+        modelImagePath = null;
+    }
+}
+
+// ─────────────────────────────────────
+// 视频剪辑尺（精准复刻 5-10s 区间）
+// ─────────────────────────────────────
+let trimEnabled = false;        // 是否启用裁剪
+let trimStart = 0;              // 秒
+let trimEnd = 0;                // 秒
+let draggingHandle = null;      // 'L' | 'R' | null
+let trimBound = false;          // 弹窗事件是否已绑定
+let trimBackup = null;          // 打开弹窗时的区间备份（取消时恢复）
+
+function openTrimModal() {
+    const overlay = document.getElementById('trimOverlay');
+    if (!videoFilePath || !videoDuration || videoDuration <= 0) {
+        trimEnabled = false;
+        return;
+    }
+    overlay.classList.add('show');
+    // 设置弹窗内视频源
+    const mv = document.getElementById('trimModalVideo');
+    if (videoObjectUrl) mv.src = videoObjectUrl;
+    if (!trimEnabled || trimEnd <= 0) {
+        trimStart = 0;
+        trimEnd = videoDuration;
+    }
+    // 备份当前区间（取消时恢复到此状态）
+    trimBackup = { s: trimStart, e: trimEnd };
+    trimEnabled = true;
+    bindTrimEvents();
+    renderTicks();
+    renderTrim();
+    // 生成 filmstrip 缩略图 + 跳到起点
+    mv.muted = true;
+    if (mv.readyState >= 1) {
+        generateFilmstrip();
+        try { mv.currentTime = trimStart; } catch (_) {}
+    }
+    mv.onloadeddata = function() {
+        generateFilmstrip();
+        try { mv.currentTime = trimStart; } catch (_) {}
+    };
+    updateRunBtn();
+}
+
+function bindTrimEvents() {
+    if (trimBound) return;
+    const track = document.getElementById('trimTrack');
+    const handleL = document.getElementById('trimHandleL');
+    const handleR = document.getElementById('trimHandleR');
+    handleL.addEventListener('pointerdown', e => onPointerDown(e, 'L'));
+    handleR.addEventListener('pointerdown', e => onPointerDown(e, 'R'));
+    track.addEventListener('pointerdown', function(e) {
+        if (e.target.classList.contains('trim-handle')) return;
+        const rect = track.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const t = (x / rect.width) * videoDuration;
+        if (Math.abs(t - trimStart) < Math.abs(t - trimEnd)) {
+            trimStart = clampT(t, 0, trimEnd - MIN_CLONE_SEC + 0.001);
+            seekTrimVideo(trimStart);
+        } else {
+            trimEnd = clampT(t, trimStart + MIN_CLONE_SEC - 0.001, videoDuration);
+            seekTrimVideo(trimEnd);
+        }
+        enforceTrimLimits();
+        renderTrim();
+        updateRunBtn();
+    });
+    trimBound = true;
+}
+
+function closeTrimModal(confirm) {
+    const overlay = document.getElementById('trimOverlay');
+    overlay.classList.remove('show');
+    const mv = document.getElementById('trimModalVideo');
+    try { mv.pause(); } catch (_) {}
+    if (!confirm && trimBackup) {
+        // 取消：恢复打开时的区间
+        trimStart = trimBackup.s;
+        trimEnd = trimBackup.e;
+    }
+    // 更新主页触发条显示
+    const trig = document.getElementById('trimTrigger');
+    if (trimEnabled && videoDuration > 0) {
+        trig.classList.add('show');
+        document.getElementById('trimTriggerRange').textContent =
+            trimStart.toFixed(1) + 's - ' + trimEnd.toFixed(1) + 's';
+    } else {
+        trig.classList.remove('show');
+    }
+    updateRunBtn();
+}
+
+function seekTrimVideo(t) {
+    const mv = document.getElementById('trimModalVideo');
+    if (!mv || !mv.duration) return;
+    try { mv.currentTime = Math.max(0, Math.min(t, mv.duration - 0.05)); } catch (_) {}
+}
+
+// 生成 filmstrip：用弹窗视频 seek 到多个时间点，canvas 截图拼成背景
+let filmstripGenerating = false;
+function generateFilmstrip() {
+    if (filmstripGenerating) return;
+    const mv = document.getElementById('trimModalVideo');
+    if (!mv || !mv.videoWidth || !videoDuration) return;
+    filmstripGenerating = true;
+    const n = 12;                       // 帧数
+    const fw = 96, fh = 54;             // 每帧尺寸（16:9）
+    const canvas = document.createElement('canvas');
+    canvas.width = fw * n; canvas.height = fh;
+    const ctx = canvas.getContext('2d');
+    const fs = document.getElementById('trimFilmstrip');
+    const prevTime = mv.currentTime;
+    let i = 0;
+    const step = function() {
+        if (i >= n) {
+            fs.style.backgroundImage = 'url(' + canvas.toDataURL('image/jpeg', 0.6) + ')';
+            try { mv.currentTime = prevTime; } catch (_) {}
+            filmstripGenerating = false;
+            return;
+        }
+        const t = (videoDuration * (i + 0.5)) / n;
+        const onSeeked = function() {
+            mv.removeEventListener('seeked', onSeeked);
+            try { ctx.drawImage(mv, i * fw, 0, fw, fh); } catch (_) {}
+            i++;
+            step();
+        };
+        mv.addEventListener('seeked', onSeeked);
+        try { mv.currentTime = Math.min(t, videoDuration - 0.05); } catch (_) { i++; step(); }
+    };
+    step();
+}
+
+function renderTicks() {
+    const ticks = document.getElementById('trimTicks');
+    ticks.innerHTML = '';
+    const n = 11;
+    for (let i = 0; i < n; i++) {
+        const s = document.createElement('span');
+        ticks.appendChild(s);
+    }
+}
+
+function renderTrim() {
+    if (!videoDuration) return;
+    const startPct = (trimStart / videoDuration) * 100;
+    const endPct = (trimEnd / videoDuration) * 100;
+    const bar = document.getElementById('trimBar');
+    bar.style.left = startPct + '%';
+    bar.style.width = (endPct - startPct) + '%';
+    document.getElementById('trimHandleL').style.left = startPct + '%';
+    document.getElementById('trimHandleR').style.left = endPct + '%';
+    const span = trimEnd - trimStart;
+    document.getElementById('trimStartLabel').textContent = trimStart.toFixed(1) + 's';
+    document.getElementById('trimEndLabel').textContent = trimEnd.toFixed(1) + 's';
+    document.getElementById('trimSpanLabel').textContent = span.toFixed(1) + 's';
+    const durEl = document.getElementById('trimDuration');
+    const valid = span >= MIN_CLONE_SEC - 0.05;
+    const n = estimateSegments(span);
+    durEl.textContent = n > 1 ? `${span.toFixed(1)}s · ${n}段拼接` : `${span.toFixed(1)}s`;
+    document.getElementById('trimSpanLabel').classList.toggle('bad', !valid);
+    durEl.classList.toggle('bad', !valid);
+}
+
+function estimateSegments(span) {
+    if (span <= SEGMENT_SEC + 0.05) return 1;
+    return Math.ceil(span / SEGMENT_SEC);
+}
+
+function onPointerDown(e, which) {
+    e.preventDefault();
+    e.stopPropagation();
+    draggingHandle = which;
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+}
+
+function onPointerMove(e) {
+    if (!draggingHandle) return;
+    const track = document.getElementById('trimTrack');
+    const rect = track.getBoundingClientRect();
+    let x = e.clientX - rect.left;
+    x = Math.max(0, Math.min(rect.width, x));
+    const t = (x / rect.width) * videoDuration;
+    if (draggingHandle === 'L') {
+        trimStart = clampT(t, 0, trimEnd - MIN_CLONE_SEC + 0.001);
+        seekTrimVideo(trimStart);
+    } else {
+        trimEnd = clampT(t, trimStart + MIN_CLONE_SEC - 0.001, videoDuration);
+        seekTrimVideo(trimEnd);
+    }
+    enforceTrimLimits();
+    renderTrim();
+    updateRunBtn();
+}
+
+function onPointerUp() {
+    draggingHandle = null;
+    document.removeEventListener('pointermove', onPointerMove);
+    document.removeEventListener('pointerup', onPointerUp);
+}
+
+function clampT(t, lo, hi) { return Math.max(lo, Math.min(hi, t)); }
+
+function enforceTrimLimits() {
+    let span = trimEnd - trimStart;
+    if (span < MIN_CLONE_SEC) {
+        if (trimEnd + (MIN_CLONE_SEC - span) <= videoDuration) {
+            trimEnd = trimStart + MIN_CLONE_SEC;
+        } else {
+            trimStart = Math.max(0, trimEnd - MIN_CLONE_SEC);
+            trimEnd = trimStart + MIN_CLONE_SEC;
+        }
+    }
+    if (trimStart < 0) trimStart = 0;
+    if (trimEnd > videoDuration) trimEnd = videoDuration;
+}
+
+function setTrimPreset(spanSec) {
+    if (!videoDuration) return;
+    trimStart = 0;
+    trimEnd = Math.min(spanSec, videoDuration);
+    enforceTrimLimits();
+    renderTrim();
+    updateRunBtn();
+    seekTrimVideo(trimStart);
+}
+
+function resetTrim() {
+    if (!videoDuration) return;
+    trimStart = 0;
+    trimEnd = videoDuration;
+    if (videoDuration < MIN_CLONE_SEC) {
+        const durEl = document.getElementById('trimDuration');
+        durEl.textContent = `原视频不足 ${MIN_CLONE_SEC}s，无法精准复刻`;
+        durEl.classList.add('bad');
+    }
+    enforceTrimLimits();
+    renderTrim();
+    updateRunBtn();
+    seekTrimVideo(trimStart);
+}
+
+function previewTrim() {
+    const v = document.getElementById('trimModalVideo');
+    if (!v) return;
+    v.currentTime = trimStart;
+    v.play();
+    const onTime = function() {
+        if (v.currentTime >= trimEnd) {
+            v.pause();
+            v.removeEventListener('timeupdate', onTime);
+        }
+    };
+    v.addEventListener('timeupdate', onTime);
+}
+
+// ─────────────────────────────────────
+// 启动工作流
+// ─────────────────────────────────────
+async function startPipeline() {
+    if (!videoFilePath || selectedProductFiles.length === 0) return;
+
+    // 产品名必填校验
+    const productNameCheck = document.getElementById('productName').value.trim();
+    if (!productNameCheck) {
+        alert('请填写产品名（必填）');
+        document.getElementById('productName').focus();
+        return;
+    }
+
+    let payloadTrimStart = null;
+    let payloadTrimEnd = null;
+    if (trimEnabled) {
+        const span = trimEnd - trimStart;
+        if (span < MIN_CLONE_SEC - 0.05) {
+            alert(`裁剪区间 ${span.toFixed(1)}s 短于 ${MIN_CLONE_SEC}s，请调整剪辑尺`);
+            return;
+        }
+        payloadTrimStart = +trimStart.toFixed(2);
+        payloadTrimEnd = +trimEnd.toFixed(2);
+    }
+
+    const btn = document.getElementById('btnRun');
+    btn.disabled = true;
+    btn.textContent = '⏳ 上传产品图...';
+
+    // 上传所有产品图
+    const productPaths = [];
+    for (const f of selectedProductFiles) {
+        const fd = new FormData();
+        fd.append('file', f);
+        try {
+            const resp = await fetch('/api/upload/image', { method: 'POST', body: fd });
+            const data = await resp.json();
+            if (!data.success) throw new Error('上传失败');
+            productPaths.push(data.file_path);
+        } catch (e) {
+            alert('产品图上传失败: ' + e.message);
+            btn.disabled = false;
+            btn.textContent = '🚀 开始超级复刻';
+            return;
+        }
+    }
+
+    btn.textContent = '⏳ 提交任务...';
+
+    // 提交任务
+    const customerRequest = document.getElementById('customerRequest').value.trim();
+    const productName = document.getElementById('productName').value.trim();
+    const payload = {
+        video_path: videoFilePath,
+        product_image_paths: productPaths,
+        customer_request: customerRequest,
+        engine: 'wan3',
+        // 分辨率不在这里写死：写死 = 第二份真相（这里曾是 '480P'，而 wan3-prime 那条 lane 根本没有 480p 档，
+        // 以前被后端"警告一句然后硬改成 1080P"糊过去了）。档位唯一源 = gateway._WAN30_RES_MODEL，
+        // 不传就走服务端默认档；要给客户选档是另一件事，得从网关读档位列表，别再抄一份字面量。
+    };
+    // 产品名（可选，传给 GPT 编译器做产品识别）
+    if (productName) payload.product_name = productName;
+    // 精准复刻：携带裁剪区间
+    if (payloadTrimStart !== null && payloadTrimEnd !== null) {
+        payload.trim_start = payloadTrimStart;
+        payload.trim_end = payloadTrimEnd;
+    }
+    if (modelImagePath) payload.model_image_path = modelImagePath;
+    const sceneText = (document.getElementById('sceneText').value || '').trim();
+    if (sceneText) payload.scene_text = sceneText;
+    try {
+        const resp = await fetch('/api/super-clone-wan3/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.success) {
+            throw new Error(data.detail || '提交失败');
+        }
+        currentTaskId = data.task_id;
+        lastLogCount = 0;
+        setStatus('running', '运行中');
+        btn.textContent = '⏳ 工作流运行中...';
+        // 重置展示区
+        document.getElementById('storyboardArea').style.display = 'none';
+        document.getElementById('sb1Pill').textContent = '待运行';
+        document.getElementById('sb1Pill').className = 'pill';
+        document.getElementById('sb2Pill').textContent = '待运行';
+        document.getElementById('sb2Pill').className = 'pill';
+        document.getElementById('sb1Text').textContent = '';
+        document.getElementById('sb2Text').textContent = '';
+        document.getElementById('videoArea').innerHTML = '<div class="video-placeholder">工作流完成后视频将在此展示</div>';
+        document.getElementById('resultLinks').style.display = 'none';
+        // 开始轮询
+        startPolling();
+    } catch (e) {
+        alert('提交失败: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = '🚀 开始超级复刻';
+    }
+}
+
+// ─────────────────────────────────────
+// 轮询状态
+// ─────────────────────────────────────
+function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollStatus, 2000);
+    pollStatus(); // 立即查一次
+}
+
+async function pollStatus() {
+    if (!currentTaskId) return;
+    try {
+        const resp = await fetch(`/api/super-clone-wan3/status/${currentTaskId}`);
+        const data = await resp.json();
+
+        // 更新步骤条
+        updateSteps(data.phase, data.status);
+
+        // 更新日志
+        if (data.logs && data.logs.length > 0) {
+            const box = document.getElementById('logBox');
+            const newLogs = data.logs.slice(lastLogCount);
+            lastLogCount = data.logs.length;
+            for (const log of newLogs) {
+                const line = document.createElement('div');
+                line.className = 'log-line ' + classifyLog(log.msg);
+                const ts = log.ts ? log.ts.substring(11, 19) : '';
+                line.innerHTML = `<span class="ts">${ts}</span>${escapeHtml(log.msg)}`;
+                box.appendChild(line);
+            }
+            box.scrollTop = box.scrollHeight;
+        }
+
+        // 更新中间产品
+        if (data.storyboard) {
+            document.getElementById('storyboardArea').style.display = 'block';
+            document.getElementById('sb1Text').textContent = JSON.stringify(data.storyboard, null, 2);
+            document.getElementById('sb1Pill').textContent = '已完成';
+            document.getElementById('sb1Pill').className = 'pill done';
+        }
+        if (data.prompt) {
+            document.getElementById('sb2Text').textContent = data.prompt;
+            if (data.status === 'SUCCESS' || data.phase === 'step3_wan3' || data.phase === 'step2_wan3') {
+                document.getElementById('sb2Pill').textContent = '已完成';
+                document.getElementById('sb2Pill').className = 'pill done';
+            } else {
+                document.getElementById('sb2Pill').textContent = '生成中';
+                document.getElementById('sb2Pill').className = 'pill active';
+            }
+        }
+
+        // 提示词编译好了就挂出「生成视频」这一刀（判据在服务端算，前端只认 generate.ready）
+        renderGenerateOffer(data);
+
+        // 完成 / 失败
+        if (data.status === 'SUCCESS') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            // 🔴 状态字说完成、盘上没有成片 ⇒ 不许跟着写「完成」（2026-10-22 sc_9c246af70384：
+            //    提交被拒、0 分未扣，界面却顶着「完成」两个字让人以为片子已经出来了）
+            if (data.generate && !data.generate.delivered) {
+                setStatus('failed', '没出片');
+            } else {
+                setStatus('completed', '完成');
+            }
+            document.getElementById('btnRun').disabled = false;
+            document.getElementById('btnRun').textContent = '🚀 开始超级复刻';
+            // 展示视频
+            if (data.local_path) {
+                const videoUrl = `/api/super-clone-wan3/result/${currentTaskId}`;
+                document.getElementById('videoArea').innerHTML =
+                    `<video src="${videoUrl}" controls autoplay></video>`;
+                const links = document.getElementById('resultLinks');
+                links.innerHTML = '';
+                if (data.result_url) {
+                    links.innerHTML += `<a href="${data.result_url}" target="_blank">🌐 原始 URL</a>`;
+                }
+                links.innerHTML += `<a href="${videoUrl}" download>⬇ 下载成品</a>`;
+                if (data.duration) {
+                    const extra = data.segment_count > 1 ? `（${data.segment_count}段拼接）` : '';
+                    links.innerHTML += `<span style="color:#888;align-self:center;font-size:.8em;">时长 ${data.duration}s${extra}</span>`;
+                }
+                links.style.display = 'flex';
+            }
+            loadHistory();
+        } else if (data.status === 'FAILED') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            setStatus('failed', '失败');
+            document.getElementById('btnRun').disabled = false;
+            document.getElementById('btnRun').textContent = '🚀 开始超级复刻';
+            if (data.error) {
+                const box = document.getElementById('logBox');
+                const line = document.createElement('div');
+                line.className = 'log-line error';
+                line.innerHTML = `<span class="ts">!!</span>错误: ${escapeHtml(data.error)}`;
+                box.appendChild(line);
+                box.scrollTop = box.scrollHeight;
+            }
+            loadHistory();
+        } else if (data.status === 'INTERRUPTED') {
+            // 服务重启 / 进程中断：任务快照仍在磁盘上，可点"断点继续"从中断步骤恢复
+            clearInterval(pollTimer);
+            pollTimer = null;
+            setStatus('interrupted', '已中断');
+            document.getElementById('btnRun').disabled = false;
+            document.getElementById('btnRun').textContent = '🚀 开始超级复刻';
+            const box = document.getElementById('logBox');
+            const line = document.createElement('div');
+            line.className = 'log-line warn';
+            line.innerHTML = `<span class="ts">!!</span>任务已中断${data.phase ? `（中断于 ${escapeHtml(PHASE_TEXT[data.phase] || data.phase)}）` : ''}，可在历史记录点「▶ 断点继续」恢复`;
+            box.appendChild(line);
+            box.scrollTop = box.scrollHeight;
+            loadHistory();
+        }
+    } catch (e) {
+        console.error('轮询失败:', e);
+    }
+}
+
+function updateSteps(phase, status) {
+    const s1 = document.getElementById('step1');
+    const s2 = document.getElementById('step2');
+    const s3 = document.getElementById('step3');
+    const s4 = document.getElementById('step4');
+    const l1 = document.getElementById('label1');
+    const l2 = document.getElementById('label2');
+    const l3 = document.getElementById('label3');
+    const l4 = document.getElementById('label4');
+    // 重置
+    s1.className = 'step-item'; l1.className = '';
+    s2.className = 'step-item'; l2.className = '';
+    s3.className = 'step-item'; l3.className = '';
+    s4.className = 'step-item'; l4.className = '';
+
+    if (status === 'SUCCESS' || phase === 'completed') {
+        s1.className = 'step-item done'; l1.className = 'done';
+        s2.className = 'step-item done'; l2.className = 'done';
+        s3.className = 'step-item done'; l3.className = 'done';
+        s4.className = 'step-item done'; l4.className = 'done';
+        return;
+    }
+    if (phase === 'step1_mimo') {
+        s1.className = 'step-item active'; l1.className = 'active';
+    } else if (phase === 'step1_5_gpt_compile') {
+        s1.className = 'step-item done'; l1.className = 'done';
+        s2.className = 'step-item active'; l2.className = 'active';
+    } else if (phase === 'step2_gpt_lint') {
+        s1.className = 'step-item done'; l1.className = 'done';
+        s2.className = 'step-item done'; l2.className = 'done';
+        s3.className = 'step-item active'; l3.className = 'active';
+    } else if (phase === 'step3_wan3' || phase === 'step2_wan3') {
+        s1.className = 'step-item done'; l1.className = 'done';
+        s2.className = 'step-item done'; l2.className = 'done';
+        s3.className = 'step-item done'; l3.className = 'done';
+        s4.className = 'step-item active'; l4.className = 'active';
+    }
+}
+
+function setStatus(type, text) {
+    const badge = document.getElementById('statusBadge');
+    badge.className = 'status-badge badge-' + type;
+    badge.textContent = text;
+}
+
+function classifyLog(msg) {
+    if (!msg) return '';
+    if (msg.startsWith('✓') || msg.startsWith('✓ ')) return 'success';
+    if (msg.startsWith('✗') || msg.startsWith('✗ ')) return 'error';
+    if (msg.startsWith('⚠') || msg.startsWith('⚠ ')) return 'warn';
+    if (msg.startsWith('▶') || msg.startsWith('▶ ')) return 'info';
+    return '';
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+}
+
+// ─────────────────────────────────────
+// 历史记录
+// ─────────────────────────────────────
+const STATUS_TEXT = {
+    SUCCESS: '完成', FAILED: '失败', RUNNING: '运行中',
+    PENDING: '排队中', INTERRUPTED: '已中断',
+};
+const PHASE_TEXT = {
+    step0_trim: '裁剪', step1_mimo: '分镜解析', step1_5_gpt_compile: '提示词编译',
+    step2_gpt_lint: '提示词校验', step3_wan3: '视频生成', step2_wan3: '视频生成',
+    completed: '完成',
+};
+
+// 断点继续：从磁盘快照恢复，已完成步骤复用、缺失才重跑
+// ask=false ⇒ 一步就开（提示词下面那颗「生成视频」用的就是这条，不再弹二次确认）
+async function resumeTask(taskId, btn, ask) {
+    if (ask !== false && !confirm(`从断点继续任务 ${taskId}？\n已完成的步骤会复用磁盘产物，不会重复消耗 token / 积分。`)) return false;
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await fetch(`/api/super-clone-wan3/resume/${taskId}`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || !data.success) {
+            throw new Error(data.detail || '续跑失败');
+        }
+        currentTaskId = taskId;
+        lastLogCount = 0;
+        document.getElementById('logBox').innerHTML = '';
+        document.getElementById('storyboardArea').style.display = 'none';
+        document.getElementById('sb1Text').textContent = '';
+        document.getElementById('sb2Text').textContent = '';
+        document.getElementById('sb1Pill').textContent = '待运行';
+        document.getElementById('sb1Pill').className = 'pill';
+        document.getElementById('sb2Pill').textContent = '待运行';
+        document.getElementById('sb2Pill').className = 'pill';
+        document.getElementById('videoArea').innerHTML = '<div class="video-placeholder">工作流完成后视频将在此展示</div>';
+        document.getElementById('resultLinks').style.display = 'none';
+        const from = PHASE_TEXT[data.resume_from_phase] || data.resume_from_phase || '断点';
+        const box = document.getElementById('logBox');
+        const line = document.createElement('div');
+        line.className = 'log-line info';
+        line.innerHTML = `<span class="ts">↻</span>从「${escapeHtml(from)}」继续执行`;
+        box.appendChild(line);
+        setStatus('running', '运行中');
+        document.getElementById('btnRun').disabled = true;
+        document.getElementById('btnRun').textContent = '⏳ 工作流运行中...';
+        startPolling();
+        loadHistory();
+        document.getElementById('genRow').style.display = 'none';
+        return true;
+    } catch (e) {
+        alert('续跑失败: ' + e.message);
+        if (btn) btn.disabled = false;
+        const hint = document.getElementById('genHint');
+        hint.className = 'gen-hint err';
+        hint.textContent = '启动失败：' + e.message;
+        loadHistory();
+        return false;
+    }
+}
+
+// 「生成视频」= 把已经编译好的那一份提示词交给 wan3.0（同一个 /resume 机制：缺哪步补哪步，
+// 分镜/编译/审查的磁盘产物都复用，只有 Step 3 真提交、真扣分）
+function renderGenerateOffer(data) {
+    const row = document.getElementById('genRow');
+    const g = data.generate;
+    if (!g || !g.ready) { row.style.display = 'none'; return; }
+    row.style.display = 'flex';
+    document.getElementById('genCost').textContent = g.unit_price
+        ? ` · ${g.total_credits} 分 / ${g.segments} 段` : ' · 价格待查';
+    const hint = document.getElementById('genHint');
+    hint.className = 'gen-hint';
+    hint.textContent = g.segments > 1
+        ? `分 ${g.segments} 段生成，完成后自动拼接` : '一次提交 1 段';
+}
+
+async function generateVideo() {
+    if (!currentTaskId) return;
+    await resumeTask(currentTaskId, null, false);
+}
+
+async function loadHistory() {
+    try {
+        const resp = await fetch('/api/super-clone-wan3/tasks');
+        const data = await resp.json();
+        const list = document.getElementById('historyList');
+        if (!data.tasks || data.tasks.length === 0) {
+            list.innerHTML = '<div class="history-empty">暂无任务</div>';
+            return;
+        }
+        list.innerHTML = '';
+        for (const t of data.tasks) {
+            const div = document.createElement('div');
+            div.className = 'history-item';
+            const statusClass = t.status === 'SUCCESS' ? 'badge-completed'
+                : t.status === 'FAILED' ? 'badge-failed'
+                : t.status === 'INTERRUPTED' ? 'badge-interrupted'
+                : t.status === 'RUNNING' ? 'badge-running' : 'badge-pending';
+            const statusText = STATUS_TEXT[t.status] || t.status;
+            const durStr = t.duration ? `${t.duration}s` : (t.video_duration ? `原${t.video_duration.toFixed(1)}s` : '-');
+            const canResume = t.resumable || t.status === 'FAILED' || t.status === 'INTERRUPTED';
+            const phaseStr = (t.status === 'RUNNING' || t.status === 'INTERRUPTED') && t.phase
+                ? ` · ${PHASE_TEXT[t.phase] || t.phase}` : '';
+            div.innerHTML = `
+                <div class="h-row">
+                    <span class="h-id">${t.task_id}</span>
+                    <span class="h-status status-badge ${statusClass}">${statusText}</span>
+                </div>
+                <div class="h-meta">${durStr} · ${formatTime(t.created_at)}${phaseStr}</div>
+                ${canResume ? `<div class="h-foot"><span></span><button class="h-resume" data-resume="${t.task_id}">▶ 断点继续</button></div>` : ''}
+            `;
+            if (canResume) {
+                const rbtn = div.querySelector('.h-resume');
+                rbtn.onclick = (ev) => {
+                    ev.stopPropagation();
+                    resumeTask(t.task_id, rbtn);
+                };
+            }
+            div.onclick = () => {
+                currentTaskId = t.task_id;
+                lastLogCount = 0;
+                document.getElementById('logBox').innerHTML = '';
+                startPolling();
+            };
+            list.appendChild(div);
+        }
+    } catch (e) {
+        console.error('加载历史失败:', e);
+    }
+}
+
+function formatTime(iso) {
+    if (!iso) return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+        return iso.substring(0, 16);
+    }
+}
+
+// 初始加载历史
+loadHistory();
+</script>
+
+<!-- 裁剪弹窗：上传视频后自动弹出，含视频预览 + filmstrip 缩略图 + 拖动跳转 -->
+<div class="trim-overlay" id="trimOverlay">
+    <div class="trim-modal">
+        <div class="trim-modal-head">
+            <span>✂️ 精准复刻剪辑尺 — 拖动手柄选择保留区间（不限时长）</span>
+            <span class="trim-duration" id="trimDuration">0.0s</span>
+        </div>
+        <video class="trim-modal-video" id="trimModalVideo" playsinline></video>
+        <div class="trim-track" id="trimTrack">
+            <div class="trim-filmstrip" id="trimFilmstrip"></div>
+            <div class="trim-bar" id="trimBar"></div>
+            <div class="trim-handle" id="trimHandleL" style="left:0%"></div>
+            <div class="trim-handle" id="trimHandleR" style="left:100%"></div>
+            <div class="trim-ticks" id="trimTicks"></div>
+        </div>
+        <div class="trim-row">
+            <span>起点</span><span class="trim-num" id="trimStartLabel">0.0s</span>
+            <span style="margin-left:auto">终点</span><span class="trim-num" id="trimEndLabel">0.0s</span>
+            <span style="margin-left:auto">区间</span><span class="trim-num" id="trimSpanLabel">0.0s</span>
+        </div>
+        <div class="trim-actions">
+            <button type="button" onclick="setTrimPreset(2)">锁定 2s</button>
+            <button type="button" onclick="setTrimPreset(5)">锁定 5s</button>
+            <button type="button" onclick="setTrimPreset(10)">锁定 10s</button>
+            <button type="button" onclick="setTrimPreset(15)">锁定 15s</button>
+            <button type="button" onclick="setTrimPreset(videoDuration)">全部</button>
+            <button type="button" onclick="previewTrim()">▶ 预览裁剪片段</button>
+            <button type="button" class="trim-reset" onclick="resetTrim()">重置（框住全部）</button>
+        </div>
+        <div class="trim-hint">
+            💡 拖动左右手柄选择要复刻的区间（最短 1 秒）。超过 15 秒时后端按 15 秒一段生成，再自动拼成一条成片。
+        </div>
+        <div class="trim-modal-foot">
+            <button type="button" class="btn-cancel" onclick="closeTrimModal(false)">取消</button>
+            <button type="button" class="btn-confirm" onclick="closeTrimModal(true)">确认裁剪区间</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>

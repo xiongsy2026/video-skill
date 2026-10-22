@@ -16,9 +16,9 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import httpx
 
 from config import settings
@@ -128,6 +128,14 @@ async def lifespan(app: FastAPI):
             print(f"恢复 {recovered_vt} 个视频翻译中断任务，可从成功步骤继续")
     except Exception as e:
         print(f"视频翻译任务恢复失败: {e}")
+    # wan3.0 直出工作台的自动回传：扫 outputs/wan30_studio/*/wan3_job.json，
+    # 凡是【有上游任务号、盘上没成片】的自己 GET 回来（只 GET，绝不 POST ⇒ 不可能双花）。
+    # 放在启动这一格是故意的：任务号是提交那一刻就落盘的，人不需要记得也没法贴第二次。
+    try:
+        from backend.services import wan30_studio as _w30s
+        _w30s.start_reconciler()
+    except Exception as e:
+        print(f"wan30-studio 自动回传启动失败: {type(e).__name__}: {e}")
     print("=" * 60)
     yield
 
@@ -156,6 +164,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 from backend.services.hypit_workspace import router as hypit_router
 app.include_router(hypit_router)
+
+# wan3.0 直出工作台（/wan30-studio + /api/wan30-studio/*）：花钱那一刀仍走 gateway.invoke，
+# 本模块只做页面、素材换直链、报价与批准窗，不另造第二套判据（见该文件头注）。
+from backend.services.wan30_studio import router as wan30_studio_router
+app.include_router(wan30_studio_router)
 
 # 统一模型网关的 HTTP 入口不在这里：它由常驻的 backend/model_admin.py(:8100) 提供
 # （管理面 + 调用面同源）。8090 只做流水线任务服务器。
@@ -368,7 +381,7 @@ async def health_check_models():
 
     # 并发检测所有 API
     checks = [
-        _check_openai_compat("MiMo", "llm", settings.MIMO_BASE_URL, settings.MIMO_API_KEY, "mimo-v2.5"),
+        _check_openai_compat("MiMo", "llm", settings.MIMO_BASE_URL, settings.MIMO_API_KEY, settings.TEXT_MODEL_MIMO),
         _check_openai_compat("GPT", "llm", settings.OPENAI_BASE_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL),
         _check_openai_compat("Grok", "llm", settings.SR_GROK_BASE_URL, settings.SR_GROK_API_KEY, settings.SR_GROK_MODEL),
         _check_openai_compat("Image2", "image", settings.IMAGE2_BASE_URL, settings.IMAGE2_API_KEY, "image2"),
@@ -5290,7 +5303,7 @@ async def _womenswear_run(
         generate_motion_reference_image, extract_video_keyframe, save_image_result,
         analyze_product_image_has_model, select_best_model_frame_from_video,
     )
-    from backend.services.douyin_downloader import download_douyin_video
+    from backend.services.link_fetch import link_fetch_local
     from backend.services.runninghub_rpa_client import run_motion_transfer_rpa
     from backend.services import task_store
 
@@ -5460,8 +5473,11 @@ async def _womenswear_run(
                 pass
             _set_step(step_key, f"{stage_prefix}: 已有视频不达标({reason})，重新下载", base_progress)
         _set_step(step_key, f"{stage_prefix}: 下载抖音模仿视频", base_progress)
-        vid_info = await download_douyin_video(params.get("video_url", ""), str(work_dir))
-        src = vid_info.get("video_path") or vid_info.get("file_path")
+        # 走下载这条腿的唯一入口（两次重试 + 断头片重下都在里面）。
+        # 🔴 `analyze=True` 必须显式给：漏斗的默认是 False（批量存片只要文件），
+        #    而这一条是动作迁移的准入门槛，原来靠 `download_douyin_video` 自己的默认值 True 吃到的。
+        vid_info = await link_fetch_local(params.get("video_url", ""), out_dir=str(work_dir), analyze=True)
+        src = vid_info.get("file_path")
         if not src or not Path(src).exists():
             raise RuntimeError("模仿视频下载失败")
         if Path(src).resolve() != video_path.resolve():
@@ -9427,7 +9443,7 @@ MiMo 原始视频提示词：
     # 524 是 Cloudflare 网关超时（默认 100s），多图大 payload 容易触发
     # 策略：Grok-4.6 重试 2 次（每次 180s），全部失败后切 GPT-5.6-sol 备用
     payload_grok = {
-        "model": settings.SR_GROK_MODEL,
+        "model": settings.TEXT_MODEL_MIMO_PRO,
         "messages": messages,
         "temperature": 0.1,
         "max_tokens": 8000,
@@ -9439,7 +9455,7 @@ MiMo 原始视频提示词：
         "max_tokens": 8000,
     }
     headers_grok = {
-        "Authorization": f"Bearer {settings.SR_GROK_API_KEY}",
+        "Authorization": f"Bearer {settings.MIMO_API_KEY}",
         "Content-Type": "application/json",
     }
     headers_gpt = {
@@ -9453,7 +9469,7 @@ MiMo 原始视频提示词：
             print(f"[fuse-product] Grok 第 {attempt}/2 次尝试（timeout=180s）...", flush=True)
             async with _httpx.AsyncClient(timeout=180.0) as client:
                 response = await client.post(
-                    f"{settings.SR_GROK_BASE_URL.rstrip('/')}/chat/completions",
+                    f"{settings.MIMO_BASE_URL.rstrip('/')}/chat/completions",
                     headers=headers_grok,
                     json=payload_grok,
                 )
@@ -9582,50 +9598,34 @@ async def prompt_reverse_prepare_link(req: PrepareLinkRequest):
     if not text:
         raise HTTPException(400, "链接为空")
 
-    from backend.services.douyin_downloader import is_douyin_link, download_douyin_video
-    try:
-        from backend.services.xhs_downloader import is_xhs_link, download_xhs_video
-    except ImportError:
-        is_xhs_link = lambda _t: False  # noqa: E731
-        download_xhs_video = None
+    from backend.services.link_fetch import link_fetch_local
 
     out_dir = UPLOAD_DIR / "prompt_reverse_links" / uuid.uuid4().hex[:12]
     out_dir.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []
 
-    async def _cb(msg: str):
-        logs.append(str(msg))
-
     try:
-        if is_xhs_link(text) and download_xhs_video:
-            result = await download_xhs_video(text, str(out_dir), _cb)
-        elif is_douyin_link(text):
-            result = await download_douyin_video(text, str(out_dir), _cb)
-        else:
-            raise HTTPException(400, "未识别到抖音或小红书链接")
-    except HTTPException:
-        raise
+        # 下载这条腿只有 `link_fetch` 一份：两次重试、断头片（ffprobe 量不出时长就重下）、
+        # 抖音/小红书分发、浏览器策略全在里面 —— 这里不再自己直接调下载器（少一次抄一份的机会）。
+        got = await link_fetch_local(text, cb=logs, out_dir=str(out_dir))
+    except RuntimeError as e:
+        msg = str(e)
+        # 认不出链接 = 输入问题(400)；下载器拿不到片 = 上游问题(502)。两种话不许混成一种。
+        raise HTTPException(400 if ("未识别" in msg or "链接为空" in msg) else 502,
+                            f"视频下载失败：{msg}")
     except Exception as e:
         raise HTTPException(502, f"视频下载失败：{e}")
 
-    video_path = result.get("video_path") or ""
-    if not video_path or not Path(video_path).exists():
-        raise HTTPException(502, "下载完成但未找到视频文件")
-
-    from backend.services.super_clone_wan3 import _ffprobe_duration
-    duration = float(_ffprobe_duration(video_path) or 0.0)
-    try:
-        rel = Path(video_path).resolve().relative_to(UPLOAD_DIR.resolve())
-        preview_url = f"/uploads/{rel.as_posix()}"
-    except ValueError:
-        preview_url = ""
     return {
         "success": True,
-        "file_path": video_path,
-        "preview_url": preview_url,
-        "duration": duration,
-        "title": result.get("title") or Path(video_path).stem,
+        "file_path": got["file_path"],
+        "preview_url": got["preview_url"],
+        "duration": got["duration"],
+        "title": got["title"],
         "logs": logs,
+        "size_mb": got["size_mb"],
+        "seconds": got["seconds"],
+        "platform": got["platform"],
     }
 
 
@@ -10272,6 +10272,189 @@ async def replica_wan3_pipeline_tasks_list():
 # 任务存储：super_clone_wan3_tasks[task_id] = {...}
 super_clone_wan3_tasks: dict = {}
 
+# ── 断点继续：任务状态落盘 ──
+# 为什么要落盘：任务只存在内存里时，后端重启/进程中断 = 任务连同请求参数一起消失，
+# 盘上只剩半成品目录却没人能接着跑。现在每个任务在 output_dir 下留一份状态快照，
+# 重启后历史记录仍可见，并可「断点继续」从最后成功步骤复用产物接着跑。
+SC_STATE_FILE = "_super_clone_state.json"
+_SC_PERSIST_KEYS = (
+    "task_id", "type", "status", "phase", "error", "request", "output_dir",
+    "prompt", "storyboard", "result_url", "local_path", "duration", "video_duration",
+    "trimmed_path", "wan3_task_id", "segment_paths", "segment_count", "trim_start",
+    "trim_end", "resolution", "aspect_ratio", "audio", "model_image_path",
+    "scene_image_path", "created_at", "started_at", "finished_at",
+)
+
+
+def _persist_super_clone_task(t: dict, force: bool = False) -> None:
+    """把任务状态快照写入 output_dir/_super_clone_state.json（节流，落盘失败不影响运行）。"""
+    out_dir = t.get("output_dir")
+    if not out_dir:
+        return
+    now = time.time()
+    if not force and now - float(t.get("_persist_at") or 0) < 0.8:
+        return
+    t["_persist_at"] = now
+    try:
+        data = {k: t.get(k) for k in _SC_PERSIST_KEYS}
+        data["logs"] = list(t.get("logs") or [])[-1000:]
+        data["updated_at"] = datetime.now().isoformat()
+        path = Path(out_dir) / SC_STATE_FILE
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[!] super_clone_wan3 状态落盘失败: {exc}", flush=True)
+
+
+def _task_from_state(state: dict) -> dict:
+    """把磁盘快照还原成任务字典；上次未正常收尾的任务标记为 INTERRUPTED（可断点继续）。"""
+    task = {k: state.get(k) for k in _SC_PERSIST_KEYS}
+    task["task_id"] = state.get("task_id") or ""
+    task["type"] = state.get("type") or "super_clone_wan3"
+    task["logs"] = list(state.get("logs") or [])
+    task["error"] = state.get("error")
+    saved_status = str(state.get("status") or "FAILED")
+    # 只有正常收尾的 SUCCESS/FAILED 可信；盘上是 RUNNING/PENDING = 进程已经不在了
+    if saved_status in ("RUNNING", "PENDING"):
+        task["status"] = "INTERRUPTED"
+        task["interrupted_from"] = saved_status
+    else:
+        task["status"] = saved_status
+    task["resumable"] = task["status"] in ("FAILED", "INTERRUPTED") and bool(task.get("request"))
+    task["_from_disk"] = True
+    return task
+
+
+def _find_disk_super_clone_task(task_id: str) -> Optional[dict]:
+    """按 task_id 在 outputs 目录里找状态快照（后端重启后恢复用）。"""
+    if not task_id:
+        return None
+    for state_file in OUTPUT_DIR.glob(f"*/{SC_STATE_FILE}"):
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if str(state.get("task_id") or "") != task_id:
+            continue
+        state.setdefault("output_dir", str(state_file.parent))
+        return _task_from_state(state)
+    return None
+
+
+def _list_disk_super_clone_tasks() -> List[dict]:
+    """列出所有带状态快照的任务（按创建时间倒序）。"""
+    items: List[dict] = []
+    for state_file in OUTPUT_DIR.glob(f"*/{SC_STATE_FILE}"):
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if not state.get("task_id"):
+            continue
+        state.setdefault("output_dir", str(state_file.parent))
+        items.append(_task_from_state(state))
+    items.sort(key=lambda t: t.get("created_at") or "", reverse=True)
+    return items
+
+
+async def _super_clone_runner(task_id: str, resume: bool = False) -> None:
+    """执行/续跑超级复刻任务。所有入参都从 task['request'] 读，保证重启后也能重建同一条任务。"""
+    from backend.services.super_clone_wan3 import run_pipeline
+
+    t = super_clone_wan3_tasks[task_id]
+    r = t.get("request") or {}
+    t["status"] = "RUNNING"
+    t["started_at"] = t.get("started_at") or datetime.now().isoformat()
+    if resume:
+        t["logs"].append({"ts": datetime.now().isoformat(),
+                          "msg": "▶ 断点继续：已完成步骤自动复用，缺失步骤重新执行"})
+    _persist_super_clone_task(t, force=True)
+
+    def _log(msg: str) -> None:
+        t["logs"].append({"ts": datetime.now().isoformat(), "msg": msg})
+        _persist_super_clone_task(t)
+
+    def _phase(phase: str, extra: dict) -> None:
+        t["phase"] = phase
+        if phase == "step1_mimo":
+            # 这三行 banner 里【不写厂商标】：分镜腿可在 agnes/小米之间切、编译/审查腿可在 magpie/mimo/grok/gpt
+            #   之间切（config 开关），写死一家名就是让 UI 照着假话念引擎。真型号由服务层自己打：
+            #   `分镜腿=…（model=…）`、`调用编译器（<model>，…）`、`审查腿=…（model=…）`。
+            _log("▶ Step 1/4: 分镜腿（纯视频解析器）→ storyboard JSON")
+        elif phase == "step1_5_gpt_compile":
+            _log(f"▶ Step 1.5/4: 编译器 → storyboard JSON → Wan3.0 prompt（{extra.get('shots', '?')} 镜）")
+        elif phase == "step2_gpt_lint":
+            _log("▶ Step 2/4: 审查（Lint）→ 规则校验 + LLM 二次审查")
+        elif phase in ("step3_wan3", "step3_h3"):
+            executor = "满雪 H3 全能参考" if phase == "step3_h3" else "Wan3.0"
+            _log(f"▶ Step 3/4: {executor}（执行器）→ 生成成品视频（目标 {extra.get('target_duration', '?')}s）")
+        elif phase == "completed":
+            _log(f"✓ 工作流完成 → {extra.get('final_path', '')}")
+            t["local_path"] = extra.get("final_path")
+        _persist_super_clone_task(t, force=True)
+
+    try:
+        compile_notes = []
+        customer_request = (r.get("customer_request") or "").strip()
+        if r.get("swap_person"):
+            compile_notes.append(
+                "换脸：主体人物严格按模特图，只换脸、五官、发型、肤色；"
+                "忽略模特图中的服装与配饰。成片服装只来自产品图。"
+            )
+        if r.get("swap_scene"):
+            bg = (r.get("scene_text") or "").strip()
+            compile_notes.append(
+                "换背景（仅文字，不提供场景图）："
+                f"{bg}\n每个 Shot 的人物站位、动作、运镜继承原视频；"
+                "禁止把人贴在一张背景静帧上循环；不要写回原室内除非用户未要求换背景。"
+            )
+            extra_bg = f"背景要求：{bg}"
+            customer_request = f"{customer_request}\n\n{extra_bg}".strip() if customer_request else extra_bg
+        result = await run_pipeline(
+            task_id=task_id,
+            video_path=r.get("video_path"),
+            product_image_paths=r.get("product_image_paths") or [],
+            customer_request=customer_request,
+            output_dir=t.get("output_dir"),
+            on_log=_log,
+            on_phase=_phase,
+            trim_start=r.get("trim_start"),
+            trim_end=r.get("trim_end"),
+            model_image_path=r.get("model_image_path") if r.get("swap_person") else None,
+            scene_image_path=None,
+            product_name=r.get("product_name") or "",
+            resolution=r.get("resolution"),
+            aspect_ratio=r.get("aspect_ratio"),
+            audio=True if r.get("audio") is None else r.get("audio"),
+            engine=r.get("engine") or "wan3",
+            extra_compile_note="\n".join(compile_notes) if compile_notes else None,
+            background_override=(r.get("scene_text") or "").strip() if r.get("swap_scene") else None,
+            voice_audio_paths=r.get("voice_audio_paths") or [],
+            resume=resume,
+        )
+        t["prompt"] = result.get("prompt")
+        t["storyboard"] = result.get("storyboard")
+        t["result_url"] = result.get("result_url")
+        t["local_path"] = result.get("local_path")
+        t["duration"] = result.get("duration")
+        t["video_duration"] = result.get("video_duration")
+        t["trimmed_path"] = result.get("trimmed_path")
+        t["wan3_task_id"] = result.get("task_id")
+        t["segment_paths"] = result.get("segment_paths")
+        t["segment_count"] = result.get("segment_count")
+        t["status"] = "SUCCESS"
+        t["phase"] = "completed"
+        t["error"] = None
+        t["finished_at"] = datetime.now().isoformat()
+    except Exception as e:
+        t["status"] = "FAILED"
+        t["error"] = str(e)
+        t["finished_at"] = datetime.now().isoformat()
+        t["logs"].append({"ts": datetime.now().isoformat(), "msg": f"✗ 失败: {e}"})
+        print(f"[!] super_clone_wan3 {task_id} 失败: {e}", flush=True)
+    _persist_super_clone_task(t, force=True)
+
 
 class SuperCloneWan3SubmitRequest(BaseModel):
     """超级复刻 wan3.0 请求
@@ -10342,7 +10525,16 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
     if not req.product_name or not req.product_name.strip():
         raise HTTPException(400, "product_name 为必填字段，请提供产品名")
     swap_person = bool(req.model_image_path)
-    swap_scene = bool((req.scene_text or "").strip())
+    # 🔴 非空 ≠ 要换背景（2026-10-22 sc_9c246af70384：客户把整段任务说明写进「换背景」栏，
+    #   而那句里明写着「背景…全部保留原片」，旧写法 `bool(scene_text)` 替他打开了两道从未要求的闸）。
+    #   判定抽在 super_clone_wan3.scene_swap_decision —— 入口与 Layer1 闸读同一份，不各抄一套。
+    from backend.services.super_clone_wan3 import scene_swap_decision
+    swap_scene, swap_why = scene_swap_decision(req.scene_text)
+    # 他写的自然语言是合同：判成不换背景时，这段文字不能丢，原样并进「客户需求说明」继续进编译器。
+    customer_request_final = (req.customer_request or "").strip()
+    if not swap_scene and (req.scene_text or "").strip():
+        _st = req.scene_text.strip()
+        customer_request_final = (customer_request_final + "\n" + _st).strip() if customer_request_final else _st
     if swap_person and not Path(req.model_image_path).exists():
         raise HTTPException(400, f"面部图不存在: {req.model_image_path}")
     vd = _ffprobe_duration(req.video_path) or 0.0
@@ -10363,14 +10555,38 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     task_id = f"sc_{uuid.uuid4().hex[:12]}"
+    # ★完整入参快照：断点继续时靠它重建同一条任务（后端重启后也不丢参数）
+    request_snapshot = {
+        "video_path": req.video_path,
+        "product_image_paths": list(req.product_image_paths or []),
+        "product_name": req.product_name,
+        "customer_request": customer_request_final,
+        "output_subdir": req.output_subdir,
+        "trim_start": req.trim_start,
+        "trim_end": req.trim_end,
+        "model_image_path": req.model_image_path,
+        "scene_image_path": req.scene_image_path,
+        "scene_text": req.scene_text,
+        "voiceover_replacements": req.voiceover_replacements,
+        "person_app_key": req.person_app_key,
+        "scene_app_key": req.scene_app_key,
+        "resolution": req.resolution,
+        "aspect_ratio": req.aspect_ratio,
+        "audio": req.audio,
+        "voice_audio_paths": list(req.voice_audio_paths or []),
+        "engine": req.engine,
+        "swap_person": swap_person,
+        "swap_scene": swap_scene,
+    }
     super_clone_wan3_tasks[task_id] = {
         "task_id": task_id,
         "type": "super_clone_wan3",
         "status": "PENDING",
         "phase": "init",
+        "request": request_snapshot,
         "video_path": req.video_path,
         "product_image_paths": req.product_image_paths,
-        "customer_request": req.customer_request,
+        "customer_request": customer_request_final,
         "model_image_path": req.model_image_path,
         "scene_image_path": req.scene_image_path,
         "swap_person": swap_person,
@@ -10399,88 +10615,16 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
         "started_at": None,
         "finished_at": None,
     }
+    # 判成什么就说什么：这道闸开没开、为什么开，必须印在任务日志上，别让人去猜（也别让人以为是自己填错了）
+    super_clone_wan3_tasks[task_id]["logs"].append({
+        "ts": datetime.now().isoformat(),
+        "msg": "换背景判定=%s（%s）%s" % (
+            "要换" if swap_scene else "不换", swap_why,
+            "" if swap_scene else "；「换背景」栏那段文字已并进客户需求说明，合同不丢"),
+    })
+    _persist_super_clone_task(super_clone_wan3_tasks[task_id], force=True)
 
-    async def _runner():
-        t = super_clone_wan3_tasks[task_id]
-        t["status"] = "RUNNING"
-        t["started_at"] = datetime.now().isoformat()
-
-        def _log(msg: str) -> None:
-            t["logs"].append({"ts": datetime.now().isoformat(), "msg": msg})
-
-        def _phase(phase: str, extra: dict) -> None:
-            t["phase"] = phase
-            if phase == "step1_mimo":
-                _log("▶ Step 1/4: MiMo（纯视频解析器）→ storyboard JSON")
-            elif phase == "step1_5_gpt_compile":
-                _log(f"▶ Step 1.5/4: Grok 编译器 → storyboard JSON → Wan3.0 prompt（{extra.get('shots', '?')} 镜）")
-            elif phase == "step2_gpt_lint":
-                _log("▶ Step 2/4: Grok Lint → 规则校验 + LLM 二次审查")
-            elif phase in ("step3_wan3", "step3_h3"):
-                executor = "满雪 H3 全能参考" if phase == "step3_h3" else "Wan3.0"
-                _log(f"▶ Step 3/4: {executor}（执行器）→ 生成成品视频（目标 {extra.get('target_duration', '?')}s）")
-            elif phase == "completed":
-                _log(f"✓ 工作流完成 → {extra.get('final_path', '')}")
-                t["local_path"] = extra.get("final_path")
-
-        try:
-            compile_notes = []
-            customer_request = (req.customer_request or "").strip()
-            if swap_person:
-                compile_notes.append(
-                    "换脸：主体人物严格按模特图，只换脸、五官、发型、肤色；"
-                    "忽略模特图中的服装与配饰。成片服装只来自产品图。"
-                )
-            if swap_scene:
-                bg = req.scene_text.strip()
-                compile_notes.append(
-                    "换背景（仅文字，不提供场景图）："
-                    f"{bg}\n每个 Shot 的人物站位、动作、运镜继承原视频；"
-                    "禁止把人贴在一张背景静帧上循环；不要写回原室内除非用户未要求换背景。"
-                )
-                extra_bg = f"背景要求：{bg}"
-                customer_request = f"{customer_request}\n\n{extra_bg}".strip() if customer_request else extra_bg
-            result = await run_pipeline(
-                task_id=task_id,
-                video_path=req.video_path,
-                product_image_paths=req.product_image_paths,
-                customer_request=customer_request,
-                output_dir=str(out_dir),
-                on_log=_log,
-                on_phase=_phase,
-                trim_start=req.trim_start,
-                trim_end=req.trim_end,
-                model_image_path=req.model_image_path if swap_person else None,
-                scene_image_path=None,
-                product_name=req.product_name,
-                resolution=req.resolution,
-                aspect_ratio=req.aspect_ratio,
-                audio=True if req.audio is None else req.audio,
-                engine=req.engine,
-                extra_compile_note="\n".join(compile_notes) if compile_notes else None,
-                background_override=req.scene_text.strip() if swap_scene else None,
-                voice_audio_paths=req.voice_audio_paths,
-            )
-            t["prompt"] = result.get("prompt")
-            t["storyboard"] = result.get("storyboard")
-            t["result_url"] = result.get("result_url")
-            t["local_path"] = result.get("local_path")
-            t["duration"] = result.get("duration")
-            t["video_duration"] = result.get("video_duration")
-            t["trimmed_path"] = result.get("trimmed_path")
-            t["wan3_task_id"] = result.get("task_id")
-            t["segment_paths"] = result.get("segment_paths")
-            t["segment_count"] = result.get("segment_count")
-            t["status"] = "SUCCESS"
-            t["finished_at"] = datetime.now().isoformat()
-        except Exception as e:
-            t["status"] = "FAILED"
-            t["error"] = str(e)
-            t["finished_at"] = datetime.now().isoformat()
-            _log(f"✗ 失败: {e}")
-            print(f"[!] super_clone_wan3 {task_id} 失败: {e}")
-
-    asyncio.create_task(_runner())
+    asyncio.create_task(_super_clone_runner(task_id))
     return {
         "success": True,
         "task_id": task_id,
@@ -10490,15 +10634,51 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
     }
 
 
+def _super_clone_generate_offer(t: dict) -> dict:
+    """提示词下面那颗「生成视频」按钮的料（只读、0 消耗、不建任何条子）。
+
+    出现条件只写一处：有编译好的 prompt + 盘上没有成片 + 这一单没在跑。
+    分数现读价目表（`model_prices.json` 改了按钮跟着改，前端不许硬编码 60）。
+    """
+    from backend import gateway as gw
+
+    local = str(t.get("local_path") or "")
+    delivered = bool(local) and Path(local).is_file()
+    segments = 1
+    try:
+        plan = Path(str(t.get("output_dir") or "")) / "_submit_plan.json"
+        if plan.is_file():
+            segments = max(1, int(json.loads(plan.read_text(encoding="utf-8")).get("count") or 1))
+    except Exception as e:                                     # noqa: BLE001
+        print(f"[!] super_clone 提交计划读不到（按钮按 1 段显示）：{e}", flush=True)
+    try:
+        # 分数只认网关那一份估法（`meter` 与预扣同源；在这里再乘一遍时长档就是第二套判据）
+        m = gw.meter("video.generate", "wan3-prime", {"count": segments})
+        unit, total = int(m["unit_price"]), int(m["credits_estimate"])
+    except Exception as e:                                     # noqa: BLE001
+        print(f"[!] super_clone 报价读不到（按钮显示『价格待查』）：{e}", flush=True)
+        unit = total = 0
+    return {
+        "lane": "video.generate/wan3-prime",
+        "delivered": delivered,
+        "segments": segments,
+        "unit_price": unit,
+        "total_credits": total,
+        "ready": bool(t.get("prompt")) and not delivered and t.get("status") != "RUNNING",
+    }
+
+
 @app.get("/api/super-clone-wan3/status/{task_id}")
 async def super_clone_wan3_status(task_id: str):
-    """查询超级复刻 wan3.0 任务状态"""
+    """查询超级复刻 wan3.0 任务状态（内存里没有时从磁盘快照恢复，支持重启后查询）"""
     t = super_clone_wan3_tasks.get(task_id)
+    if not t:
+        t = _find_disk_super_clone_task(task_id)
     if not t:
         raise HTTPException(404, "任务不存在")
     return {
         "task_id": task_id,
-        "type": t["type"],
+        "type": t.get("type") or "super_clone_wan3",
         "status": t["status"],
         "phase": t.get("phase"),
         "error": t.get("error"),
@@ -10520,16 +10700,72 @@ async def super_clone_wan3_status(task_id: str):
         "segment_count": t.get("segment_count"),
         "segment_paths": t.get("segment_paths"),
         "logs": t.get("logs", []),
+        "resumable": bool(t.get("resumable")) or t["status"] in ("FAILED", "INTERRUPTED"),
+        "generate": _super_clone_generate_offer(t),
         "created_at": t.get("created_at"),
         "started_at": t.get("started_at"),
         "finished_at": t.get("finished_at"),
     }
 
 
+@app.post("/api/super-clone-wan3/resume/{task_id}")
+async def super_clone_wan3_resume(task_id: str):
+    """断点继续任务：从最后成功步骤续跑（已落盘的产物自动复用，缺失才重跑）。
+
+    覆盖：任务 FAILED，或后端重启/进程中断导致盘上状态停在 RUNNING/PENDING（显示为 INTERRUPTED）。
+    """
+    from backend.services.super_clone_wan3 import engine_lock_error, validate_input
+
+    t = super_clone_wan3_tasks.get(task_id)
+    if t:
+        if t.get("status") == "RUNNING":
+            raise HTTPException(400, "任务正在运行，无需断点继续")
+        if t.get("status") == "SUCCESS":
+            # 🔴 判据是【盘上有没有成片】，不是状态字：2026-10-22 sc_9c246af70384 提交被批准闸拒回
+            #    （0 分未扣、上游没建任务）却写着 SUCCESS ⇒ 按状态字拒绝等于逼人重发一整单。
+            if _super_clone_generate_offer(t)["delivered"]:
+                raise HTTPException(400, "任务已交付成片，无需再生成")
+    else:
+        t = _find_disk_super_clone_task(task_id)
+        if not t:
+            raise HTTPException(404, "任务不存在，且磁盘上没有可恢复的状态快照")
+        super_clone_wan3_tasks[task_id] = t
+
+    req = t.get("request") or {}
+    if not req:
+        raise HTTPException(400, "缺少原始请求参数（该任务早于断点功能），无法继续，请重新发起")
+    lock_err = engine_lock_error(req.get("engine") or "wan3")
+    if lock_err:
+        raise HTTPException(400, lock_err)
+    in_err = validate_input(req.get("video_path") or "")
+    if in_err:
+        raise HTTPException(400, f"原始视频不可用，无法继续：{in_err}")
+    missing = [p for p in (req.get("product_image_paths") or [])
+               if p and not Path(p).exists()]
+    if missing:
+        raise HTTPException(400, f"产品图已不存在，无法继续：{missing[0]}")
+    if req.get("swap_person") and req.get("model_image_path") and not Path(req["model_image_path"]).exists():
+        raise HTTPException(400, f"模特图已不存在，无法继续：{req['model_image_path']}")
+
+    t["status"] = "RUNNING"
+    t["error"] = None
+    t["finished_at"] = None
+    t["resumable"] = False
+    _persist_super_clone_task(t, force=True)
+    asyncio.create_task(_super_clone_runner(task_id, resume=True))
+    return {
+        "success": True,
+        "task_id": task_id,
+        "status": "RUNNING",
+        "resume_from_phase": t.get("phase"),
+        "output_dir": t.get("output_dir"),
+    }
+
+
 @app.get("/api/super-clone-wan3/result/{task_id}")
 async def super_clone_wan3_result(task_id: str):
-    """下载成品视频"""
-    t = super_clone_wan3_tasks.get(task_id)
+    """下载成品视频（内存里没有时从磁盘快照恢复）"""
+    t = super_clone_wan3_tasks.get(task_id) or _find_disk_super_clone_task(task_id)
     if not t:
         raise HTTPException(404, "任务不存在")
     local = t.get("local_path")
@@ -10544,10 +10780,15 @@ async def super_clone_wan3_result(task_id: str):
 
 @app.get("/api/super-clone-wan3/tasks")
 async def super_clone_wan3_tasks_list():
-    """列出所有超级复刻任务（按创建时间倒序，最多 50 条）"""
+    """列出所有超级复刻任务（内存 + 磁盘快照合并，按创建时间倒序，最多 50 条）"""
+    merged: dict = {}
+    for t in _list_disk_super_clone_tasks():
+        merged[t["task_id"]] = t
+    for t in super_clone_wan3_tasks.values():
+        merged[t["task_id"]] = t
     items = sorted(
-        super_clone_wan3_tasks.values(),
-        key=lambda t: t.get("created_at", ""),
+        merged.values(),
+        key=lambda t: t.get("created_at") or "",
         reverse=True,
     )[:50]
     return {
@@ -10556,13 +10797,14 @@ async def super_clone_wan3_tasks_list():
                 "task_id": t["task_id"],
                 "status": t["status"],
                 "phase": t.get("phase"),
-                "video_path": t.get("video_path"),
+                "video_path": t.get("video_path") or (t.get("request") or {}).get("video_path"),
                 "local_path": t.get("local_path"),
                 "duration": t.get("duration"),
                 "video_duration": t.get("video_duration"),
                 "created_at": t.get("created_at"),
                 "finished_at": t.get("finished_at"),
                 "error": t.get("error"),
+                "resumable": bool(t.get("resumable")) or t["status"] in ("FAILED", "INTERRUPTED"),
             }
             for t in items
         ]
@@ -10737,144 +10979,18 @@ async def hot_explosion_wan3_probe_duration(path: str):
 
 @app.post("/api/hot-explosion-wan3/submit")
 async def hot_explosion_wan3_submit(req: HotExplosionWan3SubmitRequest):
-    """提交爆款裂变 wan3.0 任务
+    """旧矩阵裂变通道已退役（M5 收口，只断提交、保留捞回）。
 
-    工作流：
-      Step 1: MiMo 解析原视频 → storyboard（1 次，共享）
-      Step 2: 对每套素材组并行：
-        2a. GPT 编译器 → Wan3.0 prompt
-        2b. GPT Lint 校验
-        2c. Wan3.0 执行（reference_video=原视频, duration=-1）
-      Step 3: 汇总 N 个成品视频
-
-    时长规则与超级复刻一致：≤15s 整段复刻，>15s 必须裁剪 5-15s 区间。
+    原「1 原视频 + N 素材组」矩阵工作流已被「账号知识库 + 智能体大脑裂变」取代
+    （新入口 POST /api/smart-fission/start + /hot-explosion-wan3 新页）。
+    旧生成腿必死：submit_reference_to_video 被 WAN3_RH_ENABLED=False 守卫拒绝
+    （2026-10-09 禁令），放行只会白烧 MiMo/GPT 解析费。
+    status / result / tasks 端点保留，用于捞回历史任务（只捞不重发）。
     """
-    from backend.services.super_clone_wan3 import validate_input, validate_trim, _ffprobe_duration, _cfg
-    from backend.services.hot_explosion_wan3 import MaterialGroup, run_pipeline
-
-    # 入口校验
-    err = validate_input(req.video_path)
-    if err:
-        raise HTTPException(400, err)
-    if not req.material_groups:
-        raise HTTPException(400, "至少需要 1 套素材组")
-    if len(req.material_groups) > 10:
-        raise HTTPException(400, "素材组数量上限 10 套")
-    if not (1 <= req.max_concurrent <= 5):
-        raise HTTPException(400, "max_concurrent 必须在 1-5 之间")
-
-    groups: List[MaterialGroup] = []
-    for i, mg in enumerate(req.material_groups):
-        g = MaterialGroup(
-            group_id=f"g{i}",
-            product_image_paths=mg.product_image_paths,
-            product_name=mg.product_name,
-            model_image_path=mg.model_image_path,
-            scene_image_path=mg.scene_image_path,
-            customer_request=mg.customer_request,
-            product_facts=mg.product_facts,
-        )
-        gerr = g.validate()
-        if gerr:
-            raise HTTPException(400, gerr)
-        groups.append(g)
-
-    # 裁剪 / 时长校验
-    vd = _ffprobe_duration(req.video_path) or 0.0
-    if req.trim_start is not None or req.trim_end is not None:
-        terr = validate_trim(req.trim_start, req.trim_end, vd)
-        if terr:
-            raise HTTPException(400, terr)
-    else:
-        max_dur = _cfg()["max_input_duration"]
-        if vd > max_dur + 0.5:
-            raise HTTPException(
-                400,
-                f"未启用裁剪时原视频必须 ≤{int(max_dur)}s，当前 {vd:.1f}s 超限。"
-                f"请在前端剪辑尺上选定 5-15s 区间后再提交。",
-            )
-
-    sub = req.output_subdir or f"hot_explosion_wan3_{uuid.uuid4().hex[:8]}"
-    out_dir = OUTPUT_DIR / sub
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    task_id = f"he_{uuid.uuid4().hex[:12]}"
-    hot_explosion_wan3_tasks[task_id] = {
-        "task_id": task_id,
-        "type": "hot_explosion_wan3",
-        "status": "PENDING",
-        "phase": "init",
-        "video_path": req.video_path,
-        "material_groups": [g.to_dict() for g in groups],
-        "trim_start": req.trim_start,
-        "trim_end": req.trim_end,
-        "max_concurrent": req.max_concurrent,
-        "resolution": req.resolution,
-        "aspect_ratio": req.aspect_ratio,
-        "audio": req.audio,
-        "output_dir": str(out_dir),
-        "logs": [],
-        "storyboard": None,
-        "target_duration": None,
-        "variants": [],
-        "success_count": 0,
-        "failed_count": 0,
-        "error": None,
-        "created_at": datetime.now().isoformat(),
-        "started_at": None,
-        "finished_at": None,
-    }
-
-    async def _runner():
-        t = hot_explosion_wan3_tasks[task_id]
-        t["status"] = "RUNNING"
-        t["started_at"] = datetime.now().isoformat()
-
-        def _log(msg: str) -> None:
-            t["logs"].append({"ts": datetime.now().isoformat(), "msg": msg})
-
-        def _phase(phase: str, extra: dict) -> None:
-            t["phase"] = phase
-            if phase == "step1_mimo":
-                _log("▶ Step 1: MiMo 解析原视频 → storyboard（共享）")
-            elif phase == "step2_variants":
-                _log(f"▶ Step 2: 并行生成 {extra.get('total', '?')} 个变体")
-            elif phase == "completed":
-                _log(
-                    f"✓ 爆款裂变完成：成功 {extra.get('success', 0)}，"
-                    f"失败 {extra.get('failed', 0)}"
-                )
-
-        try:
-            result = await run_pipeline(
-                task_id=task_id,
-                video_path=req.video_path,
-                material_groups=groups,
-                output_dir=str(out_dir),
-                on_log=_log,
-                on_phase=_phase,
-                trim_start=req.trim_start,
-                trim_end=req.trim_end,
-                max_concurrent=req.max_concurrent,
-                resolution=req.resolution,
-                aspect_ratio=req.aspect_ratio,
-                audio=req.audio,
-            )
-            t["storyboard"] = result.get("storyboard")
-            t["target_duration"] = result.get("target_duration")
-            t["variants"] = result.get("variants")
-            t["success_count"] = result.get("success_count")
-            t["failed_count"] = result.get("failed_count")
-            t["status"] = "SUCCESS"
-            t["finished_at"] = datetime.now().isoformat()
-        except Exception as e:
-            t["status"] = "FAILED"
-            t["error"] = str(e)
-            t["finished_at"] = datetime.now().isoformat()
-            print(f"[!] hot_explosion_wan3 {task_id} 失败: {e}")
-
-    asyncio.create_task(_runner())
-    return {"task_id": task_id, "status": "PENDING"}
+    raise HTTPException(
+        410,
+        "旧矩阵裂变通道已下线，请走 /hot-explosion-wan3 新工作流（POST /api/smart-fission/start）",
+    )
 
 
 @app.get("/api/hot-explosion-wan3/status/{task_id}")
@@ -11477,37 +11593,37 @@ async def hook_extend_page():
 # 爆款裂变 v2 工作流（smart_fission）
 # ─────────────────────────────────────
 
-@app.get("/smart-fission", response_class=HTMLResponse)
+@app.get("/smart-fission")
 async def smart_fission_page():
-    """爆款裂变 v2 页面"""
-    html_path = Path(settings.FRONTEND_DIR) / "smart_fission.html"
-    if not html_path.exists():
-        raise HTTPException(404, "爆款裂变 v2 页面未找到")
-    return HTMLResponse(
-        content=html_path.read_text(encoding="utf-8"),
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"},
-    )
+    """旧入口收口（M5）：302 → /hot-explosion-wan3，杜绝旧页传老参数（去 video_path 契约同次上线）。"""
+    return RedirectResponse(url="/hot-explosion-wan3", status_code=302)
 
 
 class SmartFissionStartRequest(BaseModel):
-    """启动爆款裂变 v2 请求"""
-    video_path: str
+    """启动爆款裂变 v2 请求（M5 契约：去 video_path——解析在知识库入库阶段完成）"""
+    model_config = ConfigDict(extra="forbid")  # 旧页传老参数（video_path 等）必须 422，不许静默吞掉
+
     product_image_paths: list[str]
     customer_request: str = ""
     variant_count: int = 3
-    target_duration: float = 15.0
+    target_duration: float = 30.0  # 15 / 30 两档（30s 待小样本定档）
     product_name: str = "目标产品"
     product_facts: str | None = None
     model_image_path: str | None = None
     scene_image_path: str | None = None
+    account_id: str = ""
+    account_skill_version: int | None = None
 
 
 @app.post("/api/smart-fission/start")
 async def smart_fission_start(req: SmartFissionStartRequest):
-    """启动新任务（Step 1-4 一气呵成，到 PENDING_REVIEW 停下）"""
+    """启动新任务（Step 3-4 一气呵成，到 PENDING_REVIEW 停下）"""
     from backend.services.smart_fission.workflow import start_workflow
+    if int(req.target_duration) not in (15, 30):
+        raise HTTPException(400, f"target_duration 只放行 15/30 秒（收到 {req.target_duration}）")
+    if not req.product_image_paths:
+        raise HTTPException(400, "产品图必填")
     task_id = await start_workflow(
-        video_path=req.video_path,
         product_image_paths=req.product_image_paths,
         customer_request=req.customer_request,
         variant_count=req.variant_count,
@@ -11516,6 +11632,8 @@ async def smart_fission_start(req: SmartFissionStartRequest):
         product_facts=req.product_facts,
         model_image_path=req.model_image_path,
         scene_image_path=req.scene_image_path,
+        account_id=req.account_id,
+        account_skill_version=req.account_skill_version,
     )
     return {"task_id": task_id, "status": "RUNNING", "stage": "INIT"}
 
@@ -11662,6 +11780,219 @@ async def smart_fission_list(limit: int = 20):
             for t in items
         ]
     }
+
+
+# ─────────────────────────────────────
+# 账号知识库 API（M1：视频 RAG 入库，MiMo 解析 + GPT 营销结构 + 本地 ASR）
+# ─────────────────────────────────────
+
+class KbIngestVideo(BaseModel):
+    path: str
+    title: str = ""
+    play_count: int = 0
+    source: str = "upload"  # upload / link（link 通道 M1b 可选，默认关闭）
+
+
+class KbIngestRequest(BaseModel):
+    account_id: str
+    videos: List[KbIngestVideo]
+
+
+@app.post("/api/kb/ingest")
+async def kb_ingest(req: KbIngestRequest):
+    """批量入库并逐条解析（断点续跑：重跑跳过 status='parsed' 条目）"""
+    from backend.services.kb.ingest import start_ingest
+    try:
+        task_id = await start_ingest(req.account_id, [v.dict() for v in req.videos])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"task_id": task_id, "status": "RUNNING", "stage": "KB_INGEST"}
+
+
+@app.get("/api/kb/ingest/{task_id}/status")
+async def kb_ingest_status(task_id: str):
+    """入库任务进度 + 日志 + 调用账目"""
+    from backend.services.task_store import get as get_task, get_logs
+    from backend.services.kb import db as kb_db
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"任务不存在：{task_id}")
+    intermediate = task.get("intermediate", {})
+    if isinstance(intermediate, str):
+        import json as _json
+        intermediate = _json.loads(intermediate) if intermediate else {}
+    logs = get_logs(task_id, limit=200)
+    return {
+        "task_id": task_id,
+        "status": task.get("status", ""),
+        "stage": task.get("stage", ""),
+        "progress": task.get("progress", 0),
+        "error": task.get("error", ""),
+        "intermediate": intermediate,
+        "calls": kb_db.calls_summary(task_id),
+        "logs": [{"ts": l.get("ts"), "msg": l.get("msg")} for l in logs],
+    }
+
+
+@app.get("/api/kb/{account_id}/videos")
+async def kb_videos(account_id: str):
+    """账号视频台账（含解析状态，驱动断点续跑展示）"""
+    from backend.services.kb import db as kb_db
+    kb_db.init_db()
+    items = kb_db.videos_by_account(account_id)
+    return {"account_id": account_id, "videos": items, "counts": kb_db.video_counts(account_id)}
+
+
+@app.get("/api/kb/{account_id}/analysis")
+async def kb_analysis(account_id: str):
+    """逐条解析结果（shot_analysis / 营销结构 / 案例字段）"""
+    from backend.services.kb import db as kb_db
+    kb_db.init_db()
+    return {"account_id": account_id, "items": kb_db.analyses_by_account(account_id)}
+
+
+@app.get("/api/kb/{account_id}/status")
+async def kb_account_status(account_id: str):
+    """账号知识库总览：条目统计 + 解析统计 + 全链路调用账目"""
+    from backend.services.kb import db as kb_db
+    kb_db.init_db()
+    return {
+        "account_id": account_id,
+        "counts": kb_db.video_counts(account_id),
+        "calls": kb_db.calls_summary(),
+        "has_profile": bool(kb_db.profile_latest(account_id)),
+        "skill_latest": kb_db.skill_latest(account_id),
+    }
+
+
+# ─────────────────────────────────────
+# 账号知识库 API（M2/M5：聚合蒸馏 + skill 在线审核）
+# ─────────────────────────────────────
+
+@app.get("/api/kb/accounts")
+async def kb_accounts():
+    """全部账号清单（视频条数 + 最新 skill 版本，驱动前端账号/skill 快照选择）"""
+    from backend.services.kb import db as kb_db
+    return {"accounts": kb_db.accounts_list()}
+
+
+class KbTaskRequest(BaseModel):
+    """聚合/蒸馏请求（task_id 可选，不传则后端建任务号）"""
+    task_id: str = ""
+
+
+def _kb_task_id(prefix: str, req: KbTaskRequest | None) -> str:
+    task_id = (req.task_id if req else "") or ""
+    if not task_id:
+        task_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+        from backend.services.task_store import create as _create
+        _create(task_id=task_id, task_type=prefix, status="RUNNING",
+                stage="KB_AGGREGATE", params={})
+    return task_id
+
+
+def _kb_task_failed(task_id: str, err: str) -> None:
+    """kb 聚合/蒸馏异常收口：任务置 FAILED，防僵尸 RUNNING。"""
+    from backend.services import task_store
+    try:
+        task_store.update(task_id, status="FAILED", error=str(err)[:500])
+    except Exception:
+        pass
+
+
+@app.post("/api/kb/{account_id}/aggregate")
+async def kb_aggregate(account_id: str, req: KbTaskRequest | None = None):
+    """账号画像聚合（≥3 条已解析结果；画像版本 +1 落库）"""
+    from backend.services.kb.aggregate import aggregate_account
+    task_id = _kb_task_id("kb_aggregate", req)
+    try:
+        result = await aggregate_account(task_id, account_id)
+    except ValueError as e:
+        _kb_task_failed(task_id, str(e))
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        _kb_task_failed(task_id, str(e))
+        raise HTTPException(500, f"账号画像聚合失败：{e}")
+    return {"task_id": task_id, "status": "DONE",
+            "version": result.get("version"), "stats": result.get("stats")}
+
+
+@app.post("/api/kb/{account_id}/distill")
+async def kb_distill(account_id: str, req: KbTaskRequest | None = None):
+    """两阶段 Map-Reduce 蒸馏 → SKILL.md（含 contract: 段，过 skill_contract 形状闸）"""
+    from backend.services.kb.distill import distill_skill
+    task_id = _kb_task_id("kb_distill", req)
+    try:
+        result = await distill_skill(task_id, account_id)
+    except ValueError as e:
+        _kb_task_failed(task_id, str(e))
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        _kb_task_failed(task_id, str(e))
+        raise HTTPException(500, f"账号蒸馏失败：{e}")
+    return {"task_id": task_id, "status": "DONE",
+            "version": result.get("version"),
+            "skill_md_path": result.get("skill_md_path"),
+            "stats": result.get("stats")}
+
+
+@app.get("/api/kb/skill/{account_id}/{version}")
+async def kb_skill_get(account_id: str, version: int = 0):
+    """skill 版本详情 + SKILL.md 全文（version=0 取最新）"""
+    from backend.services.kb import db as kb_db
+    kb_db.init_db()
+    row = kb_db.skill_get(account_id, version) if version > 0 else kb_db.skill_latest(account_id)
+    if not row:
+        raise HTTPException(404, f"skill 不存在：{account_id} v{version or 'latest'}")
+    content = ""
+    p = Path(row.get("skill_md_path", ""))
+    if p.exists():
+        content = p.read_text(encoding="utf-8")
+    return {**row, "content": content}
+
+
+class KbSkillSaveRequest(BaseModel):
+    """人工审核修改 skill（写回 SKILL.md 并标 manual_edited，不被后续蒸馏覆盖）"""
+    account_id: str
+    version: int
+    content: str
+
+
+@app.post("/api/kb/skill/save")
+async def kb_skill_save(req: KbSkillSaveRequest):
+    """skill 在线审核保存：写回文件 + manual_edited；合同形状问题如实回报（人工有最终决定权）"""
+    from backend.services.kb import db as kb_db
+    kb_db.init_db()
+    row = kb_db.skill_get(req.account_id, req.version)
+    if not row:
+        raise HTTPException(404, f"skill 不存在：{req.account_id} v{req.version}")
+    p = Path(row.get("skill_md_path", ""))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(req.content, encoding="utf-8")
+    kb_db.skill_save(req.account_id, req.version, str(p),
+                     row.get("rule_candidates") or [], status="manual_edited")
+
+    problems: List[str] = []
+    try:
+        from backend.skill_contract import parse_contract, contract_shape_problems
+        contract = parse_contract(req.content)
+        problems = contract_shape_problems(contract) if contract else ["未找到 contract: 段（生成出片时合同回执闸可能拒绝）"]
+    except Exception as e:
+        problems = [f"合同解析失败：{e}"]
+    return {"status": "ok", "version": req.version, "skill_md_path": str(p),
+            "skill_status": "manual_edited", "contract_problems": problems}
+
+
+@app.get("/account-kb", response_class=HTMLResponse)
+async def account_kb_page():
+    """账号知识库工作台（M5）：视频库双通道入库 → 蒸馏分析 → skill 在线审核"""
+    html_path = Path(settings.FRONTEND_DIR) / "account_kb.html"
+    if not html_path.exists():
+        raise HTTPException(404, "账号知识库页面未找到")
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"},
+    )
 
 
 # ─────────────────────────────────────
@@ -12154,6 +12485,542 @@ async def face_swap_result(task_id: str):
         media_type="video/mp4",
         filename=f"face_swap_{task_id}.mp4",
     )
+
+
+# ==================== 抖音账号批量下载工作台 (/douyin-batch) ====================
+# 零模型消耗的链路：只翻列表 + 拉 mp4，不进花钱那道闸（与 womenswear 同侧）。
+BATCH_TASK_TYPE = "douyin_batch"
+douyin_batch_tasks: dict = {}
+
+
+def _batch_touch(task_id: str, **fields):
+    t = douyin_batch_tasks.get(task_id)
+    if t:
+        t.update(fields)
+
+
+def _batch_log(task_id: str, msg: str, level: str = "info"):
+    t = douyin_batch_tasks.get(task_id)
+    if t is not None:
+        logs = t.setdefault("logs", [])
+        logs.append({"ts": time.time(), "msg": str(msg)})
+        del logs[:-400]
+    try:
+        from backend.services import task_store
+        task_store.add_log(task_id, str(msg), level=level)
+    except Exception:
+        pass
+
+
+def _batch_persist(task_id: str):
+    """逐条都写库会把 1300 条的台账变成 IO 瓶颈，按检查点镜像；内存态才是活的那一份"""
+    t = douyin_batch_tasks.get(task_id)
+    if not t:
+        return
+    try:
+        from backend.services import task_store
+        task_store.update(
+            task_id,
+            status=t.get("status"),
+            progress=t.get("progress", 0),
+            stage=t.get("stage", ""),
+            error=t.get("error") or "",
+            intermediate={"feed": t.get("intermediate", {}).get("feed", {}),
+                          "items": t.get("items", [])},
+            extra=t.get("extra", {}),
+            outputs=t.get("outputs", []),
+        )
+    except Exception:
+        pass
+
+
+def _batch_rehydrate(task_id: str) -> Optional[dict]:
+    """服务重启后内存丢了，从 task_store 把任务捞回来（列表/进度都能回看）"""
+    if task_id in douyin_batch_tasks:
+        return douyin_batch_tasks[task_id]
+    try:
+        from backend.services import task_store
+        t_db = task_store.get(task_id)
+    except Exception:
+        t_db = None
+    if not t_db or t_db.get("task_type") != BATCH_TASK_TYPE:
+        return None
+    inter = t_db.get("intermediate", {}) or {}
+    t = {
+        "task_id": task_id,
+        "status": t_db.get("status", "FAILED"),
+        "progress": t_db.get("progress", 0),
+        "stage": t_db.get("stage", ""),
+        "error": t_db.get("error"),
+        "kind": t_db.get("extra", {}).get("kind", "download"),
+        "params": t_db.get("params", {}),
+        "items": inter.get("items", []) or [],
+        "intermediate": {"feed": inter.get("feed", {}) or {}},
+        "extra": t_db.get("extra", {}),
+        "outputs": t_db.get("outputs", []),
+        "logs": [],
+    }
+    douyin_batch_tasks[task_id] = t
+    return t
+
+
+def _batch_counts(items: list) -> dict:
+    return {
+        "total": len(items),
+        "done": sum(1 for i in items if i.get("dl_status") == "done"),
+        "failed": sum(1 for i in items if i.get("dl_status") == "failed"),
+        "skipped": sum(1 for i in items if i.get("dl_status") == "skipped"),
+        "pending": sum(1 for i in items if not i.get("dl_status")),
+    }
+
+
+class DouyinBatchCookieRequest(BaseModel):
+    cookie: str
+
+
+class DouyinBatchPreviewRequest(BaseModel):
+    account_input: str
+    want: int = 0
+
+
+class DouyinBatchRunRequest(BaseModel):
+    """run 只认 preview 出来的那张清单 —— 看到多少条就下多少条，不在背后重翻一次列表"""
+    sec_uid: str
+    nickname: str = ""
+    items: list
+    target_dir: str = ""
+    gap_sec: float = 2.0
+
+
+class DouyinBatchDeleteRequest(BaseModel):
+    """真删下载目录内的视频文件（勾选即真删，拦住无效视频进蒸馏）"""
+    task_id: str = ""
+    files: List[str]
+
+
+async def _douyin_batch_preview(task_id: str):
+    from backend.services import douyin_author_feed as F
+
+    t = douyin_batch_tasks[task_id]
+    params = t["params"]
+    _batch_touch(task_id, status="RUNNING", stage="解析账号链接…",
+                 extra={**t.get("extra", {}), "current_step": "preview"})
+    try:
+        author = await F.resolve_author(params.get("account_input", ""))
+        _batch_log(task_id, f"主页解析成功：{author['homepage_url'][:70]}")
+
+        async def _say(msg):
+            _batch_touch(task_id, stage=str(msg))
+
+        feed = await F.list_author_videos(
+            author["sec_uid"], want=int(params.get("want") or 0), status_callback=_say)
+        _batch_touch(
+            task_id,
+            items=feed["items"],
+            intermediate={"feed": {k: v for k, v in feed.items() if k != "items"}},
+            status="SUCCESS",
+            progress=100,
+            stage=(f"列表就绪：{feed.get('nickname') or '未知昵称'}｜取到 {feed['got']} 条本人作品"
+                   f"（非本人已扔 {feed['foreign_dropped']} 条）"),
+            extra={**t.get("extra", {}), "sec_uid": feed["sec_uid"],
+                   "nickname": feed.get("nickname") or "",
+                   "declared_count": feed.get("declared_count"),
+                   "stopped_reason": feed.get("stopped_reason"),
+                   "maybe_anonymous": feed.get("maybe_anonymous"),
+                   "foreign_dropped": feed.get("foreign_dropped")},
+        )
+        _batch_log(task_id, f"翻页尺寸 {feed['page_sizes']}，has_more={feed['has_more']}，"
+                            f"停止原因={feed['stopped_reason']}")
+    except Exception as e:
+        _batch_touch(task_id, status="FAILED", stage=f"取列表失败：{e}", error=str(e)[:600],
+                     extra={**t.get("extra", {}), "failed_step": "preview"})
+        _batch_log(task_id, f"取列表失败：{e}", level="error")
+    _batch_persist(task_id)
+
+
+async def _douyin_batch_download(task_id: str):
+    import shutil
+    from backend.services import douyin_author_feed as F
+    from backend.services.link_fetch import link_fetch_local
+
+    t = douyin_batch_tasks[task_id]
+    items = t["items"]
+    params = t["params"]
+    extra = t.get("extra", {})
+    target = Path(str(params.get("target_dir") or F.DEFAULT_TARGET_DIR))
+    # 续跑必须落回同一个目录：优先用首次算出来并存档的那个，别拿昵称现算
+    out_dir = Path(extra.get("out_dir") or F.run_dir(target, extra.get("nickname", ""),
+                                                    extra.get("sec_uid", ""), task_id))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gap = max(0.0, float(params.get("gap_sec", 2.0)))
+    total = len(items)
+    _batch_touch(task_id, status="RUNNING", progress=0, error=None,
+                 stage=f"目标目录：{out_dir}｜依次下载 {total} 条",
+                 extra={**extra, "current_step": "download", "out_dir": str(out_dir)})
+    _batch_log(task_id, f"开始依次下载 {total} 条 → {out_dir}")
+    consecutive_fail = 0
+
+    for pos, it in enumerate(items, start=1):
+        t = douyin_batch_tasks[task_id]
+        if t.get("abort_requested"):
+            _batch_log(task_id, "已收到中止，剩余条目不再下载", level="error")
+            break
+        idx = it.get("index", pos)
+        already = it.get("file") and (out_dir / it["file"]).exists()
+        if it.get("dl_status") == "done" and already:
+            continue
+        if not it.get("downloadable", True):
+            it["dl_status"] = "skipped"
+            _batch_log(task_id, f"[{idx}/{total}] 跳过：{it.get('skip_reason') or '不可下载'}")
+            _batch_touch(task_id, progress=int(pos / max(total, 1) * 100))
+            continue
+
+        fname = F.item_filename(idx, total, it["aweme_id"], it.get("title") or "")
+        final_path = out_dir / fname
+        if final_path.exists() and final_path.stat().st_size > 100_000:
+            it.update({"dl_status": "done", "file": fname,
+                       "size_mb": round(final_path.stat().st_size / 1024 / 1024, 2),
+                       "method": it.get("method") or "已存在（跳过重下）", "error": ""})
+            _batch_log(task_id, f"[{idx}/{total}] 已在盘上，跳过：{fname}")
+            _batch_persist(task_id)
+            continue
+
+        it["dl_status"] = "downloading"
+        _batch_touch(task_id, stage=f"[{idx}/{total}] 下载中：{(it.get('title') or '')[:24]}")
+        try:
+            raw = str(it.get("share_url") or "").strip()
+            if not raw and it.get("aweme_id"):
+                # 只有 aweme_id 时拼成分享页链接：下载腿认的是 URL（`resolve_douyin_url` 里没有
+                # `http` 当场就拒），原来把裸 id 直接传进去必然失败 —— 那是给错了形状，不是下载器的毛病。
+                raw = "https://www.iesdouyin.com/share/video/%s/" % it["aweme_id"]
+            # 下载这条腿只有 `link_fetch` 一份：两次重试 + 断头片判定（ffprobe 量不出时长就重下）
+            # 都在里面；批量存片只要文件 ⇒ analyze=False，与漏斗默认一致（这里写明是为了看得懂）。
+            res = await link_fetch_local(raw, cb=_say_batch(task_id), out_dir=str(out_dir),
+                                         analyze=False, allow_browser=True)
+            src = Path(res["file_path"])
+            if src != final_path:
+                if final_path.exists():
+                    final_path.unlink()
+                shutil.move(str(src), str(final_path))
+            size_mb = round(final_path.stat().st_size / 1024 / 1024, 2)
+            it.update({
+                "dl_status": "done", "file": fname, "size_mb": size_mb,
+                "method": res.get("method") or "",
+                "quality": res.get("quality") or "", "error": "",
+            })
+            _batch_log(task_id, f"[{idx}/{total}] 完成 {fname}"
+                                f"（{res.get('method') or '没记'}｜{res.get('quality') or size_mb}MB）")
+            consecutive_fail = 0
+        except Exception as e:
+            it.update({"dl_status": "failed", "error": str(e)[:300]})
+            consecutive_fail += 1
+            _batch_log(task_id, f"[{idx}/{total}] 失败：{str(e)[:180]}", level="error")
+            if consecutive_fail >= 3:
+                _batch_touch(task_id, stage=f"连续 {consecutive_fail} 条失败，先停下（多半被风控或 cookie 过期）")
+                _batch_log(task_id, "连续 3 条失败，批量已自动停止，避免继续撞风控", level="error")
+                break
+        _batch_touch(task_id, progress=int(pos / max(total, 1) * 100))
+        if pos % 20 == 0 or pos == total:
+            # 3712 条的清单约 1MB，逐条全量写库 = 4GB 写放大
+            _batch_persist(task_id)
+        if gap:
+            await asyncio.sleep(gap)
+
+    cur = douyin_batch_tasks[task_id]
+    counts = _batch_counts(cur["items"])
+    try:
+        _write_batch_ledger(out_dir, cur["items"])
+    except Exception as e:
+        _batch_log(task_id, f"清单写入失败：{e}", level="error")
+    aborted = bool(cur.get("abort_requested"))
+    status = "FAILED" if (aborted or counts["failed"]) else "SUCCESS"
+    _batch_touch(
+        task_id, status=status, progress=100,
+        stage=(f"已中止：{counts['done']}/{counts['total']} 条已落盘" if aborted else
+               f"完成：成功 {counts['done']}／失败 {counts['failed']}／跳过 {counts['skipped']}"
+               f"／未做 {counts['pending']}"),
+        error=cur.get("error"),
+        outputs=[{"name": i["file"], "path": str(out_dir / i["file"]), "index": i["index"],
+                  "size_mb": i.get("size_mb", 0), "method": i.get("method", "")}
+                 for i in cur["items"] if i.get("dl_status") == "done" and i.get("file")],
+        extra={**cur.get("extra", {}), "out_dir": str(out_dir), "counts": counts},
+    )
+    _batch_persist(task_id)
+
+
+def _write_batch_ledger(out_dir: Path, items: list):
+    import csv
+    from backend.services import douyin_author_feed as F
+
+    rows = F.list_ledger(items)
+    with open(out_dir / "清单.csv", "w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerows(rows)
+    (out_dir / "清单.json").write_text(
+        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _say_batch(task_id: str):
+    """下载器的每条状态同时进日志和当前 stage（前端只轮询一个任务口）"""
+    async def _cb(msg):
+        _batch_touch(task_id, stage=str(msg)[:160])
+        _batch_log(task_id, f"    {msg}")
+    return _cb
+
+
+@app.get("/douyin-batch", response_class=HTMLResponse)
+async def douyin_batch_page():
+    """抖音账号批量下载工作台（账号主页链接 → 选数量 → 依次下载到指定文件夹）"""
+    html_path = Path(settings.FRONTEND_DIR) / "douyin_batch_studio.html"
+    if not html_path.exists():
+        raise HTTPException(404, "抖音批量下载工作台页面未找到")
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"},
+    )
+
+
+@app.get("/api/douyin-batch-studio/cookie-status")
+async def douyin_batch_cookie_status():
+    """只读登录态摘要：有没有文件、几条 cookie、关键位齐不齐。绝不回显 cookie 值。"""
+    from backend.services import douyin_author_feed as F
+    st = F.login_state()
+    st["default_target_dir"] = str(F.DEFAULT_TARGET_DIR)
+    return {"success": True, **st}
+
+
+@app.post("/api/douyin-batch-studio/save-cookie")
+async def douyin_batch_save_cookie(req: DouyinBatchCookieRequest):
+    from backend.services import douyin_author_feed as F
+    try:
+        summary = F.save_cookie_string(req.cookie)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"success": True, **summary}
+
+
+@app.post("/api/douyin-batch-studio/preview")
+async def douyin_batch_preview(req: DouyinBatchPreviewRequest):
+    from backend.services import douyin_author_feed as F
+    if not (req.account_input or "").strip():
+        raise HTTPException(400, "请输入抖音账号主页链接（或整段分享文案）")
+    if not F.login_state()["exists"]:
+        raise HTTPException(400, "还没有抖音登录态：请先粘贴 cookie。")
+
+    task_id = uuid.uuid4().hex[:12]
+    douyin_batch_tasks[task_id] = {
+        "task_id": task_id, "status": "INIT", "progress": 0, "stage": "排队中",
+        "kind": "preview", "params": {"account_input": req.account_input, "want": req.want},
+        "items": [], "intermediate": {}, "extra": {"kind": "preview", "current_step": "init"},
+        "outputs": [], "error": None, "logs": [],
+    }
+    try:
+        from backend.services import task_store
+        task_store.create(task_id, BATCH_TASK_TYPE, status="INIT", progress=0, stage="排队中",
+                          params={"account_input": req.account_input, "want": req.want,
+                                  "sec_uid": ""},
+                          intermediate={}, extra={"kind": "preview", "current_step": "init"})
+    except Exception:
+        pass
+    asyncio.create_task(_douyin_batch_preview(task_id))
+    return {"success": True, "task_id": task_id}
+
+
+@app.post("/api/douyin-batch-studio/run")
+async def douyin_batch_run(req: DouyinBatchRunRequest):
+    from backend.services import douyin_author_feed as F
+
+    if not req.sec_uid:
+        raise HTTPException(400, "缺 sec_uid：请先取列表再下载")
+    if not req.items:
+        raise HTTPException(400, "列表是空的，没东西可下")
+    target = Path(str(req.target_dir or F.DEFAULT_TARGET_DIR))
+    task_id = uuid.uuid4().hex[:12]
+    out_dir = F.run_dir(target, req.nickname, req.sec_uid, task_id)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(400, f"目标目录不可写：{out_dir}（{e}）")
+
+    items = [dict(i) for i in req.items]
+    for pos, it in enumerate(items, start=1):
+        it.setdefault("index", pos)
+        it.setdefault("dl_status", "")
+    params = {
+        "sec_uid": req.sec_uid, "nickname": req.nickname, "target_dir": str(target),
+        "gap_sec": req.gap_sec, "item_count": len(items),
+        "account_input": "", "want": len(items),
+    }
+    douyin_batch_tasks[task_id] = {
+        "task_id": task_id, "status": "INIT", "progress": 0, "stage": "排队中",
+        "kind": "download", "params": params, "items": items, "intermediate": {},
+        "extra": {"kind": "download", "current_step": "init", "sec_uid": req.sec_uid,
+                  "nickname": req.nickname},
+        "outputs": [], "error": None, "logs": [],
+    }
+    try:
+        from backend.services import task_store
+        task_store.create(task_id, BATCH_TASK_TYPE, status="INIT", progress=0, stage="排队中",
+                          params=params, intermediate={"items": items},
+                          extra={"kind": "download", "current_step": "init",
+                                 "sec_uid": req.sec_uid, "nickname": req.nickname})
+    except Exception:
+        pass
+    asyncio.create_task(_douyin_batch_download(task_id))
+    return {"success": True, "task_id": task_id, "out_dir": str(out_dir)}
+
+
+@app.get("/api/douyin-batch-studio/status")
+async def douyin_batch_status(task_id: str):
+    t = _batch_rehydrate(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    extra = t.get("extra", {})
+    counts = _batch_counts(t.get("items", []))
+    return {
+        "success": True,
+        "task_id": task_id,
+        "kind": extra.get("kind", t.get("kind", "")),
+        "status": t.get("status"),
+        "progress": t.get("progress", 0),
+        "stage": t.get("stage", ""),
+        "error": t.get("error"),
+        "sec_uid": extra.get("sec_uid", ""),
+        "nickname": extra.get("nickname", ""),
+        "declared_count": extra.get("declared_count"),
+        "stopped_reason": extra.get("stopped_reason", ""),
+        "maybe_anonymous": extra.get("maybe_anonymous", False),
+        "foreign_dropped": extra.get("foreign_dropped", 0),
+        "out_dir": extra.get("out_dir", ""),
+        "counts": counts,
+        "feed": t.get("intermediate", {}).get("feed", {}),
+        "items": t.get("items", []),
+        "logs": t.get("logs", [])[-60:],
+    }
+
+
+@app.get("/api/douyin-batch-studio/history")
+async def douyin_batch_history(limit: int = 30):
+    from backend.services import task_store
+    out = []
+    try:
+        rows = task_store.list_by_type(BATCH_TASK_TYPE, limit=limit)
+    except Exception:
+        rows = []
+    for t in rows:
+        extra = t.get("extra", {}) or {}
+        counts = extra.get("counts") or {}
+        out.append({
+            "task_id": t["task_id"],
+            "kind": extra.get("kind", ""),
+            "status": t.get("status"),
+            "progress": t.get("progress", 0),
+            "stage": t.get("stage", ""),
+            "nickname": extra.get("nickname", ""),
+            "sec_uid": extra.get("sec_uid", ""),
+            "out_dir": extra.get("out_dir", ""),
+            "item_count": (t.get("params", {}) or {}).get("item_count", 0),
+            "counts": counts,
+            "created_at": t.get("created_at", 0),
+            "created_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(t.get("created_at", 0)))
+            if t.get("created_at") else "",
+        })
+    return {"success": True, "tasks": out}
+
+
+@app.post("/api/douyin-batch-studio/retry")
+async def douyin_batch_retry(task_id: str):
+    t = _batch_rehydrate(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("kind") != "download" and t.get("extra", {}).get("kind") != "download":
+        raise HTTPException(400, "只有下载任务可以续跑（取列表任务请用「取列表」按钮）")
+    if t.get("status") == "RUNNING":
+        raise HTTPException(400, "这个任务还在跑，不用续")
+    t["abort_requested"] = False
+    for it in t["items"]:
+        if it.get("dl_status") in ("failed", "downloading"):
+            it["dl_status"] = ""
+            it["error"] = ""
+    _batch_log(task_id, "续跑：失败的条目重下，已落盘的自动跳过")
+    asyncio.create_task(_douyin_batch_download(task_id))
+    return {"success": True, "task_id": task_id}
+
+
+@app.post("/api/douyin-batch-studio/abort")
+async def douyin_batch_abort(task_id: str):
+    t = _batch_rehydrate(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    t["abort_requested"] = True
+    _batch_log(task_id, "用户请求中止，当前这条下完就停", level="error")
+    return {"success": True, "task_id": task_id}
+
+
+@app.get("/api/douyin-batch-studio/file")
+async def douyin_batch_file(task_id: str, name: str):
+    """文件在 C:\\视频下载（仓库外），所以这里给一条受路径校验的直链，不挂 StaticFiles"""
+    t = _batch_rehydrate(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    out_dir = Path(t.get("extra", {}).get("out_dir") or "").resolve()
+    if not str(out_dir) or not out_dir.exists():
+        raise HTTPException(404, "任务目录还不存在")
+    candidate = (out_dir / name).resolve()
+    if not str(candidate).startswith(str(out_dir) + os.sep):
+        raise HTTPException(400, "非法文件名")
+    if not candidate.exists():
+        raise HTTPException(404, f"文件不存在：{name}")
+    suffix = candidate.suffix.lower()
+    media_type = {"csv": "text/csv", "json": "application/json"}.get(suffix[1:], "video/mp4")
+    return FileResponse(str(candidate), media_type=media_type, filename=candidate.name)
+
+
+@app.post("/api/douyin-batch-studio/delete")
+async def douyin_batch_delete(req: DouyinBatchDeleteRequest):
+    """真删下载目录内的视频文件（M6：勾选即真删，拦住无效视频进蒸馏）。
+
+    安全口径：
+    - 路径 resolve 后必须落在下载根目录（C:/视频下载）内，防目录逃逸；
+    - 只允许删视频后缀（mp4/webm/mov/m4v/flv/ts），清单账本 csv/json 删不到；
+    - 不支持删目录。
+    """
+    from backend.services.douyin_author_feed import DEFAULT_TARGET_DIR
+    root = Path(str(DEFAULT_TARGET_DIR)).resolve()
+    video_suffixes = {".mp4", ".webm", ".mov", ".m4v", ".flv", ".ts"}
+    deleted: list = []
+    errors: list = []
+    for f in (req.files or [])[:200]:
+        raw = str(f or "").strip()
+        if not raw:
+            errors.append({"file": f, "error": "空路径"})
+            continue
+        try:
+            p = Path(raw)
+            if not p.is_absolute():
+                p = root / raw
+            rp = p.resolve()
+            if not str(rp).startswith(str(root) + os.sep):
+                errors.append({"file": raw, "error": "路径越界：不在下载目录内，拒绝删除"})
+                continue
+            if rp.suffix.lower() not in video_suffixes:
+                errors.append({"file": raw, "error": f"只允许删除视频文件（{sorted(video_suffixes)}）"})
+                continue
+            if rp.is_dir():
+                errors.append({"file": raw, "error": "不支持删除目录"})
+                continue
+            if not rp.exists():
+                errors.append({"file": raw, "error": "文件不存在"})
+                continue
+            rp.unlink()
+            deleted.append(str(rp))
+        except Exception as e:
+            errors.append({"file": raw, "error": str(e)[:200]})
+    if req.task_id and deleted:
+        try:
+            _batch_log(req.task_id, f"真删 {len(deleted)} 个视频文件（拦住无效视频进蒸馏）")
+        except Exception:
+            pass
+    return {"success": True, "deleted": deleted, "errors": errors}
 
 
 if __name__ == "__main__":
