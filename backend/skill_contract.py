@@ -78,13 +78,22 @@ def _scalar(line: str) -> str:
     return v.strip()
 
 
-def parse_contract(text: str) -> dict:
-    """从 SKILL.md 里抠 `contract:` 段。行格式与 form: 同族：`k=v | k=v`。"""
-    m = re.search(r"(?m)^contract:\s*$", text)
+def parse_contract(text: str, key: str = "contract") -> dict:
+    """从 SKILL.md 里抠某一合同段。行格式与 form: 同族：`k=v | k=v`。
+
+    `key` 支持 `contract-human` 这种【同文件的第二种形状】：人工稿那条流程物理上没有
+    编译器物证（storyboard/compile-bound 的判据它永远满足不了），拿默认合同去核它 = 逼着
+    要么拒提交、要么伪造指纹。所以给它一份自己的合同，而不是把默认合同里那几格降级
+    （降级会把【编译档】的判据一起拆掉）。
+    """
+    m = re.search(r"(?m)^%s:\s*$" % re.escape(key), text)
     if not m:
         return {}
     body = text[m.end():]
-    stop = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_]*:\s*$|^---\s*$|^#{1,2} ", body)
+    # 🔴 停行必须认得【带连字符的顶层键】（`contract-human:`）。早先这个字符类没有 `-`，
+    #    于是追加第二份合同时它不会被当成边界 ⇒ 默认那份把人工稿的 5 格一起吞进去
+    #    （实测：version 变成 human@1、步数 13→18），编译档就会被【人工稿的形状】核验 = 假放行。
+    stop = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_-]*:\s*$|^---\s*$|^#{1,2} ", body)
     if stop:
         body = body[:stop.start()]
     c = {"version": "", "entry": "", "spend": "", "steps": []}
@@ -139,6 +148,10 @@ def impl_problems(contract: dict, used_impl: dict) -> list:
             continue
         got = str((used_impl or {}).get(st["id"]) or "").strip()
         if not got:
+            if not st.get("required"):
+                # 可选步【没做】是合法的（改口播那一档没选就没做）⇒ 不判、不误拒整条流程。
+                # 强度没丢：真做了就必须申报手段，报了不在名单内的照样拒。
+                continue
             bad.append("步 %s 限定了手段 %s，但没申报用了哪个" % (st["id"], allow))
         elif got not in allow:
             bad.append("步 %s 的手段 %r 不在合同白名单 %s 内 ⇒ 自造手段，不许执行" % (st["id"], got, allow))
@@ -223,15 +236,16 @@ def check_proof(pred: str, evidence: str, other_evidence: dict | None = None) ->
     return ""
 
 
-def contract_for(skill: str) -> dict:
+def contract_for(skill: str, variant: str = "") -> dict:
     d = LANE_DIRS.get(skill)
     if not d:
         return {}
     p = os.path.join(SKILLS_DIR, d, "SKILL.md")
     if not os.path.isfile(p):
         return {}
+    key = "contract" + (("-" + str(variant).strip()) if str(variant or "").strip() else "")
     with open(p, "r", encoding="utf-8", errors="replace") as f:
-        return parse_contract(f.read())
+        return parse_contract(f.read(), key=key)
 
 
 def skill_for_spend(capability: str, purpose: str) -> str:
@@ -534,8 +548,14 @@ def check_receipt(skill: str, receipt: dict, inputs=(), contract: dict | None = 
     return bad
 
 
-def verify_or_raise(skill: str | None = None, task_dir: str | None = None, inputs=()) -> dict:
-    """花钱那一刀之前调它。上下文缺省时从入口设的 SKILL_CONTRACT_CTX 读。"""
+def verify_or_raise(skill: str | None = None, task_dir: str | None = None, inputs=(),
+                    contract_variant: str = "") -> dict:
+    """花钱那一刀之前调它。上下文缺省时从入口设的 SKILL_CONTRACT_CTX 读。
+
+    `contract_variant` 只许【调用点显式传】（人工稿那条流程传 "human"），不走 ctx：
+    8090 是常驻进程、`SKILL_CONTRACT_CTX` 是进程级环境变量，两条任务并发时谁后设谁说话
+    ⇒ 把"用哪份合同"放进这种共享槽里，等于让人工稿的形状去核验编译档的回执。
+    """
     c0 = ctx()
     skill = skill or c0.get("skill") or ""
     task_dir = task_dir or c0.get("task_dir") or ""
@@ -543,7 +563,7 @@ def verify_or_raise(skill: str | None = None, task_dir: str | None = None, input
         raise SkillContractError(
             "没有合同上下文（%s 未设）⇒ 这条腿不是从 skill 声明的入口进来的。"
             "要出片请跑对应 skill 的 runner，而不是直接调管线。" % CTX_ENV)
-    c = contract_for(skill)
+    c = contract_for(skill, variant=contract_variant)
     if not c.get("steps"):
         raise SkillContractError("skill %r 没有 contract: 段 ⇒ 无法核验流程，拒绝提交"
                                  "（先给它补合同，见 docs/ADR-skill-contract.md）" % skill)

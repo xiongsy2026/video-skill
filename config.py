@@ -12,8 +12,18 @@ class Settings(BaseSettings):
     """应用配置"""
     
     # MiMo API 配置
-    MIMO_BASE_URL: str = "https://token-plan-cn.xiaomimimo.com/v1"
+    # 2026-10-27 换渠道：小米 token-plan-cn 那把整把 429 之后，现在走 lant.top 中转（OpenAI 兼容）。
+    # 上游 /v1/models 实测只有 mimo-v2.6-flash / mimo-v2.6-pro 两个名字 ⇒ 模型名不许写裸 "mimo-v2.6"。
+    MIMO_BASE_URL: str = "https://lant.top/relay-api/v1"
     MIMO_API_KEY: str = ""
+    # 🔴 吃视频的那条腿（超级复刻 Step1 分镜）单独一档：lant.top 中转实测【不收视频】——
+    #   2026-10-27 三次实测同一形状：HTTP 200、回话通顺，但 prompt_tokens 521 vs 纯文本基线 492
+    #   （增量 29 = 只有那句文字），模型自己说"当前模型不支持视频，内容已被过滤"⇒ 静默丢帧。
+    #   （发 data:base64 还会先撞一次 502 RELAY_002。）判据落在 scripts/check-mimo-video-capability.py，
+    #   换端点前必跑：它比的不是"有没有回话"而是"画面有没有进模型"。
+    #   留空 = 回落 MIMO_*（宁可跟着主渠道，也不要静默看不见画面）。
+    MIMO_VIDEO_BASE_URL: str = ""
+    MIMO_VIDEO_API_KEY: str = ""
 
     # === 统一网关「文本推理脑」注册表（2026-10-01 全中转实测结果，模型名集中在这里、不散在代码里）===
     # 每条 = 网关的一个 text.complete purpose；.env 可覆盖成别的型号名。
@@ -61,6 +71,16 @@ class Settings(BaseSettings):
     #    ⚠️ 它【不吃视频】：裸问 pt=42 → 带 10.2MB 原片 pt=82（Δ=40 = 只有题目文字），
     #    且模型自己答"没有收到视频" ⇒ 分镜腿绝不能指它（和 opencode 那三条同一个毛病：桥丢 video part）。
     MAGPIE_QFMODEL_MODEL: str = "qoder-cn/qfmodel"
+    # 🔴 2026-10-29 新增（用户点名"mimo 用 qoder 池的 GLM-5.3-Flash 兜底"）：`qoder-cn/gfmodel`
+    #    的模型卡 display_name = **GLM-5.3-Flash**，input=[text,image]、1M 窗口。
+    #    实测：文本 max_tokens=1800 → 4.3s、=8000 → 1.8s，两次都 finish=stop 且【正文有字】
+    #    （opencode 那条 glm-5.3-flash 的"整段烧在 reasoning⇒正文 0 字"这个坑【没有】复现）；
+    #    看图 11.8s 答对瓶色。⚠️ 它【不吃视频】：39MB 的片按分镜腿同一个 part 形状递进去
+    #    pt=82，与裸问一模一样（Δ=0），模型自述"没有收到视频" ⇒ 只能当文本/看图的兜底，
+    #    吃视频的分镜腿绝不能退到这里。
+    MAGPIE_GLMFLASH_MODEL: str = "qoder-cn/gfmodel"
+    # mimo 直连腿（lant.top）失败时退到哪条 magpie 腿；空 = 不兜底（回到"失败就如实失败"）。
+    MIMO_FALLBACK_LANE: str = "magpie_glmflash"
 
     # 🔴 腿序（主腿→兜底）也在这里，不在网关写死 —— **2026-10-20 用真 payload 实测定的序**
     #    （题面 = 盘上真产物：9 镜 storyboard + 2 张产品图 + STEP1_5 系统合同，166KB，预算 8192；
@@ -70,7 +90,7 @@ class Settings(BaseSettings):
     #      glm-5.3-flash        0/3｜三次都把 8192 预算【整段烧在 reasoning】⇒ 正文 0 字、finish=length、白等 85–117s
     #    ⇒ glm 从两张表里【整条摘掉】：留一个 0/3 的兜底位不是保险，是多花 100 秒再失败一次。
     #    ⚠️ 他说的"glm 上下文不够"实测下来不是窗口不够（卡上 200k），是**思考把输出预算吃光** —— 修法不同。
-    MAGPIE_TEXT_LANES: str = "magpie_deepseek:3,magpie_mimo:2"
+    MAGPIE_TEXT_LANES: str = "magpie_deepseek:3,magpie_mimo:2,magpie_glmflash:1"
     # 🔴 带图表（看图腿走它）2026-10-22 夜按【新实测】改序：qfmodel 主 → opencode mimo free → deepseek 兜。
     #    依据是今晚同一张真产品图、同一道题的四方对照（判据=结构看对没 / logo 读对没 / 有没有补画面外）：
     #      qoder-cn/qfmodel(Qwen3.8-Flash)  ✅ 认出紫色旋盖、读对 jio、明写"规格成分本面未见，不按常识补"｜36.1s
@@ -78,7 +98,7 @@ class Settings(BaseSettings):
     #      opencode deepseek-v4.1-flash-free 🔴 把真实存在的盖子看成"未开口、无盖子或旋盖"｜20.1s
     #      qoder-cn/dfmodel(DeepSeek-Flash)  🔴 同样"未见外露的旋盖" + logo 读成 jie ｜🔴 374.4s（6 分 14 秒，不能用）
     #    ⚠️ 三条都不吃视频（qfmodel 实测 Δ=40）⇒ 这张表只服务【看图】，分镜腿另走 mimo 直连。
-    MAGPIE_VISION_LANES: str = "magpie_qfmodel:2,magpie_mimo:2,magpie_deepseek:1"
+    MAGPIE_VISION_LANES: str = "magpie_qfmodel:2,magpie_mimo:2,magpie_deepseek:1,magpie_glmflash:1"
 
 
     # API 配置
@@ -100,6 +120,10 @@ class Settings(BaseSettings):
     # GPT Image 2.5（该端点 /models 实测三型：gpt-image-2、gpt-image-2.5-sunburst、gpt-image-2.5-flare）。
     # sunburst=保真默认（Framewright gpt_image_2_5 的 default_model_id）；要提速档就在 .env 覆盖成 gpt-image-2.5-flare。
     IMAGE2_IMAGE25_MODEL: str = "gpt-image-2.5-sunburst"
+    # 🔴 2026-10-29 实测：这台机器【直连 image1.vibelearning.top 被 reset】(WinError 10054，TCP 通、TLS/HTTP 一律断)，
+    #    走本机 v2rayN 的 127.0.0.1:10808 才通（GET /v1/models 回 200，三型都在）。与 TIANYUE_PROXY_URL 同一形状、同一病因。
+    #    回滚：把 .env 的 IMAGE2_PROXY_URL 清空即回到直连。代价：Bearer 会经过本机代理进程（可见）。
+    IMAGE2_PROXY_URL: str = ""
 
     # zexapi Omni 配置（Google Gemini Omni Flash 1.1 中转，文生/图生视频）
     OMNI_BASE_URL: str = "https://zexapi.com"
@@ -243,6 +267,18 @@ class Settings(BaseSettings):
     # ⚠️ 强度边界按引擎分两种，别混：magpie 这条【经 gateway.invoke】⇒ 有预扣/结算/台账（free 池记 0 分、token 照记）；
     #    mimo/grok/gpt 三条仍自己拼 OpenAI client 直连厂商（`_compiler_llm` 里如实写 ledger="off"），换它们不产生台账。
     REPLICA_WAN3_LLM_ENGINE: str = "magpie"
+    # 🔴 编译产出的【输出粒度】这里没有开关 —— 只有一档（收紧版），常量在
+    #    `super_clone_wan3.COMPILE_COMPACT_BLOCK` / `STORYBOARD_COMPACT_BLOCK`，无条件拼在两条腿的系统提示后面。
+    #    2026-10-23 用户定："怎么还搞一个粗档和细档，直接按粗档不就好了" ⇒ 原来的
+    #    `REPLICA_WAN3_PROMPT_GRANULARITY`（fine|coarse）整条删除：一个只有默认值的开关不是配置，是第二个入口。
+    #    为什么这一档要存在（同日）：参考视频本身就在请求里，逐镜复述材质/光效/构图/微动作对模型是重复信息，
+    #    一条 8 镜片子编出 2555 字。
+    #    ⚠️ 别想用 --extra-note 压粒度 —— 实测过：把"只写四块、控制在 700 字"写进 extra_note 重编译，
+    #    8 镜各编出 383–484 字、合并仍是 2555 字、prompt.txt 的 sha8 一个字没变（`200a9509`）
+    #    ⇒ 补充文字压不动【强制输出语法】，只能改系统提示词本身。
+    #    ⚠️ 仍未 A/B：这一档的前提是"wan3.0 能自己从参考视频看懂细节"，这条还没对照验过
+    #    （旁证方向甚至是反的：看图模型会把真实存在的盖子看成"无盖子"）。用户知情后要的就是短稿。
+
     # ③审查腿（Step2 Lint）单独用哪个引擎：空=跟②编译腿同一条。
     #   取值只能是 _compiler_llm 认的四个引擎名：magpie / mimo / grok / gpt。
     #   🔴 故意【不收网关 purpose 名】：`text.complete/mimo` 是经网关扣账的腿，`engine=mimo` 是直连厂商
@@ -257,6 +293,33 @@ class Settings(BaseSettings):
     # 分镜腿用小米哪个型号（engine=mimo 时才读）：空=回落 TEXT_MODEL_MIMO_PRO。
     # 2026-10-22 用户点名 mimo-v2.6-flash ⇒ .env 写 REPLICA_WAN3_STORYBOARD_MODEL=mimo-v2.6-flash。
     REPLICA_WAN3_STORYBOARD_MODEL: str = ""
+    # 🔴 2026-10-30 用户定【禁止用 gemini-3.1-pro 做分镜腿】。分镜腿是全线唯一吃视频的一条，
+    #    而 lant.top 实测把 video_url part 直接过滤（带片与裸问 pt 只差 29–48，模型自述"不支持视频输入"），
+    #    gemini-3.1-pro 这把 key 还回 403 RELAY_101（无额度）⇒ 指它 = 403 死在 Step1 或静默出垃圾分镜。
+    #    逗号分隔的【前缀】；命中的模型名一律在发任何请求之前拒（0 分）。
+    REPLICA_WAN3_STORYBOARD_BANNED_MODELS: str = "gemini"
+    # 🔴 只有列在这里的 host 被【实测证明】能吃 video_url（判据：带片与裸问的 prompt_tokens 差要上千，
+    #    且正文说出只有看片才知道的事实）。lant.top 实测 Δ=29~48、模型自述"不支持视频输入"⇒ 不在名单。
+    #    往这里加一家之前必须先跑那条 Δ 判别，别凭型号名字像就多开一格。
+    # 🔴 2026-10-30 补 lant.top：Δ 判别已跑（裸问 pt=469 → 带片 pt=2416/2590/2631，Δ=1947–2162 > 1000），
+    #    且正文说出只有看片才知道的事实（5 镜结构、3 位不同女性与各自衣着动作、烧录字「霜降」「天气变凉」，
+    #    与本地 ffmpeg scene-detect + 逐帧目视一致）。⚠️ 但这家的"能不能看"是【渠道+模型】这一对的性质，
+    #    不是渠道单边的性质：同一 host 上 mimo-v2.6-flash / -pro 实测 Δ=59（瞎，自述"内容被过滤掉了"），
+    #    只有 nemotron-3.5-vl 能看 ⇒ 名单按 host 收，挡不住"把 model 改回 flash 而 host 留在 lant"这个组合。
+    #    要根治得把名单改成 host+model 对（这条判据的形状不归我改，报给渠道的主人定）。
+    REPLICA_WAN3_STORYBOARD_VIDEO_HOSTS: str = "token-plan-cn.xiaomimimo.com,lant.top"
+    # 🔴 分镜腿送片之前的【body 上限】，形如 `host=字节,…`（2026-10-30 用户拍板"超阈值先降码率再送"）。
+    #    根因不在 key、不在额度：`pipeline/step1_mimo_parse.py:1220` 把【整片 base64 塞进 JSON body】，
+    #    而 lant.top 对 body 里单个字符串的上限是 2000 万字符 ⇒ 一条 29MB/12.03s 的片回
+    #    `400 RELAY_201 body must be valid JSON: String value length (20054016) exceeds the maximum (20000000)`。
+    #    12,000,000 字节 base64 后约 1600 万字符 ⇒ 给 2000 万留了余量（渠道没说是字节还是字符，保守取字节）。
+    # 🔴 为什么按【渠道】列而不是一根全局阈值：这是"这一家的解析器限制"，不是"视频该多大"。
+    #    小米直连实测吃得下 29MB 原片（10-23 那条 6 镜分镜就是原片跑出来的）⇒ 拿一家的限制去降另一家的输入
+    #    质量是白赔。**名单里没有的 host ⇒ 不设上限、原片直送**，别凭猜给人降码率。
+    #    压完为什么还敢用：这一腿自己按 REPLICA_WAN3_MIMO_FPS（现 4fps）采样，29MB/12s ≈ 20Mbps 是纯浪费；
+    #    而"近看才看得清"那部分归【抽帧补充腿】，它看的是从【原片】抽的静图，不是这条有损副本。
+    #    🔴 只换传给分镜腿的那一份：FunASR 仍读原片（口播逐字是音频事实）。
+    REPLICA_WAN3_STORYBOARD_BODY_LIMITS: str = "lant.top=12000000"
     # 看图腿（Step0 素材分析）= 一条【有序链】，每一项是网关 `video.analyze` 的一条 purpose，
     # 串形 `purpose[:试几次],…`；写一条裸名字（老写法 `mimo_pro`）= 只有一条腿的链，行为照旧。
     # 🔴 2026-10-22 夜用户按当晚实测拍的序：qoder 的 Qwen3.8-Flash 主 → opencode 的 mimo-v2.6-flash-free 第二
@@ -270,6 +333,29 @@ class Settings(BaseSettings):
     #       opencode 那三条同理）⇒ 这条链只服务看图，【分镜腿】仍只能小米直连 mimo-v2.6-flash
     #       （当晚正对照：pt 13→3265、逐秒动作与画面文字全读出来了）。
     REPLICA_WAN3_ANALYZE_PURPOSE: str = "magpie_qfmodel:1,magpie_mimo:1,mimo:1"
+
+    # 🔴 抽帧补充腿（Step1 的第二只眼，2026-10-30 用户定"改成这样的流程"）：
+    #    分镜腿看【整片】拿时间轴与动作，但一条 12–15s 片摊到几千 token 里，包装印刷/logo/部件形状
+    #    这类【近看才看得清】的实物事实会糊。参考源 D:\prompt_reverse_8099 的实测：同一道题 8 帧静图
+    #    让模型读，pt 769→5395，读出了视频腿漏掉的叠加卖点文字与正确瓶形 ⇒ 补一腿【看图】而不是换分镜腿。
+    #    这一腿只吃图，所以任何支持图片的腿都行（用户原话"可以用任意支持图片的模型，比如 qoder3.8flash"）；
+    #    默认 magpie_qfmodel = qoder 池的 Qwen3.8-Flash，当晚实测看图为正（认出紫色旋盖 + 读对 jio +
+    #    明写"规格成分本面未见，不按常识补"｜36.1s｜pt 42→2603），且在 config.MAGPIE_VISION_LANES 的 vision 名单首位。
+    #    ⚠️ 免批不免账：预估 6 分/次，实扣按 token —— 8 帧一次【实测 173 分 / 17324 tok / 54.5s】，
+    #    报价与交付读台账 charged，别照预估写；要压代价就减 REPLICA_WAN3_FRAME_COUNT（帧数是 token 主导项）。
+    #    空 = 关掉这条腿（回到只有分镜腿一份事实），交付里会如实显示"抽帧补充未跑"。
+    REPLICA_WAN3_FRAME_PURPOSE: str = "magpie_qfmodel"
+    # 均匀抽几帧喂给它。8099 的判据是 8 帧能读出叠加文字与瓶形；帧数↑ = pt↑ 近线性、单帧细节并不线性变好。
+    REPLICA_WAN3_FRAME_COUNT: int = 8
+    # 思考型视觉腿的正文预算：300 会被 reasoning 吃光（实测 mimo 看 5s 小片正文 0 字），这里给足。
+    REPLICA_WAN3_FRAME_MAX_TOKENS: int = 6000
+    # 🔴 这一腿的代价（2026-10-30 真跑实测，一条 12.03s 扫把片、8 帧一次递进去）：
+    #    预估 6 分（价目按次的档位）→ 【实扣 173 分 = 17324 tok，basis=usage】，墙钟 54.5s。
+    #    ⇒ 它是"整条方案一次"的量级，不是"每段一次"：分段编译复用同一份事实（同一条片每段是同一个产品，
+    #      这一腿补的是"产品长什么样"，不是"这一段发生了什么"）。跑成每段一次 = 40s 的片白烧 519 分。
+    #    所以这里【不设熔断分/段】—— 一条方案只花一次的腿设熔断就是假保险（判据永不生效）。
+    #    要控代价就调 REPLICA_WAN3_FRAME_COUNT（帧数是 token 的主导项，近线性）。
+    #    报价侧的可见性走既有那条：实扣读【素材分析台账合计】，不读预估。
 
     REPLICA_WAN3_CONCURRENCY: int = 3               # N 段并发提交数
     REPLICA_WAN3_RESOLUTION: str = "1080P"          # wan3.0 输出分辨率：默认档 = 网关那条 lane 的主档（名单唯一源 gateway._WAN30_RES_MODEL，现支持 720P/1080P；这里曾写 480P，而那条 lane 物理上没有 480p 档）
@@ -365,44 +451,19 @@ class Settings(BaseSettings):
     VINTED_VIDEO_API_KEY: str = ""
     # （2026-10-08 用户点名移除）xjai.beauty 两条（wan3 / wan3-prime）与 youzan666.vip 三条
     # （wan3-youzan / wan3-youzan-prime / wan3-smart）的 WAN 3.0 字段块连同适配器一起下线。
-    # === api.tianyue.xyz：wan3.0 出片腿（2026-10-16 换芯，替掉 wan3.youzan666.vip 那条）===
-    # 用户 2026-10-16 定："新的api，只接着一个wan3.0到网关上，之前的wan3.0 满血，删除"
-    #   ⇒ PRIME_YZ_*（youzan666 域名+Key 成对换、余额两桶那套）连同 _yz_prime_* 适配器整条删掉。
-    # 契约（渠道方 API 文档 + 0 消耗只读探测核对过，实测细节见 C:\dsh\docs\tianyue-api.md）：
-    #   提交 POST /v1/videos {model,prompt,duration,video_duration,aspect_ratio,resolution,
-    #                          image_urls[],audio_urls[],video_urls[]} → 任务号；轮询 GET /v1/videos/{id}。
-    #   素材只收公网 http/https 外链（本地文件先走 gateway upload）；没有余额口/列表口（都 404）。
-    # 🔴 key 只从 .env 的 TIANYUE_API_KEY 读，源码里不留默认值（全仓明文 key 清零那条纪律）。
-    # ⚠️ 计费口径未实测（文档有按次/按秒两种，模型表无价格字段）；2026-10-16 实测这把 key 余额 ¥0，
-    #    但 2026-10-20 同一把 key 已能真建单（探针里有 2 发 completed）⇒ 账户已充值；
-    #    单价仍然【看不见】（这家没有对账口：/v1/balance 与 GET /v1/videos 都 404）⇒ 只能去渠道后台核。
-    TIANYUE_BASE_URL: str = "https://api.tianyue.xyz"
-    TIANYUE_API_KEY: str = ""
-    # 🔴 2026-10-20 用户定：默认【两条 wan3.0】—— 主 + 兜底 `PIX-Wan30-pro-1080p-1055-se`。
-    #    兜底只在【确定没建上单】时才换（判据 = gateway.wan30_fallback_allowed，白名单里只有 submit_rejected）；
-    #    拿到过任务号 / 结果未知 ⇒ 绝不换第二条，那两种情况再 POST 就是双花（这家没对账口）。
-    #    ⚠️ 事故留痕：今天 .env 曾把本行覆盖成 PIX ⇒ "表单锁 ME、机器实跑 PIX"，已在 .env 改回 ME。
-    # 🔴 2026-10-21 17:2x 用户定：1080P 档主模型换成 `ME-WAN3-prime-1080p-1055`，
-    #    替换掉 `ME-wan30-1080p-1055`（那条当天在现网被渠道回过"上游余额不足/建单失败"，
-    #    另一会话已把 720P 档换成 S-Wan30-prime-720p-1050-se）。⚠️ 新这条【我们还没跑过】⇒
-    #    它的入参合法域是未实测，别照旧模型的规矩假设它能过（时长/媒体上限都未知，先小样本试）。
-    # 🔴 2026-10-22 用户定（推翻 10-21 的"1080P 按段长二选一"）：**超级复刻一条片子里全部走
-    #    `ME-WAN3-prime-1080p-1055`**，短段不许掉进按秒计费的 PIX —— 一条片子里两段用两个模型、
-    #    两种计费口径，画面与账都会漂（用户原话"不然会乱"）。
-    #    实现上不改判据、只【摘掉第二条候选】：`wan30_accepted_models()` 读这两键，
-    #    兜底键留空 ⇒ 候选表只剩一条 ⇒ `wan30_pick_1080p_by_duration()` 两向都回 prime（它本来就
-    #    "表里没有第二条就原样返回，不猜、不从价目里捞第三条"）。要恢复二选一：把本键填回 PIX。
-    TIANYUE_WAN30_MODEL: str = "ME-WAN3-prime-1080p-1055"
-    TIANYUE_WAN30_FALLBACK_MODEL: str = ""
-    # 出网代理：2026-10-20 实测【这台机器直连 api.tianyue.xyz 被 reset】(WinError 10054)，走 127.0.0.1:10808 才通。
-    # 🔴 不配它，超级复刻的出片腿今天一条都发不出去（与模型、与兜底都无关）。
-    # 只在 tianyue 这一条腿内部建 ProxyHandler 用它 ⇒ 不动全局环境变量、不牵连别的项目；
-    # 代价要认：Bearer 会经过本机代理进程（可见、可回滚：把本行清空就回到直连）。
-    TIANYUE_PROXY_URL: str = "http://127.0.0.1:10808"
-    # （2026-10-22 撤掉 TIANYUE_DURATION_MODE 这一键）计费口径不再是一个全局开关：
-    # 一个键管两条不同档本身就是 bug —— 它为按秒那条设成 seconds 之后，按次那条也被按秒发。
-    # 唯一判据换成【模型名尾巴的 -se】（`gateway.wan30_is_per_second()`：-se=按秒传真实秒数，
-    # 无尾巴=按次固定传 1）。⚠️ .env 里若还留着 TIANYUE_DURATION_MODE=seconds 那一行，现在没人读它。
+    # （2026-10-30 用户指令『tianyue 那条 lane 移除』：api.tianyue.xyz 整块字段（TIANYUE_BASE_URL/
+    #   API_KEY/WAN30_MODEL/WAN30_FALLBACK_MODEL/PROXY_URL）连同 gateway 适配器一起拆除 ——
+    #   余额 ¥2.81、503/504 连发，wan3.0 固定走下面 youzan666 那条。.env 里遗留的 TIANYUE_* 行没人读了。）
+    # === 2026-10-30 用户定【wan3.0 固定换这一家】：youzan666.vip 的 Prime 独立工作台 ===
+    # `video.generate/wan3-prime` 从 tianyue 换芯到这里；模型固定一条，不许失败换档（同 10-22 那条口径）。
+    # 契约不是照抄文档，是 0 分只读探出来的：GET /v1/models 回 `wan3.0-video-prime` 参数卡
+    #   （billingUnit=second、prime 720P=0.15 / 1080P=0.20 ⚡每秒、durations 2—30、resolution 只 [720P,1080P]），
+    #   `GET /v1/tasks` 回 {"ok":true,"items":[…]}，`GET /v1/tasks/<乱编号>` 回 400→404 TASK_NOT_FOUND（=0 分判别口），
+    #   而 `GET /v1/videos/generations` 回 404 NOT_FOUND ⇒ tianyue 那套 /v1/videos/* 形状在这家【不存在】。
+    # 🔴 key 只从 .env 的 WAN3_PRIME_YZ_API_KEY 读，源码里不留默认值（全仓明文 key 清零那条纪律）。
+    WAN3_PRIME_YZ_BASE_URL: str = "https://youzan666.vip"
+    WAN3_PRIME_YZ_API_KEY: str = ""
+    WAN3_PRIME_YZ_MODEL: str = "wan3.0-video-prime"
     # === H3 的第二条腿：本机 C:\Minimax-H3 的浏览器 RPA 工作台（8093）===
     # video.generate/h3-rpa 转调它：POST /api/generate → 轮询 /api/status/<id> → 按盘上 mp4 判成败。
     # 它是【登录态型】服务（Playwright 复用 runninghub_profile/，没有 api_key 可验），所以网关不做 HTTP 探活。

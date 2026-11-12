@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend import gateway as gw                      # noqa: E402
 
-REAL_STATE = ROOT / "outputs" / "super_clone_wan3_b51de56b" / "_super_clone_state.json"
+# 真档 = 已编译、未交付的任务（b51de56b 那单 10-23 已真出片，local_path 落盘 ⇒ 不再是"没成片"样本）。
+REAL_STATE = ROOT / "outputs" / "super_clone_wan3_28ba351f" / "_super_clone_state.json"
 
 
 def _offer_fn():
@@ -30,20 +31,35 @@ offer = _offer_fn()
 cases = []
 
 with tempfile.TemporaryDirectory() as td:
-    Path(td, "_submit_plan.json").write_text(json.dumps({"count": 3}), encoding="utf-8")
+    # 🔴 2026-10-30 换芯 yz30 后单价是【分/秒】、实扣预扣每段带真实秒数 ⇒
+    #    有 target_duration：报价 = 单价 × ceil(Σ秒)，与段数无关（Σ秒 已含全部段）；
+    #    没有秒数：退回 meter 的"每段 30 秒上限估"（宁可高报）。
+    Path(td, "_submit_plan.json").write_text(json.dumps({"count": 3, "target_duration": 40}), encoding="utf-8")
     g5 = offer({"prompt": "p", "local_path": None, "status": "FAILED", "output_dir": td})
-    cases.append(("3 段 ⇒ 报价按段乘", g5["segments"] == 3 and g5["total_credits"] == g5["unit_price"] * 3, g5))
+    cases.append(("40 秒 3 段 ⇒ 报价=单价×40（Σ秒口径，不按段重复乘）",
+                  g5["segments"] == 3 and g5["total_credits"] == g5["unit_price"] * 40, g5))
+    Path(td, "_submit_plan.json").write_text(json.dumps({"count": 3}), encoding="utf-8")
+    g5b = offer({"prompt": "p", "local_path": None, "status": "FAILED", "output_dir": td})
+    cases.append(("3 段·秒数未知 ⇒ 按 meter 每段 30 秒上限估",
+                  g5b["segments"] == 3
+                  and g5b["total_credits"] == gw.meter("video.generate", "wan3-prime", {"count": 3})["credits_estimate"], g5b))
 
 if REAL_STATE.is_file():
     real = json.loads(REAL_STATE.read_text(encoding="utf-8"))
     g = offer(real)
-    # 现网 sc_9c246af70384：提交被批准闸拒回（0 分未扣、没建任务）却写着 SUCCESS ⇒ 按钮必须出现，
-    # 否则人只能重新发起一整单（分镜 5 分钟 + 编译 16 分钟重烧）。
+    # 真档 sc_086c1910135f：编译完停住（COMPILED）、盘上没成片 ⇒ 按钮必须出现，
+    # 人点「生成视频」才花钱。
     cases.append(("真档：SUCCESS 但没成片 ⇒ ready", g["ready"] is True, g))
     cases.append(("真档：段数取自 _submit_plan.json", g["segments"] == 1, g))
+    # 真档期望值从它自己的 _submit_plan.json 现算（不硬编码秒数——不同素材时长不同）：
+    # 报价 = 单价 × ceil(target_duration)（实扣口径 = Σ秒×分/秒）。
+    _pj = json.loads((REAL_STATE.parent / "_submit_plan.json").read_text(encoding="utf-8"))
+    _s = float(_pj.get("target_duration") or 0.0) or float(real.get("duration") or 0.0)
+    _sec = int(_s) + (1 if _s > int(_s) else 0)
+    _exp = gw.meter("video.generate", "wan3-prime", {"count": 1, "duration": _sec})["credits_estimate"]
     cases.append(("真档：分数与网关 meter 同源（不硬编码价）",
                   0 < g["unit_price"] == gw.meter("video.generate", "wan3-prime", {"count": 1})["unit_price"]
-                  and g["total_credits"] == g["unit_price"], g))
+                  and g["total_credits"] == _exp, g))
     delivered = dict(real)
     delivered["local_path"] = real["trimmed_path"]
     g2 = offer(delivered)

@@ -181,10 +181,21 @@ def _compiler_llm(engine: str = ""):
             raise RuntimeError("OPENAI_API_KEY 未配置，GPT 编译器无法运行")
         engine = "gpt"
     from openai import OpenAI
+    # 🔴 gpt/grok 两条腿的宿主（hub.nocannobb.com）本机直连会被 reset，只有经本机代理才通。
+    #    代理地址唯一源：REPLICA_WAN3_LLM_PROXY > TIANYUE_PROXY_URL（都留空 ⇒ 维持直连，magpie/mimo 不受影响）。
+    _llm_proxy = (
+        os.environ.get("REPLICA_WAN3_LLM_PROXY", "").strip()
+        or str(getattr(settings, "TIANYUE_PROXY_URL", "") or "").strip()
+    )
+    _http_client = None
+    if _llm_proxy and engine in ("gpt", "grok"):
+        import httpx
+        _http_client = httpx.Client(proxy=_llm_proxy, timeout=180.0)
     return OpenAI(
         api_key=api_key,
         base_url=base_url or "https://hub.nocannobb.com/v1",
         timeout=180.0,
+        http_client=_http_client,
     ), model
 
 
@@ -244,8 +255,13 @@ def _storyboard_lane() -> dict:
     import urllib.parse as _up
     eng = str(getattr(settings, "REPLICA_WAN3_STORYBOARD_ENGINE", "gateway") or "gateway").strip().lower()
     if eng in ("mimo", "xiaomimimo"):
-        base = str(getattr(settings, "MIMO_BASE_URL", "") or "").strip()
-        key = str(getattr(settings, "MIMO_API_KEY", "") or "").strip()
+        # 🔴 分镜腿是全线【唯一吃视频】的一条：中转（lant.top）实测不收视频输入，所以它读
+        #   MIMO_VIDEO_BASE_URL / MIMO_VIDEO_API_KEY（留空才回落 MIMO_*）。host 如实进 provider，
+        #   回执上看得见这条腿实际打的是哪家 —— 别拿"回话了"当"看见了画面"（丢视频是静默的）。
+        base = (str(getattr(settings, "MIMO_VIDEO_BASE_URL", "") or "").strip()
+                or str(getattr(settings, "MIMO_BASE_URL", "") or "").strip())
+        key = (str(getattr(settings, "MIMO_VIDEO_API_KEY", "") or "").strip()
+               or str(getattr(settings, "MIMO_API_KEY", "") or "").strip())
         # 模型名：config 的 REPLICA_WAN3_STORYBOARD_MODEL 优先（2026-10-22 用户点名 flash），
         #   没写才回落 TEXT_MODEL_MIMO_PRO —— 保持"这一腿用哪个模型"只有一个出处。
         mdl = (str(getattr(settings, "REPLICA_WAN3_STORYBOARD_MODEL", "") or "").strip()
@@ -253,7 +269,27 @@ def _storyboard_lane() -> dict:
         if not (base and key and mdl):
             return {"error": "分镜腿=mimo，但 config/.env 缺 MIMO_BASE_URL / MIMO_API_KEY / "
                              "REPLICA_WAN3_STORYBOARD_MODEL(或 TEXT_MODEL_MIMO_PRO)"}
+        # 🔴 禁用族硬拦（2026-10-30 用户点名禁止 gemini-3.1-pro 做分镜腿）：这一腿是全线唯一吃视频的，
+        #    名字落在禁用前缀里就【不发任何请求】直接拒 —— 放行它的两种下场都比报错坏：
+        #    要么 403 无额度死在 Step1，要么上游把 video part 过滤掉、静默产出一份猜出来的分镜再烧 60 分/段。
+        _ban = [x.strip().lower() for x in str(getattr(settings, "REPLICA_WAN3_STORYBOARD_BANNED_MODELS", "")
+                or "").split(",") if x.strip()]
+        if any(str(mdl).lower().startswith(x) for x in _ban):
+            return {"error": "分镜腿模型 %r 落在禁用族（config.REPLICA_WAN3_STORYBOARD_BANNED_MODELS=%r）"
+                             "⇒ 这条腿必须用【真吃视频】的模型，拒发请求（0 分）。"
+                             "正解：把 .env 的 REPLICA_WAN3_STORYBOARD_MODEL 改回 mimo-v2.6-flash，"
+                             "并给能吃视频的渠道（小米直连）配上有额度的 key" % (mdl, ",".join(_ban))}
         host = (_up.urlsplit(base).netloc or base)[:60]
+        # 🔴 渠道也要过"真吃过视频"这道门（2026-10-30 实测：lant.top 把 video_url 过滤掉 ——
+        #    带片与裸问的 prompt_tokens 只差 29~48，模型自述"不支持视频输入"）。放行它的下场是
+        #    【静默出一份猜出来的分镜】，比 403 更坏：后面每段照样烧 60 分/段。
+        #    名单只住 config；往里加一家之前必须先跑那条 Δ 判别（带片与裸问 pt 差要上千）。
+        _ok = [x.strip().lower() for x in str(getattr(settings, "REPLICA_WAN3_STORYBOARD_VIDEO_HOSTS", "")
+               or "").split(",") if x.strip()]
+        if _ok and not any(h in str(host).lower() for h in _ok):
+            return {"error": "分镜腿渠道 %r 不在【实测能吃视频】的名单里（config.REPLICA_WAN3_STORYBOARD_VIDEO_HOSTS=%r）"
+                             "⇒ 拒发请求（0 分）。正解：把 MIMO_VIDEO_BASE_URL 指回名单内渠道并配上有额度的 key；"
+                             "新渠道要先跑 Δ 判别再往名单里加。" % (host, ",".join(_ok))}
         return {"base_url": base, "api_key": key, "model": mdl,
                 "provider": "mimo·%s" % host, "ledger": "off"}
     from backend import gateway as _gw
@@ -380,6 +416,15 @@ def trim_video(
     使用 -ss + -to 精确到关键帧后再重编码（避免丢帧），输出 H.264 + AAC。
     返回 output_path。
     """
+    src = Path(video_path or "")
+    # 🔴 输入不在盘上就先说实话，别把这件事交给 ffmpeg 的退出码去猜（2026-10-23 的现场：
+    #    屏上「failed: Command ... returned non-zero exit status 4294967294」= -2 的无符号写法，
+    #    真相是 `Error opening input: No such file or directory` —— 任务改过名，物料跟着文件夹搬走了，
+    #    而批次账里存的是提交那一刻的绝对路径）。
+    if not src.exists():
+        raise FileNotFoundError(
+            "原片不在盘上，裁不了：%s ⇒ 这一单多半改过名（物料跟着文件夹一起搬走了），"
+            "回「视频池」重跑那一条，路径会按现在的位置算" % str(src))
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     duration = max(0.1, float(end) - float(start))
     cmd = [
@@ -392,7 +437,17 @@ def trim_video(
         "-movflags", "+faststart",
         output_path,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=180)
+    except subprocess.CalledProcessError as e:
+        # `check=True` 会把 stderr 吞进 PIPE ⇒ 只留退出码就是"报错了但没人知道为什么"。
+        raw = e.stderr or b""
+        why = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
+        raise RuntimeError(
+            "裁剪没成（ffmpeg 退出码 %s）：%s ｜ 输入=%s ｜ 区间=%.3f-%.3fs"
+            % (e.returncode, (why[-300:] or "ffmpeg 没写原因"), str(src),
+               float(start), float(end))) from e
     return output_path
 
 
@@ -599,7 +654,10 @@ STEP1_5_GLOBAL_CONSTRAINT = (
     "不得额外生成、改写或杜撰产品外观、结构或标识。"
     "当目标产品图片显示的结构数量、层数、部件数量或几何轮廓与原视频产品不一致时，目标产品图片是唯一的产品几何结构来源；"
     "原视频仅用于继承人物动作、手部运动方向、人物与产品的空间关系、镜头运动和时间节奏，不得从原视频恢复或复制原产品的层数、部件数量、尺寸轮廓或结构布局。"
-    "画面中不得出现字幕、花字、贴纸、账号水印或原片烧录文字；成片默认无字幕、无水印。产品包装上真实印刷文字按产品图保留。"
+    "画面中不得出现字幕、花字、贴纸、账号水印、台标或原片烧录文字；成片默认无字幕、无水印。"
+    "原片里被这些烧录文字占据的区域（画面下方与中部的横条、角落角标）必须用连续的真实画面内容填满："
+    "不得保留原字、不得留黑块/马赛克/半透明遮罩、不得重绘成任何可读或不可读的文字形状（含伪文字、乱码笔画、模糊字块、形似字母的纹理）。"
+    "产品包装上真实印刷文字按产品图保留。"
 )
 
 # ─────────────────────────────────────────────────────────────────
@@ -688,10 +746,10 @@ product_image_paths、model_image_path、scene_image_path 仅用于后端素材�
 - 因为 path 非空就假定图片视觉内容已经可用。
 
 【时间字段边界】
-target_duration = Step 0 唯一权威时间事实。
-Shot 时间只能直接取自 canonical storyboard。
-输出时间字符串必须直接复制 canonical storyboard 的开始时间和结束时间值，不得要求固定小数位，不得做任何时间格式转换。
-Compiler 不得修改 target_duration，不得 snap，不得重新计算任何 Shot 时间。
+target_duration = Step 0 用 ffprobe 实测的唯一权威时间事实；进入本 Compiler 的 storyboard 已由后端 Checkpoint A 验证并 canonicalize。
+Shot 时间只能直接取自 canonical storyboard：输出时间字符串必须直接复制其开始/结束时间值（不要求固定小数位、不做格式转换）。
+Compiler 不得修改 target_duration、不得 snap、不得重新计算任何 Shot 时间，也不负责判断是否回源或修复时间。
+Shot 数量和每个 Shot 时长以原视频实际镜头结构为准，不人为设置上下限。
 
 【最高原则】
 1. storyboard 是**原视频（A产品）**的内容，目标视频按客户明确要求迁移为 B 产品；原视频结构仍是唯一来源。
@@ -860,7 +918,7 @@ GPT 只决定每个 Shot 引用哪个已知 图N，不得重新定义编号归�
 若【图片可用判定】确认 model_image 可用（按 media_manifest 中产品图之后的连续 图N）：
 1. ★**只换脸**：用模特图替换主体人物的脸型、五官、发型、肤色。忽略模特图中的服装与配饰。成片服装只来自产品图。不得用模特图的体型、身材覆盖原视频人物体型。
    - 从模特图提取脸型、眉眼、鼻型、嘴型、发型、发色、肤色，在 Shot prompt 中**显式描述**，并标注「严格按 图N」。
-   - 不得仅用「图N 中的同一位女性」弱引用；弱引用会导致 Wan3.0 保留参考视频原人物面部。
+   - 不得仅用「图N 中的那个人」这类弱引用（不分性别）；弱引用会导致 Wan3.0 保留参考视频原人物面部。
    - 仅在当前 Shot 脸部实际可见时描述五官；仅手部入镜的 Shot 不描述面部。
 2. **同一人物跨 Shot 重复出现时，面部身份保持一致**（同一张脸）；当前 MVP 仅支持单一主要人物。
 3. ★覆盖优先级：有模特图时，模特图只控制面部身份（脸/五官/发型/肤色）；姿态、主动作、手势、运动轨迹、体型轮廓继承原视频。customer_request 仅覆盖明确指定的人物属性。无模特图时完整继承原人物。
@@ -926,7 +984,7 @@ Shot N [start-ends]: 景别, <画面内容>[, <非口播声音>][; "口播文案
 - 景别 = 镜头语言.景别 字段值（保留原视频景别）
 - <画面内容> 必须整合：
   1. 任务4迁移后的场景（有背景文字则按文字写场景；无则继承原场景）。不得引用场景 图N。
-  2. ★任务3迁移后的主体人物；模特图可用且脸部实际出现时：必须包含对应模特 图N，并**显式描述**脸型/眉眼/鼻型/嘴型/发型/发色/肤色，标注「严格按 图N」；不得仅用「图N 中的女性」弱引用，不得用模特图体型覆盖原片。仅手部入镜 Shot 不描述面部。
+  2. ★任务3迁移后的主体人物；模特图可用且脸部实际出现时：必须包含对应模特 图N，并**显式描述**脸型/眉眼/鼻型/嘴型/发型/发色/肤色，标注「严格按 图N」；不得仅用「图N 中的那个人」弱引用（不分性别），不得用模特图体型覆盖原片。仅手部入镜 Shot 不描述面部。
   3. 任务1/2迁移后的目标产品；原商品可见时，包含当前视角匹配的产品 图N；原商品不可见时不得出现目标产品或产品 图N。
   4. 迁移后的商品相关动作 + 原样保留的非商品动作。
   5. storyboard 原构图、运镜、面部微表情和已记录身体微动作。
@@ -974,42 +1032,22 @@ customer_request: 户外露营场景背景
 输出（单行）:
 Shot 1 [00:00.00-00:02.00]: 中景, 户外露营木质桌面上右手从叠放杯子中取出一个顺风顺水航空杯 图1; "家里招待客人，就用这种航空杯" [character1, 语调=平稳];
 
-【时间轴前置条件】
-进入本 Compiler 的 storyboard 已由后端 Checkpoint A 验证并 canonicalize。
-Compiler 不负责判断是否回源、不负责修复时间、不负责 snap。
-若后端发现时间 Contract 不满足，不得调用 Compiler。
-Compiler 只复制 canonical storyboard 的 shot、start、end；时间值直接复制，不要求固定小数位。
-Shot 数量和每个 Shot 时长以原视频实际镜头结构为准，不人为设置上下限。
+⚠️ 上面这段**只演示格式**（单行、时间、景别、口播位、声音属性写法）。示例里的品类（航空杯）、人物、场景（露营桌面）、
+道具与文案**都不是事实源**：本次输出的商品一律取 product_name + 产品图，人物一律取 storyboard 与模特图，
+场景一律取 storyboard（或本次给的背景输入）。不许把示例里的词带进任何一条真实分镜。
 
-【严禁事项】
-❌ 严禁修改非商品相关口播原文（如"姐妹们今天挖到宝了"）
-❌ 严禁修改 storyboard 中的稳定声音属性：语速、语调、情绪（表达强度）、呼吸感
-❌ 重音、停顿仅可因对应商品词语被任务2合法删除或替换而同步删除，不得新增或重新设计
-❌ 严禁修改非商品动作描述
-❌ 严禁脑补产品图上看不见的产品特征
+【严禁事项】只列正文没有对应出处的硬禁令，其余见文末索引。
 ❌ 严禁省略 storyboard 已明确记录的身体微动作（头部微晃/重心转移/手部律动/肩颈律动）
-❌ 严禁新增 storyboard 中不存在的身体微动作或主动作
-❌ 严禁把“无”“未入镜”“看不清”转换成新的动作描述
-❌ 严禁自行新增/删除/合并/重排分镜
-❌ 严禁重新定义 media_manifest 编号归属（后端已固定）
-❌ 严禁输出"参考图/替换/保留原视频"等元指令
-❌ 严禁输出字幕、标题、水印、花字或贴纸；严禁复现原视频烧录的字幕、花字、账号水印。成片默认无字幕、无水印。产品图片中真实存在的包装文字、品牌标识除外，必须按产品图片保留；原视频画面中本就存在的真实文字（包装印刷/品牌标识/店内真实标牌/挂画文字）按原样保留，不属于烧录字幕，不在清除范围。
-❌ 严禁输出推理、分析、检查过程
-❌ 严禁输出 markdown 代码块（```）或 JSON 包装
-❌ 严禁输出标题（如"修正版："、"编译结果："等）
-❌ 严禁跨行输出单个分镜（每个 Shot 必须一行）
-❌ 严禁遗漏 Shot（输入几个分镜就输出几行 Shot）
-❌ **口播段输出规则**：只要迁移后的口播仍有有效可保留内容，就必须输出 `"口播文案" [character1, ...]` 段；character1 永远保留，六项声音属性全部为“无”时输出 `[character1]`。
-❌ 非商品口播必须逐字保留；不得因商品口播被合法删除而遗漏非商品口播内容。
-❌ 若任务2已合法删除全部商品相关口播，则允许省略口播段；非商品口播绝不允许因此遗漏。
-❌ 严禁无依据地随机选择 图N（必须按展示角度/细节语义匹配）
-❌ 严禁把"引用多张商品图共同定义同一商品外观"解释为画面中出现多个商品实例
-❌ 严禁把 图N 当作商品实例数量；画面中目标商品实例数量完全由 storyboard 决定
-❌ 严禁在目标商品完全不可见时引用产品图；目标商品实际可见时必须引用当前视角相关的有效产品 图N
+❌ 严禁自行新增/删除/合并/重排分镜，或改变任何 Shot 时间
+❌ 严禁输出"参考图/替换/保留原视频"这类元指令（描述结果，不要描述你在做什么）
+❌ 严禁输出或复现任何【后期叠加层】文字：字幕、花字、标题、贴纸、账号水印、台标，以及原片里烧录的营销文字。成片要求全画面干净——这些区域必须用连续的真实画面内容填满：不得保留原字、不得留黑块/马赛克/半透明遮罩、不得重绘成任何可读或不可读的文字形状（含伪文字、乱码笔画、模糊字块、形似字母的纹理）。参考视频只用于继承人物动作、手部运动方向、人物与产品的空间关系、镜头运动和时间节奏，**它画面上的文字层不属于要继承的内容**。
+❌ 严禁在逐镜行里描述画面文字（"字幕写着…""屏幕下方显示…""画面带水印"这类）：抄进 prompt 等于把那行字又喂回模型。清除由后端固定文本负责，你不用处理。
+⚠️ 两类**真实物理文字**不算叠加层、按事实保留（别把它们当"干净"的敌人）：① 目标产品包装上真实存在的印刷文字与品牌标识，按产品图保留；② 原片场景内物理存在的文字（店内标牌、挂画、包装堆头）按原样继承，不得新增、不得放大、不得改写。除这两类之外，画面里一律不许出现文字。
+↩ 其余禁令不在这里重复（非商品口播逐字、稳定声音属性、不新增微动作、"无/未入镜"不转描述、不重新定义 media_manifest 编号、图N 不代表实例数、不可见镜不引产品图、单行输出、不遗漏 Shot、不输出解释与 Markdown）——**正文对应节是唯一出处，违反任一条同样直接判失败**。
 
 【后置约束段】
 所有分镜行之后，必须追加以下固定单行字符串，内容必须与该字符串 exact match：
-仅在对应 Shot 原商品实际可见时生成目标产品，并将该 Shot 中所有原商品实例替换为目标产品，禁止保留原商品外观；原商品不可见的 Shot 不新增目标产品。目标产品实际出现时，产品图片中真实存在的包装文字、品牌标识或产品印刷元素按产品图片保留；不得额外生成、改写或杜撰产品外观、结构或标识。画面中不得出现字幕、花字、贴纸、账号水印或原片烧录文字；成片默认无字幕、无水印。产品包装上真实印刷文字按产品图保留。
+{{GLOBAL_CONSTRAINT}}
 
 【输出严格约束（违反任一条直接判失败）】
 1. 只输出编译后的 prompt 正文，不要任何前言、后记、解释、分析
@@ -1021,7 +1059,7 @@ Shot 数量和每个 Shot 时长以原视频实际镜头结构为准，不人为
 7. 禁止输出"以下是""编译结果""修正版"等引导词
 8. Shot 数量必须与输入 storyboard 的 shot 数量一致
 9. **目标商品可见 Shot 必须引用当前视角相关的有效产品 图N**；不要求所有上传产品图全部出现在 Prompt
-10. ★**模特图必须被引用且必须显式描述面部身份**：若图片可用判定确认模特图可用，所有「主体人物脸部实际出现」的 Shot 必须引用对应模特 图N，并显式描述脸型/眉眼/发型/肤色，标注「严格按 图N」；不得仅用「图N 中的女性」弱引用。仅手部入镜 Shot 不描述面部。模特图不控制衣服和体型。
+10. ★**模特图必须被引用且必须显式描述面部身份**：若图片可用判定确认模特图可用，所有「主体人物脸部实际出现」的 Shot 必须引用对应模特 图N，并显式描述脸型/眉眼/发型/肤色，标注「严格按 图N」；不得仅用「图N 中的那个人」弱引用（不分性别）。仅手部入镜 Shot 不描述面部。模特图不控制衣服和体型。
 11. **换背景只走文字**：有背景文字时按文字写场景，不得引用场景 图N；无背景文字时继承原场景。
 12. 最终完整 Prompt 长度不得超过 20000 字符，包括全部 Shot 行、换行符和后置约束段。
     若信息较多接近上限：优先压缩重复视觉描述；不得删除 Shot、受保护的非商品口播、必要 图N、原视频核心动作、运镜、转场或声音信息，不得修改时间。
@@ -1035,6 +1073,103 @@ Wan3 成片跟原片声音，口播不得改写。
 **只输出 prompt 正文本身。第一字节必须是 S。每个 Shot 必须单行。**
 """
 
+# 🔴 正文【后置约束段】那一节里的示例尾行，由常量本身注入（占位符 `{{GLOBAL_CONSTRAINT}}`）。
+#    为什么不许手抄：2026-10-23 现网漂过一次 —— 常量已升级成"负向 + 正向填充 + 反伪文字"，
+#    正文示例还留着 10-22 的短版 ⇒ 模型照正文复述、后端再钉回常量，提示词自己跟自己矛盾，
+#    而"尾行必须 == 常量"那道校验比的正是模型抄回来的那份，**看不见正文里写着另一份** ⇒ 谁都不会红。
+STEP1_5_SYSTEM_PROMPT = STEP1_5_SYSTEM_PROMPT.replace("{{GLOBAL_CONSTRAINT}}", STEP1_5_GLOBAL_CONSTRAINT)
+
+# 🔴 输出粒度收紧节：压在【强制输出语法】后面，靠"后写的覆盖先写的"生效。只动**输出粒度**，
+#    四类事实一个字不松：台词位逐字 / 负向锁定 / 产品几何以图为准 / 图N 引用不越界。
+#    2026-10-23 用户定：只此一档，不留 fine/coarse 开关（"怎么还搞一个粗档和细档，直接按粗档不就好了"）。
+COMPILE_COMPACT_BLOCK = """
+
+【输出粒度收紧：本节优先于上面所有"必须整合/必须显式描述/必须逐镜写满"的要求】
+与上文冲突时一律以本节为准。上面【口播】那一节【不冲突，仍然全部照做】。
+
+一、你【只输出逐镜行】，全文（不含后端补的两段固定文本）目标 ≤900 字：
+   全局替换声明、包装文字与几何这两块**由后端固定文本各补一份，你不要写**——
+   逐镜编译时你每一镜都写一份，合并层合不掉措辞各异的重复块，只会把稿子撑长（2026-10-23 实测：
+   逐镜行 153 字/镜，总长反而从 2291 涨到 3124）。你写了也一律丢弃。
+1) 逐镜行（每个 Shot 仍必须单行；Shot 数与 storyboard 一致；时间区间原样复制，不得重算）：
+   Shot N [start-ends]: 景别, 一句话动作; "口播逐字" [character1];
+   - 一句话动作 ≤30 字，只写"谁在做什么"。
+   - 不得写材质、光泽、反光、氛围、光比、构图占比、景深、微表情、手指/肩颈等微动作——参考视频里都有，复述它们对模型是噪声。
+   - 不得逐镜重复产品外观与包装描述（不写"瓶身/面料/机身"这类具体形态词，形态以产品图为准）；只有该镜产品实际可见时，写一次「产品（图N）」即可。
+   - 转场：Shot N（N≥2）当 storyboard 记硬切时只写 Hard cut transition，不写转场散文。
+   - 声音属性一律省略，只输出 [character1]（成片声音跟原片，不靠属性描述）。
+2) 行之后由后端追加两份固定文本（你不写、不重复、不改写）：全局替换声明 + 后置约束段（含负向锁定）。
+   最后一行仍是那句固定的后置约束文本，逐字照后端给的版本。
+
+二、下面三件事仍然不许省（优先于上面任何字数限制）：
+- 每个 Shot 引号内的口播逐字。
+- 产品实际可见的那一镜必须引用对应产品 图N；不可见的 Shot 不得出现产品。
+- 主体人物脸部实际出现的那一镜引用模特 图N 一次并写「严格按 图N」，不再逐项描述五官。
+
+三、逐镜行里【不许出现任何关于画面文字的描述】：不写"字幕写着…"、不写"花字/角标/水印"、不复述原片屏幕上的任何一句话，
+   也不得为了说明"要去掉字幕"而把字幕内容抄进稿子（抄进去就等于把那行字又喂回模型）。
+   清除烧录文字这件事由后端固定文本负责，你不用在逐镜行里处理。
+"""
+
+# 🔴 分镜腿 Step 1 同样要压：编译要的"一句话动作"，如果 1.0 交下来的是 40 字光影散文，
+#    1.5 只会照着写满 —— 噪声是从源头灌进来的，只在出口压等于让两个模型互相拉扯。
+#    顺带这一版才是真治截断：2026-10-23 现网那条 `finish_reason=length, content 5313 字符` 就截在逐镜散文上，
+#    而 step1 的 token 预算写死在 BOUNDARY 保护文件里（只调不改，改不了）⇒ 能动的只有"每格写多长"。
+STORYBOARD_COMPACT_BLOCK = """
+
+====================
+【超级复刻·输出粒度收紧（只此一档）】与上文冲突时以本节为准（本节排在最后）。
+本节只压【描写长度】：不改 Schema、不改 Shot 数、不改时间轴、不改任何判定值。
+====================
+
+一、下面这些一格都不许短化、不许省、不许换成"无"（它们是下游的判定输入，不是描写）：
+- `shot` 与「时间区间」三格：格式与覆盖完全照上文【时间序列化规则】。
+- 「人物与产品.产品」：主体原商品可见就写它的**类别称呼**（如"按压泵瓶装按摩油"），不可见仍严格填"无"。
+  这一格是下游判断"哪几镜能让目标产品入画"的唯一依据，写成"无"以外的含糊值都不行；不要在格子里写颜色、材质、标签文字。
+- 「画面动作.产品动作」「商品交互.交互方式/交互部位/营销功能」：营销功能照上文客观枚举选值，
+  其余三格各 ≤8 字；但**动作真实存在就不许为了省字填"无"**（产品="无"的镜仍按【固定空值规则】五格全"无"）。
+- 「镜头语言.景别」「镜头语言.转场衔接」：照上文取值（硬切/淡入/遮挡转场/无/看不清），不许换成别的说法。
+- 「口播」：逐字，一个字都不许改、不许概括、不许删；这一格永远优先于下面任何字数上限。
+- 「声音语气.情绪」：仍然只能填 强/中/弱/无（下游校验器硬判）。
+
+二、下面这些是本档要压短的，每格给硬上限（超了就是不合格，按上限重写而不是删掉事实）：
+- 「场景环境.场景」≤10 字（地点名词即可，如"卧室床上"）；「背景细节」≤12 字（只列主要家具/墙面）；「光影设定」≤8 字（如"柔和自然光"）。
+- 「人物与产品.人物」≤14 字：只写谁/哪些身体部位入镜 + 实际穿着，不写肤色肤质评价、不写观感。
+- 「画面动作.画面内容」≤20 字：只写"谁对什么做什么"，禁止材质、颜色、光泽、反光、氛围、构图占比、景深。
+- 「画面动作.人物动作」≤15 字；顺序动作可以连着写（"拿起→打开→放回"），但每个动作短语 ≤6 字。
+- 「镜头语言.构图」≤8 字；「运镜」≤8 字（如"静止""轻微推近"）。
+- 「音效」≤6 字。
+- 「面部微表情」四格、「身体微动作」四格：未入镜/看不清照上文填；确实入镜时每格 ≤8 字，只写那一个可见变化。
+- 单个 Shot 的 JSON 文本目标 ≤150 字。
+
+三、不许拿"压短"当漏信息的理由：
+- 上限压缩的是**修饰语**，不是事实；"被操作的是什么、做了什么、什么时候、切没切"四样必须在。
+- Shot 数量与切分依据完全按上文【Shot 切分规则】，不许因为要写短就少切一镜。
+- 所有叶子字段仍然必须是非空字符串（不得因压缩出现空串、null、"-"）。
+"""
+
+
+def step1_5_system_prompt() -> str:
+    """编译器系统提示。全仓只有这一处出口，别在调用点再拼一份。
+
+    🔴 2026-10-23 起【没有粒度开关】：收紧节是无条件拼在后面的。原来那个
+       `REPLICA_WAN3_PROMPT_GRANULARITY`（fine|coarse）已整条删除 —— 一个只有默认值的开关
+       不是配置，是第二个入口（用户原话"怎么还搞一个粗档和细档，直接按粗档不就好了"）。
+    """
+    return STEP1_5_SYSTEM_PROMPT + COMPILE_COMPACT_BLOCK
+
+
+def prompt_revision(target_duration: float, split_mode: str) -> str:
+    """两条模型腿【当场要发出去】的系统提示词的指纹（纯本地，0 模型 0 分）。
+
+    🔴 为什么自己算 sha256 而不用 `skill_contract.sha8`：那个 helper 的入参是【文件路径】
+       （`open(path,'rb')`），喂一段正文会落到 except 分支、恒回 "unreadable" ⇒ 指纹变成一个常数，
+       "提示词改版"这件事在缓存上完全看不见 —— 而 prompt_rev 存在的唯一理由就是让改版必然不命中。
+       2026-10-23 现网形状：给系统提示词加粗档覆盖节后重编译，日志打"复用编译产物"、prompt.txt 被原样回写。
+    """
+    _t = step1_5_system_prompt() + _storyboard_system_prompt(float(target_duration), split_mode)
+    return hashlib.sha256(_t.encode("utf-8")).hexdigest()[:8]
+
 
 async def step1_5_compile_prompt(
     storyboard: List[Dict[str, Any]],
@@ -1046,6 +1181,7 @@ async def step1_5_compile_prompt(
     scene_image_path: Optional[str],
     product_name: str = "",
     product_facts: Optional[str] = None,
+    frame_facts: Optional[str] = None,
     extra_compile_note: Optional[str] = None,
     extra_model_image_paths: Optional[List[str]] = None,
     background_override: Optional[str] = None,
@@ -1199,6 +1335,12 @@ async def step1_5_compile_prompt(
         "\n调用方必须保证 product_name 与 product_image_paths 表示同一个目标商品/SKU；若明显不一致，属于上游输入错误，不得进入正常编译。"
         "\n同一 prompt 内产品名必须跨 Shot 一致。"
     )
+    # 🔴 抽帧补充事实（Step1 第二只眼，2026-10-30 用户定"改成这样的流程"）：放在 storyboard 之前、
+    #    产品名之后 —— 它只校正【实物细节】，权重不能盖过客户指定的产品名，也不能碰时间轴与台词。
+    #    由 frame_fact_block() 生成（里面自带"叠加层只登记、绝不复现"那条禁令）；这一腿没跑成 ⇒ 空串，
+    #    编译器照旧只看分镜，不假装补过。
+    if frame_facts and str(frame_facts).strip():
+        text_parts.append("\n" + str(frame_facts).strip())
     text_parts.append(f"\n待编译的 storyboard JSON:\n{storyboard_json}")
     text_parts.append("\n" + _visibility_timeline_text(storyboard))
     if extra_compile_note and extra_compile_note.strip():
@@ -1258,7 +1400,7 @@ async def step1_5_compile_prompt(
         messages=[
             {
                 "role": "system",
-                "content": STEP1_5_SYSTEM_PROMPT,
+                "content": step1_5_system_prompt(),
             },
             {"role": "user", "content": content_list},  # type: ignore
         ],
@@ -1481,8 +1623,53 @@ def _is_constraint_line(text: str) -> bool:
     return t.startswith("仅在对应 Shot 原商品")
 
 
-def merge_compiled_shot_prompts(prompts: List[str]) -> str:
-    """把逐镜编译的 prompt 拼成一条，只保留一份后置约束。"""
+def compact_global_block(product_name: str, media_manifest: List[Dict[str, Any]]) -> str:
+    """【全局替换声明】由后端固定文本出一次，不逐镜让模型重写。
+
+    🔴 为什么搬到代码里（2026-10-23 A/B 实测）：管线是"逐镜编译再合并"，8 镜 = 8 次独立调用，
+       每次都按提示词要求写一份全局声明，措辞还各不相同（"全局替换声明：…" / "全局：…" / "产品：…"），
+       合并层按整行去重根本合不掉 ⇒ 逐镜行 153 字/镜（比细档短 34%），总长反而从 2291 涨到 3124。
+       一句话：这句话不是语言模型该产出 8 次的东西 —— 它是常量，常量该由代码写一次。
+    ⚠️ 图N 一律从 media_manifest 现读（编号归属是 Step 0 后端定的），这里不硬编码"图1/图2"。
+    """
+    nums: Dict[str, List[int]] = {"product": [], "model": [], "scene": []}
+    for item in media_manifest or []:
+        match = re.search(r"(\d+)", str(item.get("image_id") or ""))
+        kind = str(item.get("type") or "").strip().lower()
+        if match and kind in nums:
+            nums[kind].append(int(match.group(1)))
+    prod = "、".join("图%d" % n for n in nums["product"]) or "产品图"
+    line = ("【全局替换】原片中出现的一切商品、包装、容器一律替换为目标产品「%s」（%s）；"
+            "原商品的外观、层数、部件数量一律不得保留，也不得从原视频恢复。"
+            % (str(product_name or "").strip() or "目标产品", prod))
+    if nums["model"]:
+        # 🔴 不写死性别、不写死"服装"：这条腿要能跑 3C/食品/家居/工具/宠物…很多片子主体是手、是脚、
+        #    是男性或儿童；而"衣服只来自产品图"只对穿戴类成立，非穿戴类要说的是"拿在手里的东西按产品图"。
+        line += ("原片中的主体人物一律替换为模特（%s），肤色、脸型、发型严格按该图，不分性别与年龄段；"
+                 "人物穿戴或手持的商品外观只来自产品图，不从模特图继承服装、配饰、道具或背景。"
+                 % "、".join("图%d" % n for n in nums["model"]))
+    line += ("产品包装上真实存在的文字与标识按产品图原样保留，不得改写、省略、杜撰或补全；"
+             "产品图是唯一几何结构来源。")
+    line += ("其余全部锁死参考视频：镜头运动、景别、构图、背景、道具位置、动作节奏、总时长、"
+             "口播时间轴一律照原片，不新增镜头、不改机位。")
+    # 🔴 去文字水印这一条只写一次（写在后端固定块里，比逐镜写 8 遍有效）：
+    #    2026-10-14 实测原片烧录字幕会被 wan3【重新渲染成伪文字】而不是像素拷贝 ⇒ 光说"不得出现"不够，
+    #    必须同时给"那块区域拿什么填"的正向指令，否则模型自己补一堆乱码笔画。
+    #    ⚠️ 强度边界照实说：这句能压住"再画一遍字"，擦不掉参考片里已有的字 —— 真要干净只能换无字幕源
+    #    或走 `video.edit/dewatermark`（那要先登记成合同步）。
+    line += ("原片烧录的字幕、花字、贴纸、账号水印、台标一律不带入成片：被它们占据的区域用连续的真实画面内容填满，"
+             "不得保留原字、不得留黑块/马赛克/半透明遮罩、不得重绘成任何可读或不可读的文字形状"
+             "（含伪文字、乱码笔画、模糊字块）。产品包装上真实存在的印刷文字按产品图保留。")
+    return line
+
+
+def merge_compiled_shot_prompts(prompts: List[str], compact_global: Optional[str] = None) -> str:
+    """把逐镜编译的 prompt 拼成一条，只保留一份后置约束。
+
+    `compact_global` 给了 ⇒ 只留 `Shot N` 行，全局声明由后端补一份放在 Shot 行之后、
+    约束行之前 —— 这样"第一字节必须是 S"仍然成立，而 8 份措辞各异的全局块不再进稿。
+    不给 ⇒ 逐字照原样拼（现在两处调用都给；这一支只留给单测）。
+    """
     lines: List[str] = []
     for raw in prompts:
         body = (raw or "").strip()
@@ -1492,6 +1679,13 @@ def merge_compiled_shot_prompts(prompts: List[str]) -> str:
             text = line.strip()
             if text and not _is_constraint_line(text):
                 lines.append(text)
+    if compact_global and str(compact_global).strip():
+        _g = str(compact_global).strip()
+        # 宽松判据：只要求行首是 "Shot"（不用 _SHOT_HEAD_RE 那种"必须带 [时间] 和冒号"的严判 ——
+        # 严判一旦不匹配就把那一镜整行删掉 = 漏镜，而漏镜是唯一必须出声的错误）。
+        # 兜底在调用点后面：`validate_prompt_time_against_storyboard` 会逐镜比时间轴，缺镜直接抛。
+        lines = [l for l in lines if l.startswith("Shot")]
+        lines.append(_g)
     lines.append(STEP1_5_GLOBAL_CONSTRAINT)
     return "\n".join(lines)
 
@@ -1687,14 +1881,15 @@ _QUOTED_ONLY_RE = re.compile(r'"[^"]*"\s*(?:\[[^\]]*\])?')
 
 
 def _voice_block_from_shot(shot: Dict[str, Any]) -> str:
-    voice = shot.get("声音语气") or {}
-    attrs = []
-    for key in ("语速", "语调", "重音", "停顿", "情绪", "呼吸感"):
-        value = str(voice.get(key) or "").strip()
-        if value and value not in {"无", "none", "None"}:
-            attrs.append(f"{key}={value}")
-    if attrs:
-        return "[character1, " + ", ".join(attrs) + "]"
+    """台词位后面那个声音标记 —— 只回 `[character1]`，六项声音属性（语速/语调/重音/停顿/情绪/呼吸感）
+    一律不再塞进 prompt。
+
+    🔴 为什么后端要压这一处（2026-10-23 A/B 实测）：这一格是【后端】在 force_verbatim_speech 里
+       逐镜拼上去的，编译器提示词写得再狠也管不到它 ⇒ 只改提示词，每行末尾照样带
+       `[character1, 语速=中等, 语调=…, 重音=…, 停顿=…, 情绪=…, 呼吸感=…]`。
+       成片声音跟原片，这六项对 wan3 就是噪声。
+    ⚠️ 原来这一刀绑在 fine/coarse 开关上（细档照旧全出）。开关已整条删除 ⇒ 这里也只有一档。
+    """
     return "[character1]"
 
 
@@ -1962,6 +2157,441 @@ def extract_still_frame(video_path: str, timestamp: float, output_path: str) -> 
     if not out.exists() or out.stat().st_size <= 0:
         raise RuntimeError(f"抽帧失败: {output_path}")
     return str(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1 的【第二只眼】：抽帧补充腿（2026-10-30 用户定"改成这样的流程"）
+#
+# 分镜腿看整片，拿到的是时间轴 + 动作 + 镜头；一条 12–15s 片摊进几千 token 里，
+# 「包装上印的是什么字」「这个部件是什么形状」这类【近看才知道】的实物事实会糊。
+# 参考源 D:\prompt_reverse_8099 的实测：同一条题改成 8 帧静图一次递进去，
+# pt 769→5395，读出了视频腿漏掉的叠加卖点文字与正确瓶形。
+# ⇒ 补一腿【看图】（任何支持图片的模型都行，用户点名 qoder 的 Qwen3.8-Flash），
+#   而不是把分镜腿换成看图模型 —— 时间轴与逐秒动作只有吃视频的腿给得出来。
+#
+# 🔴 两条边界（改之前先想清楚）：
+#  1) 这一腿的产出【不进 storyboard 的字段】，只作为一段带标题的事实块喂给 Step 1.5 编译器。
+#     直接改写 storyboard 会撞上 7 个下游消费者（合并/台词位/时间轴校验/Lint/回执…）与
+#     「画面内容 ≤20 字、不许写材质颜色」那套字数合同。
+#  2) 【叠加层】那一节（原片后期盖的字幕/花字/水印）只登记、绝不并回画面描述 ——
+#     step1 的系统提示词就明令「不许把字幕原文写进 画面动作.画面内容 / 场景环境.背景细节 / 音效，
+#     下游编译器会把它复述进 prompt」。并回去等于亲手把要清掉的东西塞进成片。
+# ─────────────────────────────────────────────────────────────────────────────
+
+def frame_fact_question(count: int) -> str:
+    """抽帧腿的题面（纯函数 ⇒ 缓存指纹含它的 sha8，改题面会让旧物证自动失效）。"""
+    return (
+        "这是同一条短视频按时间均匀抽出的 %d 帧，顺序=时间顺序（第 1 帧最早）。只回答下面两节，别的都不许写。\n"
+        "【实物】逐帧一行，只写这一帧里【真实存在于拍摄场景中的物体】：产品/道具的类别、形状、颜色、材质，"
+        "以及包装或牌子上【印刷】的文字与标识（逐字抄；读不清就写「读不清」）。"
+        "只写画面里看得见的，不许按常识补画面外的东西，不许推测规格与功效。\n"
+        "【叠加层】把后期盖在画面上的文字（字幕/花字/标题/贴纸/台标/账号水印）逐字列出，"
+        "并注明大致位置（画面上方/中部/下方横条/左上角等）；一帧都没有就写「无」。\n"
+        "两节之外不许给建议、不许写镜头语言、不许改写台词。" % int(count)
+    )
+
+
+def parse_frame_facts(text: Any) -> Dict[str, List[str]]:
+    """把答文切成 {object: [...], overlay: [...]}。认不出标题 ⇒ 整段进 object 并出声（不静默丢）。
+
+    🔴 为什么"认不出也收"：这一腿是补充事实，题面答歪了不该让整条管线停；
+       但"整段并进实物节"必须看得见（uncertain=True），否则人审时会把没分级的内容当已核对过。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return {"object": [], "overlay": [], "uncertain": True}
+    low = raw.replace("【", "[").replace("】", "]")
+    oi, fi = low.lower().find("[实物]"), low.lower().find("[叠加层]")
+    if oi < 0 and fi < 0:
+        return {"object": [ln.strip(" -•\t") for ln in raw.splitlines() if ln.strip()],
+                "overlay": [], "uncertain": True}
+    def _seg(s: str) -> List[str]:
+        out = []
+        for ln in s.splitlines():
+            ln = ln.strip(" -•\t")
+            if ln and not ln.lower().startswith(("[实物]", "[叠加层]")):
+                out.append(ln)
+        return out
+    if oi >= 0 and (fi < 0 or fi > oi):
+        obj = _seg(low[oi + len("[实物]"):fi if fi > oi else None])
+        ovl = _seg(low[fi + len("[叠加层]"):] if fi >= 0 else "")
+    else:
+        ovl = _seg(low[fi + len("[叠加层]"):])
+        oi2 = low.lower().find("[实物]", fi)
+        obj = _seg(low[oi2 + len("[实物]"):] if oi2 >= 0 else "")
+    return {"object": obj, "overlay": ovl,
+            "uncertain": bool(ovl) and not obj and False}
+
+
+def read_frame_facts(out_dir: str) -> Optional[Dict[str, Any]]:
+    """只读盘上那份 `frame_facts.json`（0 分、0 调用）；没有或读不动 ⇒ None。
+
+    为什么要有这个只读口：`--reuse-compile` 那一档【不该为复用产物再花一遍分】，
+    但它算编译指纹时必须知道"上一次编译看见的是哪份抽帧事实" —— 不读就会拿 None 去比真值，
+    每次复用都假失配、把 60 分那一刀前面又多烧一次编译。
+    """
+    p = Path(out_dir) / "frame_facts.json"
+    if not p.is_file():
+        return None
+    try:
+        r = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                                            # noqa: BLE001
+        return None
+    return r if isinstance(r, dict) else None
+
+
+def frame_fact_block(facts: Optional[Dict[str, Any]]) -> str:
+    """喂给 Step 1.5 的那一节文本；没跑成 ⇒ 空串（编译器照旧只看分镜，不假装补过）。"""
+    if not facts or not facts.get("ran"):
+        return ""
+    obj = [str(x).strip() for x in (facts.get("object_facts") or []) if str(x).strip()]
+    ovl = [str(x).strip() for x in (facts.get("overlay_text") or []) if str(x).strip()]
+    if not obj and not ovl:
+        return ""
+    lane = str(facts.get("lane") or "没记")
+    lines = [
+        "【抽帧复核事实（Step1 第二只眼：原视频均匀抽 %s 帧，腿=%s）】" % (facts.get("frame_count"), lane),
+        "★用途只有一个：校正【实物细节】——产品/道具的类别、形状、颜色、材质、包装上印刷的文字与 logo。",
+        "★与 storyboard 冲突时，以上面这些【近看才看得清】的实物事实为准；但不得因此改动时间轴、"
+        "镜头顺序、景别、运镜、动作、口播与「口播」引号内的任何字。",
+        # 🔴 分段复刻时同一份事实会喂给每一段：帧是【整片均匀取样】的，某一段的窗口里未必有这些画面。
+        #    不写这句，编译器会拿"第 8 帧有沙发缝"去给 0-15s 那段编一个本段没有的场景。
+        "★这些帧取自【整片】，按时间均匀铺开：本段窗口之外出现的画面也在里面。只用它认【产品长什么样】，"
+        "不要用它推断本段里出现了什么物体、在什么位置。",
+        "★这些是【原视频帧上的事实】，不是客户给的新素材：目标产品仍以产品图与上面客户指定产品名为准，"
+        "不许把帧里的原商品当成品商品，也不许由这些帧补出画面外没有的部件、规格或功效。",
+    ]
+    if obj:
+        lines.append("— 实物（逐帧）：")
+        lines += ["  %s" % x for x in obj]
+    if ovl:
+        lines.append("— 原片叠加层文字（这些是后期盖上去的，成片要求全画面干净）：")
+        lines += ["  %s" % x for x in ovl]
+        lines.append("  ★上面这些字【只登记、绝不复现】：严禁写进任何可渲染画面描述字段"
+                     "（画面内容/背景细节/音效/字幕位），严禁要求保留、打码、遮挡或重绘成文字形状；"
+                     "清除它们由后端那段固定负向锁定负责，本字段不新增指令。")
+    return "\n".join(lines)
+
+
+def frame_facts_pass(video_path: str, out_dir: str, target_duration: float,
+                     on_log: Optional[Callable[[str], None]] = None,
+                     force: bool = False, source_sha8: str = "",
+                     window: Optional[List[float]] = None) -> Dict[str, Any]:
+    """Step 1 之后的抽帧补充：抽 N 帧 → 一次多图请求 → 落 `frame_facts.json`。
+
+    🔴 一次请求给多帧（不是 N 次单图调用）：8 次单图 = 8 份预估、8 次墙钟（qfmodel 实测一次 36s ⇒ 5 分钟），
+       而且帧与帧的关系只有【同一次请求里】才比得出来（同一件产品在第 2 帧和第 7 帧是不是同一个东西）。
+    🔴 走 `gateway.invoke("video.analyze")`：免批但不免账，预扣/结算/素材分析台账（带 hold_id）全在这一条路上。
+       近路（直接 import analyze_media）2026-10-12 已经被封过一次，别再开第二条。
+    🔴 缓存按【原片 sha8 + 裁剪窗口 + 腿 + 帧数 + 题面 sha8】判：命中就复用（0 分）。
+       非确定性的腿不许靠再抽一次修 —— 重编译（--extra-note）那一路每次都重新抽一遍就是白烧一遍分。
+    失败 ⇒ 只记 error 并如实出声，返回 ran=False：这一腿是【补充】，它挂了不该把整条管线停掉，
+       更不该让交付文案把"没看过的细节"说成"看过了"。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    purpose = str(getattr(settings, "REPLICA_WAN3_FRAME_PURPOSE", "") or "").strip()
+    count = max(2, int(getattr(settings, "REPLICA_WAN3_FRAME_COUNT", 8) or 8))
+    budget = max(600, int(getattr(settings, "REPLICA_WAN3_FRAME_MAX_TOKENS", 6000) or 6000))
+    out = Path(out_dir)
+    fp_json = out / "frame_facts.json"
+    question = frame_fact_question(count)
+    import hashlib as _h
+    try:
+        vid_sha8 = _h.sha256(open(video_path, "rb").read()).hexdigest()[:8]
+    except Exception:                                            # noqa: BLE001
+        vid_sha8 = ""
+
+    report: Dict[str, Any] = {
+        "ran": False, "video": str(video_path), "video_sha8": vid_sha8,
+        # 🔴 缓存的【身份】用 source_sha8 + window，不用那份裁好的片文件的 sha8：
+        #    `trim_video` 是重编码，mp4 封装里带 creation_time ⇒ 同一条片同一段窗口每次裁出来的字节都不一样，
+        #    拿裁片的哈希当键 = 每次重编译都判"不是同一条" ⇒ 白烧一遍 173 分，而 `--stage compile`
+        #    在合同里承诺的是"重编译 0 分、不烧 Wan"。source 是裁之前的原片，窗口是裁的参数，两个都稳。
+        "source_sha8": str(source_sha8 or vid_sha8),
+        "window": [float(window[0]), float(window[1])] if window and len(window) >= 2 else None,
+        "target_duration": round(float(target_duration or 0), 2),
+        "purpose": purpose, "lane": "没记", "frame_count": count,
+        "frames": [], "object_facts": [], "overlay_text": [], "uncertain": False,
+        "raw_text": "", "credits": {}, "error": None, "note": "",
+        "question_sha8": _h.sha256(question.encode("utf-8")).hexdigest()[:8],
+    }
+    if not purpose:
+        report["note"] = "REPLICA_WAN3_FRAME_PURPOSE 是空的 ⇒ 这一腿【没跑】，交付只有一份分镜事实"
+        log("· 抽帧补充腿：开关是空的 ⇒ 跳过（0 分）")
+        fp_json.parent.mkdir(parents=True, exist_ok=True)
+        fp_json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        return report
+
+    def _cached_ok(r: Dict[str, Any]) -> bool:
+        # 旧物证没有 source_sha8 那几年 ⇒ 退回比 video_sha8（同一条文件的哈希），别把合格的旧证据判废
+        _ident = (r.get("source_sha8") or r.get("video_sha8")) == report["source_sha8"]
+        _win = (r.get("window") or None) == (report["window"] or None)
+        return bool(r.get("ran") and _ident and _win
+                    and r.get("purpose") == purpose and int(r.get("frame_count") or 0) == count
+                    and r.get("question_sha8") == report["question_sha8"]
+                    and all(Path(f.get("path") or "").is_file() for f in (r.get("frames") or [])))
+
+    if not force and fp_json.is_file():
+        try:
+            _old = json.loads(fp_json.read_text(encoding="utf-8"))
+        except Exception:                                        # noqa: BLE001
+            _old = {}
+        if _cached_ok(_old):
+            _old["note"] = "命中缓存（原片指纹/窗口/腿/帧数/题面五项一致，帧文件都在）⇒ 0 分、不重抽"
+            log("✓ 抽帧补充：复用盘上事实（%d 条实物 / %d 条叠加层，0 分）"
+                % (len(_old.get("object_facts") or []), len(_old.get("overlay_text") or [])))
+            return _old
+
+    try:
+        dur = _ffprobe_duration(video_path)
+    except Exception as exc:                                     # noqa: BLE001
+        report["error"] = "读不到原视频时长（%s）⇒ 抽帧没做成" % str(exc)[:120]
+        log("⚠ 抽帧补充跳过：%s" % report["error"])
+        fp_json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        return report
+    frame_dir = out / "step1_frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    stamps = [round(min(max((i + 0.5) * dur / count, 0.0), max(0.0, dur - 0.05)), 2)
+              for i in range(count)]
+    for st in stamps:
+        try:
+            p = extract_still_frame(video_path, st, str(frame_dir / ("t%05.2fs.jpg" % st)))
+            report["frames"].append({"t": st, "path": p,
+                                     "bytes": Path(p).stat().st_size})
+        except Exception as exc:                                 # noqa: BLE001
+            report["frames"].append({"t": st, "path": "", "error": str(exc)[:120]})
+    frame_paths = [f["path"] for f in report["frames"] if f.get("path")]
+    if len(frame_paths) < 2:
+        report["error"] = "只抽出 %d 帧 ⇒ 这一腿不发请求（多帧对比是它存在的理由）" % len(frame_paths)
+        log("⚠ 抽帧补充失败：%s" % report["error"])
+        fp_json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        return report
+
+    from backend import gateway as _gw
+    log("=== Step 1·抽帧补充：一次给 %d 帧 → video.analyze/%s（免批不免账）===" % (len(frame_paths), purpose))
+    env = _gw.invoke("video.analyze", purpose, "local",
+                     {"paths": frame_paths, "question": question, "max_tokens": budget}) or {}
+    res = env.get("result") or {}
+    report["credits"] = env.get("credits") or {}
+    if not env.get("ok") or not (res or {}).get("text"):
+        report["error"] = str(env.get("error") or (res or {}).get("error") or "上游回空正文")[:300]
+        log("⚠ 抽帧补充腿没出词：%s（分镜腿那份事实照旧有效，这一腿如实记【没补上】）" % report["error"])
+        fp_json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        return report
+
+    _lane = res.get("lane")
+    if isinstance(_lane, dict):
+        report["lane"] = "%s·%s" % (str(_lane.get("model") or res.get("model") or "没记"),
+                                    str(_lane.get("purpose") or purpose))
+    else:
+        report["lane"] = str(_lane or res.get("model") or purpose)
+    parsed = parse_frame_facts(res.get("text"))
+    report.update({
+        "ran": True, "raw_text": str(res.get("text") or ""),
+        "object_facts": parsed["object"], "overlay_text": parsed["overlay"],
+        "uncertain": parsed["uncertain"], "usage": res.get("usage") or {},
+        "bytes_sent": res.get("bytes_after"), "resized": res.get("resized"),
+    })
+    if report["uncertain"]:
+        report["note"] = "答文里没有【实物】/【叠加层】两个标题 ⇒ 全文并进实物节，未分级，人审时按未核对看"
+    fp_json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    _c = report["credits"] or {}
+    log("✓ 抽帧补充：实物 %d 行 / 叠加层 %d 行（腿=%s，预估 %s 分、实扣 %s 分，hold=%s）"
+        % (len(report["object_facts"]), len(report["overlay_text"]), report["lane"],
+           _c.get("estimated"), _c.get("charged"), _c.get("hold_id")))
+    return report
+
+
+def _norm_text(s: Any) -> str:
+    """OCR 比对用的归一化：去空白/标点/大小写。包装中英文名之间常差一个空格或换行。"""
+    return re.sub(r"[\s\u3000·・.,、:：;；!！?？\-_/|()（）\[\]【】'\"“”‘’®©™]+", "",
+                  str(s or "")).lower()
+
+
+_OCR_CANDIDATES = ("rapidocr_onnxruntime", "paddleocr", "easyocr")
+
+
+def _ocr_factory() -> tuple:
+    """本机 OCR（**0 分、0 上游调用**）：装了哪个用哪个。返回 `(引擎名, fn)`，都没有 ⇒ `(None, None)`。
+
+    🔴 为什么必须本地而不是看图腿：看图腿 `video.analyze` 免批但**不免账**（实测 33–40 分/张），
+       拿它逐帧验收一条 15 秒片 = 8 帧 × 40 分 = 320 分，比出片本身还贵。
+    """
+    for name in _OCR_CANDIDATES:
+        try:
+            if name == "rapidocr_onnxruntime":
+                mod = __import__("rapidocr_onnxruntime", fromlist=["RapidOCR"])
+                engine = mod.RapidOCR()
+
+                def _fn(path, _e=engine):
+                    res, _elapse = _e(path)
+                    return [(str(r[1]), float(r[2]), r[0]) for r in (res or [])]
+            elif name == "paddleocr":
+                mod = __import__("paddleocr", fromlist=["PaddleOCR"])
+                engine = mod.PaddleOCR(use_angle_cls=False, show_log=False, lang="ch")
+
+                def _fn(path, _e=engine):
+                    out = []
+                    for page in (_e.ocr(path, cls=False) or []):
+                        for ln in (page or []):
+                            box, (txt, conf) = ln[0], ln[1]
+                            out.append((str(txt), float(conf), box))
+                    return out
+            else:
+                mod = __import__("easyocr", fromlist=["readtext"])
+                engine = mod
+
+                def _fn(path, _e=mod):
+                    return [(str(r[1]), float(r[2]), r[0])
+                            for r in (_e.readtext(path, detail=1, verbose=0) or [])]
+            return name, _fn
+        except Exception:                                       # noqa: BLE001 - 没装/模型下不来都算不可用
+            continue
+    return None, None
+
+
+def allowed_label_texts(product_image_paths: Optional[List[str]] = None,
+                        ocr=None) -> List[str]:
+    """产品图上真实印着的字 = 成片里【允许】出现的文字（合同明令"包装文字按产品图保留"）。
+
+    不拿它当白名单就会假红：瓶身那行「植小妞 / ZHIXIAONIU / 净含量:100ml」是必须存在的，
+    判"全画面干净"时把它也算成字幕 = 拿验收口去否掉合同另一条。
+    """
+    if ocr is None:
+        _n, ocr = _ocr_factory()
+    if not ocr:
+        return []
+    allow: List[str] = []
+    for p in (product_image_paths or []):
+        try:
+            for txt, conf, _box in ocr(str(p)):
+                t = str(txt).strip()
+                if t and float(conf) >= 0.5 and t not in allow:
+                    allow.append(t)
+        except Exception:                                       # noqa: BLE001
+            continue
+    return allow
+
+
+def classify_frame_text(hits: List[tuple], allowed: List[str],
+                        frame_size: Optional[tuple] = None) -> List[Dict[str, Any]]:
+    """把一帧的 OCR 结果分成"包装白名单内 / 白名单外(嫌疑)"。纯函数 ⇒ 闸能整块抠出来跑值表。
+
+    ⚠️ 坐标归一化用**这一帧自己的真实分辨率**（调用方传 `frame_size`）：写死 1920×1080 会把竖屏
+       720×1280 的下方字幕算到画面中间去 —— 那条片子的字幕明明在 y=0.84，被硬编码一除就变成 0.47。
+       拿不到尺寸就输出 `center: null`，不猜。
+    """
+    norm_allow = [_norm_text(a) for a in allowed if _norm_text(a)]
+    fw, fh = (float(frame_size[0] or 0), float(frame_size[1] or 0)) if frame_size else (0.0, 0.0)
+    suspects: List[Dict[str, Any]] = []
+    for txt, conf, box in hits or []:
+        n = _norm_text(txt)
+        if not n or float(conf) < 0.5:
+            continue                                     # 半信半疑的碎块不当证据（宁漏不误伤）
+        if any(n == a or (len(a) >= 2 and (a in n or n in a)) for a in norm_allow):
+            continue                                     # 包装上真印着 ⇒ 合法
+        cx = cy = None
+        if fw > 0 and fh > 0:
+            try:
+                pts = [[float(p[0]), float(p[1])] for p in box]
+                cx = round(sum(p[0] for p in pts) / len(pts) / fw, 3)
+                cy = round(sum(p[1] for p in pts) / len(pts) / fh, 3)
+            except Exception:                                 # noqa: BLE001
+                cx = cy = None
+        suspects.append({"text": str(txt).strip(), "conf": round(float(conf), 3), "center": [cx, cy]})
+    return suspects
+
+
+def verify_frame_text(video_path: str, out_json: str,
+                      product_image_paths: Optional[List[str]] = None,
+                      interval: float = 2.0, max_frames: int = 12,
+                      ocr=None, engine_name: Optional[str] = None,
+                      on_log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """成片抽帧 + 本地 OCR ⇒ 「全画面干净」这件事第一次有能红的物证。
+
+    🔴 为什么非做不可：合同 `negative-lock` 的判据是 `text-has=不得出现字幕;水印`，**只查 prompt 文本、
+       不查像素**。2026-10-14 现网就是那个形状——提示词里那句在位、那一格照常打钩，成片每 2 秒一帧
+       仍 8/8 带原片烧录字幕（而且是重新渲染的伪文字，不是像素拷贝）。音轨有 `verify_narration_audio()`
+       复验，画面文字一个复验口都没有 ⇒ 负向词被当成了交付质量证据。
+    ⚠️ 强度边界：OCR 读得出的才算命中；极小/极淡/手写体可能漏判 ⇒ 它证"有字"很硬，证"绝对干净"要配合
+       人审抽帧。白名单来自**产品图自己的 OCR**（包装文字按合同必须保留），不是拍脑袋列的词表。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    if ocr is None:
+        engine_name, ocr = _ocr_factory()
+    report: Dict[str, Any] = {
+        "video": str(video_path), "engine": engine_name or "本机没装 OCR",
+        "interval_seconds": float(interval), "frames_checked": 0,
+        "allowed_from_product_images": [], "suspects": [], "clean": None, "note": "",
+    }
+    if not ocr:
+        report["note"] = ("本机没有 OCR（试过 %s）⇒ 这一项【没做】，不许当成「过了」。"
+                          % "/".join(_OCR_CANDIDATES))
+        log("⚠ 画面文字复验跳过：%s" % report["note"])
+        Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+        io_out = Path(out_json)
+        io_out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        return report
+
+    try:
+        dur = _ffprobe_duration(video_path)
+    except Exception as exc:                                    # noqa: BLE001
+        report["note"] = "读不到成片时长（%s）⇒ 复验没做成" % str(exc)[:120]
+        return report
+    stamps: List[float] = []
+    t = min(0.5, max(0.0, dur / 2))
+    while len(stamps) < max_frames and t < dur:
+        stamps.append(round(t, 2))
+        t += float(interval)
+    report["allowed_from_product_images"] = allowed_label_texts(product_image_paths, ocr=ocr)
+    frame_dir = Path(out_json).parent / "text_check"
+    for st in stamps:
+        try:
+            fp = extract_still_frame(video_path, st, str(frame_dir / ("t%05.2fs.jpg" % st)))
+            hits = ocr(fp) or []
+        except Exception as exc:                                # noqa: BLE001
+            report["suspects"].append({"t": st, "error": str(exc)[:120]})
+            continue
+        report["frames_checked"] += 1
+        try:
+            from PIL import Image as _Im                        # 只为拿真实分辨率；没装就 center=null，不猜
+            _sz = _Im.open(fp).size
+        except Exception:                                       # noqa: BLE001
+            _sz = None
+        for s in classify_frame_text(hits, report["allowed_from_product_images"], frame_size=_sz):
+            s["t"] = st
+            report["suspects"].append(s)
+    report["clean"] = (report["frames_checked"] > 0
+                       and not any("text" in s for s in report["suspects"]))
+    report["note"] = ("干净：%d 帧 0 处非包装文字" % report["frames_checked"] if report["clean"]
+                      else "命中 %d 处白名单外文字 ⇒ 画面没清干净（或 OCR 读到了别的真实文字，需人看）"
+                           % len(report["suspects"]))
+    Path(out_json).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    log("画面文字复验（%s，%d 帧）：%s" % (report["engine"], report["frames_checked"], report["note"]))
+    return report
+
+
+def burned_text_lines(prompt: str) -> List[int]:
+    """逐镜行里【自己写了画面文字】的镜号（引号内的台词位先剥掉——那是口播，不是画面描述）。
+
+    合同要求成片无字幕，编译器却常在逐镜行里写"字幕写着…""屏幕下方显示…"——那等于把那行字又喂回模型。
+    后置约束段与后端全局块本来就有"字幕/水印"这些词，所以判据只看 `Shot` 行，不看整篇。
+    """
+    bad: List[int] = []
+    for line in (prompt or "").splitlines():
+        if not line.startswith("Shot"):
+            continue
+        m = re.match(r"^Shot\s+(\d+)", line)
+        body = _QUOTED_SPEECH_RE.sub("", line)
+        if re.search(r"字幕|花字|水印|台标|贴纸|屏幕上(写|显)|标题文字|角标", body):
+            bad.append(int(m.group(1)) if m else 0)
+    return bad
 
 
 def manifest_for_segment(
@@ -3128,7 +3758,120 @@ def _storyboard_system_prompt(target_duration: float, split_mode: str) -> str:
 3. 主体原商品在整段视频里只有一件。先按【主体原商品识别规则】定下这一件，此后每个 Shot 的「产品」字段都用同一个称呼指同一件东西；不要因为某镜头里被操作的是别的道具（毛巾、器皿、包装盒、家具），就把那件道具写成产品。
 4. 某 Shot 里这件主体原商品确实不可见时，「产品」「产品动作」「交互方式」「交互部位」「营销功能」五格全填「无」；该镜头里对道具的真实操作改写进「画面动作.画面内容」和「画面动作.人物动作」两格。真实动作不得因为判了无就删掉，也不得留在「产品动作」里。
 5. 只输出一个顶层 JSON 数组，逐 Shot 只含【唯一输出 Schema】列出的字段：不要 gen_mode，不要时间轴数组，不要解析依据和合并段表，不要 Markdown、代码块或任何解释文字。
-"""
+6. 🔴 任何字段都**不许抄画面上出现的文字内容**：原片的烧录字幕、花字、标题、贴纸、账号水印、台标一律当"看不见"，
+   尤其不许把字幕原文写进「画面动作.画面内容」「场景环境.背景细节」或「音效」——下游编译器会把它复述进 prompt，
+   等于把要清掉的字又喂回生成模型。只有 ①目标产品包装上真实印刷的文字 ②场景内物理存在的真实标牌/挂画文字
+   属于画面内容，可按原样客观描述；除此之外分镜表里不该出现任何引号内的屏幕文字。
+   「口播」字段不受此限：那一格记的是**听到的**话（音频事实），不是画面上的字。
+""" + STORYBOARD_COMPACT_BLOCK
+
+
+def storyboard_body_limit(lane_provider: str = "") -> int:
+    """这一家的 body 上限（字节）；0 = 不设上限（原片直送）。纯函数 ⇒ 闸能整块抠出来跑值表。
+
+    🔴 按渠道列，不拿一家的解析器限制去降另一家的输入质量：`config.REPLICA_WAN3_STORYBOARD_BODY_LIMITS`
+       形如 `lant.top=12000000`；名单里没有的 host ⇒ 0（小米直连实测吃得下 29MB 原片）。
+    """
+    raw = str(getattr(settings, "REPLICA_WAN3_STORYBOARD_BODY_LIMITS", "") or "")
+    prov = str(lane_provider or "").lower()
+    for piece in raw.split(","):
+        host, _, val = piece.partition("=")
+        host, val = host.strip().lower(), val.strip()
+        if host and host in prov:
+            try:
+                n = int(val)
+            except ValueError:
+                return 0                       # 写坏了就当没配：宁可原片直送，也不拿一个猜的数去降质量
+            return max(1_000_000, n)
+    return 0
+
+
+def storyboard_send_video(video_path: str, out_dir: str, lane_provider: str = "",
+                          on_log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """返回 `{"path": 真正传给分镜腿的文件, "meta": 这次到底送了什么}`；不静默改，压不动就如实带 error。
+
+    🔴 为什么要有这一层（2026-10-30 用户拍板"超阈值先降码率再送"）：
+      `pipeline/step1_mimo_parse.py:1220`（BOUNDARY 整文件保护，只调不改）把【整片 base64】塞进 JSON body，
+      而 lant.top 对 body 里单个字符串的上限是 2000 万字符 ⇒ 一条 29MB / 12.03s 的片回
+      `400 RELAY_201 … String value length (20054016) exceeds the maximum (20000000)`。
+      跟 key、额度、片长都没关系 —— 是封装层字节数撞了中转的解析器限制。
+      压了还敢用：这一腿自己就按 `REPLICA_WAN3_MIMO_FPS`（现 4fps）采样，29MB/12s ≈ 20Mbps 是纯浪费；
+      而"近看才看得清"那部分现在归【抽帧补充腿】，它看的是从【原片】抽的静图，不是这条有损副本。
+    🔴 只换"传给分镜腿的那一份"：FunASR 读的还是原片（口播逐字是音频事实），产品图/模特图不受影响。
+    档位阶梯两档（压完还超 ⇒ 【一个请求都不发】直接拒：明知会 400 还要先传两分钟，比报错坏）：
+      1) `-crf 26` + 长边 ≤1080（保结构细节，这一腿的活是把动作与镜头读准）
+      2) 仍超 ⇒ `-crf 30` + 长边 ≤720
+    物证 `step1_mimo/send_video.json` + 文件名带原片 sha8 ⇒ 同一个源重复跑命中缓存（0 次重编码）。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    limit = storyboard_body_limit(lane_provider)
+    meta: Dict[str, Any] = {"original": str(video_path), "lane": str(lane_provider or "没记"),
+                            "limit_bytes": limit, "sent": str(video_path),
+                            "original_bytes": None, "sent_bytes": None, "sent_sha8": "",
+                            "transcoded": False,
+                            "tier": "原片直接送（未超阈值）" if limit else "原片直接送（这一家没配 body 上限）",
+                            "error": None,
+                            "note": "只有分镜腿读这一份；FunASR 与抽帧补充腿读原片"}
+    try:
+        ob = os.path.getsize(video_path)
+    except OSError as exc:
+        meta["error"] = "读不到原片大小（%s）⇒ 不判体积，照原片送" % str(exc)[:100]
+        log("⚠ 分镜腿体积判定跳过：%s" % meta["error"])
+        return {"path": video_path, "meta": meta}
+    meta["original_bytes"] = ob
+    if not limit or ob <= limit:
+        return {"path": video_path, "meta": meta}
+
+    out = Path(out_dir) / "step1_mimo"
+    out.mkdir(parents=True, exist_ok=True)
+    src_sha8 = hashlib.sha256(open(video_path, "rb").read()).hexdigest()[:8]
+    meta["original_sha8"] = src_sha8
+    last = None
+    for crf, edge, tag in ((26, 1080, "crf26-1080"), (30, 720, "crf30-720")):
+        dst = out / ("send-%s-%s.mp4" % (src_sha8, tag))
+        if not (dst.is_file() and dst.stat().st_size > 0 and os.path.getsize(str(dst)) <= limit):
+            _vf = ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))'" % (edge, edge))
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+                   "-vf", _vf, "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(dst)]
+            meta["ffmpeg_%s" % tag] = " ".join(["ffmpeg -i <原片>", "-c:v libx264 -preset veryfast",
+                                                "-crf %s" % crf, "-vf 长边≤%d" % edge, "-c:a aac 96k", str(dst)])
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=900)
+            except Exception as exc:                            # noqa: BLE001
+                last = "%s 档压片失败：%s" % (tag, str(exc)[:180])
+                meta["tier"] = tag
+                meta["error"] = last
+                log("⚠ 分镜腿降码率：%s ⇒ 换下一档" % last)
+                continue
+        nb = os.path.getsize(str(dst))
+        meta.update({"tier": tag, "transcoded": True, "sent": str(dst), "sent_bytes": nb})
+        if nb <= limit:
+            meta["sent_sha8"] = hashlib.sha256(open(str(dst), "rb").read()).hexdigest()[:8]
+            log("✓ 分镜腿送片降码率：%s → %s（%d MB → %d MB，%s 档；FunASR 仍读原片，物证=step1_mimo/send_video.json）"
+                % (Path(video_path).name, dst.name, ob // 10**6, nb // 10**6, tag))
+            try:
+                (out / "send_video.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:                                    # noqa: BLE001
+                pass
+            return {"path": str(dst), "meta": meta}
+        last = "%s 档压完仍有 %d MB > 上限 %d MB" % (tag, nb // 10**6, limit // 10**6)
+        meta["tier"], meta["error"] = tag, last
+        log("⚠ 分镜腿降码率：%s ⇒ 换下一档" % last)
+
+    # 🔴 两档都压不下去 ⇒ 一个请求都不发、0 分。拒因里必须给出路，否则人只看到一句失败。
+    raise RuntimeError(
+        "Step1 分镜腿没法送片：%s（原片 %d MB，这一家=%s 的上限 %d MB，crf26-1080 与 crf30-720 两档都试过）"
+        "⇒ 0 分、没发请求。三条出路：① 把这一条的时间窗裁短再复刻；"
+        "② 往 config.REPLICA_WAN3_STORYBOARD_BODY_LIMITS 把这一家的数抬大（并接受上游可能照样 400）；"
+        "③ 把分镜腿换到【实测吃得下大文件】的渠道（往 VIDEO_HOSTS 加之前先跑那条 Δ 判别）。"
+        % (meta["error"], ob // 10**6, lane_provider or "没记", limit // 10**6))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -3165,8 +3908,6 @@ async def step1_mimo_director(
         print(f"  [Step1·分镜腿] {msg}", flush=True)
 
     cfg = _cfg()
-    # 同步 settings.MIMO_API_KEY 到环境变量（pipeline.step1_mimo_parse 用 os.environ.get）
-    os.environ["MIMO_API_KEY"] = settings.MIMO_API_KEY
     from pipeline.step1_mimo_parse import run as mimo_run
 
     # 🔴 分镜腿用哪家 = config 的开关（唯一源 _storyboard_lane），解不出来就在这里拒：
@@ -3177,10 +3918,21 @@ async def step1_mimo_director(
     if not (_sb.get("base_url") and _sb.get("api_key") and _sb.get("model")):
         raise RuntimeError("Step1 分镜腿三元组不全（base_url/api_key/model）⇒ 不发请求；当前 provider=%s"
                            % _sb.get("provider"))
+    # 受保护那份文件在 api_key 缺省时读 os.environ["MIMO_API_KEY"] ⇒ 兜底必须与实传同一把，
+    # 否则会出现"传进去的是分镜端点、兜底读到的是中转那把"的两家混一腿。
+    os.environ["MIMO_API_KEY"] = _sb["api_key"]
     log("分镜腿=%s（model=%s，ledger=%s）" % (_sb.get("provider"), _sb.get("model"), _sb.get("ledger")))
 
     mimo_out = str(Path(output_dir) / "step1_mimo")
     Path(mimo_out).mkdir(parents=True, exist_ok=True)
+
+    # 🔴 送片之前先过体积这道门（2026-10-30 现网：29MB/12.03s 撞 lant.top 的 20M 字符 body 上限，
+    #    回 400 RELAY_201 —— 与 key/额度无关，是封装层字节数）。压不动就一请求不发、0 分，并给三条出路。
+    #    上限【按渠道取】（storyboard_body_limit）：这一家没配就是原片直送，不拿别人的限制降自己的输入质量。
+    #    放在【发请求之前那一刻】而不是 run_pipeline 里：换渠道/改阈值只影响这一条腿，
+    #    原片本身一个字不动（FunASR、抽帧腿、审帧贴图用的都还是它）。
+    _send = storyboard_send_video(video_path, str(output_dir),
+                                  lane_provider=str(_sb.get("provider") or ""), on_log=log)
 
     # ★Step 1 只解析原视频，不输入任何新素材（产品图/模特图/场景图/customer_request/product_name）
     #   - 避免新素材污染原视频解析（例如新场景是咖啡店 → MiMo 可能误把原视频白色卧室解析成咖啡店）
@@ -3208,7 +3960,8 @@ async def step1_mimo_director(
     # #endregion
     result = await asyncio.to_thread(
         mimo_run,
-        video_path=video_path,
+        video_path=_send["path"],   # 🔴 超阈值时这是降码率后的副本（见 storyboard_send_video）；
+                                     #    FunASR 与抽帧腿在下面仍用【原片】video_path
         product_name="",  # 不传产品名：MiMo 不做产品替换，只解析原视频结构
         output_dir=mimo_out,
         fps=cfg["mimo_fps"],
@@ -3252,6 +4005,53 @@ async def step1_mimo_director(
     # FunASR 负责口播，MiMo 只负责画面和镜头，按时间区间把 ASR 结果写回 storyboard。
     asr_dir = Path(output_dir) / "step1_mimo"
     voiceover_segments = await _extract_voiceover(video_path, asr_dir, target_duration)
+
+    # 静音处理（2026-11-06 客户口径「不识别asr，静音处理，只要画面」）。
+    # ASR 在没有人声的素材上会编出整段假台词：同一条素材三次重编译听出三个不同的词
+    # （"安慰。" → "…" → "…家。"），而人声分离轨实测只有前奏音乐残漏（0-3s = -24~-37dB）
+    # 与数字静音（3-15s = -56~-68dB）。编译器逐镜照抄「口播」字段 ⇒ wan3.0 会让画面外
+    # 凭空冒出一个人说话。所以这里不靠 ASR 自觉，按【量出来的响度】判静音。
+    def _narration_is_silent() -> bool:
+        if str(os.environ.get("SUPER_CLONE_NO_NARRATION") or "").strip().lower() in ("1", "true", "yes", "on"):
+            log("  口播腿=按 SUPER_CLONE_NO_NARRATION 跳过（客户口径：只要画面）")
+            return True
+        try:
+            threshold = float(os.environ.get("SUPER_CLONE_NARRATION_SILENCE_DB") or "-40")
+        except ValueError:
+            threshold = -40.0
+        for cand in (
+            asr_dir / "asr_vocals.wav",
+            asr_dir / "demucs" / "htdemucs" / "asr_audio" / "vocals.wav",
+        ):
+            if not cand.exists():
+                continue
+            try:
+                proc = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-nostats", "-i", str(cand),
+                     "-af", "volumedetect", "-f", "null", "-"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+                )
+                found = re.findall(
+                    r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB",
+                    (proc.stderr or "") + (proc.stdout or ""),
+                )
+                if not found:
+                    continue
+                mean_db = float(found[-1])
+                silent = mean_db < threshold
+                log(f"  人声轨响度实测：{cand.name} mean={mean_db:.1f}dB｜静音阈值={threshold:.1f}dB ⇒ "
+                    f"{'静音（ASR 不采信）' if silent else '有人声（ASR 采信）'}")
+                return silent
+            except Exception as exc:
+                log(f"  ⚠ 人声响度测量失败，保持 ASR 原行为：{exc}")
+                return False
+        log("  ⚠ 找不到人声分离轨，保持 ASR 原行为")
+        return False
+
+    if voiceover_segments and _narration_is_silent():
+        log("⚠ 人声轨为静音 ⇒ ASR 结果按误识丢弃，口播=无（只保留画面复刻）")
+        voiceover_segments = []
+
     if voiceover_segments:
         def _time_value(value: Any) -> float:
             if isinstance(value, (int, float)):
@@ -3681,15 +4481,20 @@ async def step2_wan3_execute(
 
     while total_attempts < max_generation_attempts:
         current_seed = base_seed + total_attempts
-        log(f"=== Wan3.0 生成 attempt {total_attempts + 1}/{max_generation_attempts}（wan3-prime 无 seed 概念：每次重试都是上游一次新计费 calls=1）===)")
+        log(f"=== Wan3.0 生成 attempt {total_attempts + 1}/{max_generation_attempts}（wan3-prime 无 seed 概念：每次重试都是上游一次新任务；"
+            f"2026-10-30 换芯后这家按【秒】计价 ⇒ 重投一次的代价 = 这一段秒数 × 单价，不是"
+            f"一次固定的 calls=1。先盘上的号，只捞不重投）===")
 
         try:
-            # 🔴 路由唯一源（2026-10-10 定）：wan3.0 = 网关 lane video.generate/wan3-prime（provider tianyue）。
+            # 🔴 路由唯一源（2026-10-10 定，2026-10-30 换芯）：wan3.0 = 网关 lane video.generate/wan3-prime
+            #    （provider 现在 = yz30 / youzan666 Prime，`wan3.0-video-prime`，按秒；
+            #     之前 = tianyue / ME-WAN3-prime-1080p-1055 按次，那条今天只剩 wan30-studio 在用）。
             #    不再走 RunningHub（2026-10-09 禁令 + WAN3_RH_ENABLED=False），也不再靠"agent 直调网关"绕开入口。
             #    分辨率在这一层【原样递下去】：以前这里印一句"只出 1080P"然后把调用方给的档位丢掉、
             #    硬写 1080P ⇒ 客户点名 720P 时既没拒也没换档，只是悄悄出了 1080P（悄悄改参数）。
-            #    现在交给 lane 自己的档位校验（gateway._WAN30_RES_MODEL）：名单外 0 分本地拒。
-            log(f"=== 提交走网关 video.generate/wan3-prime（account=local · resolution={eff_resolution} · 按次计费 calls=1）===")
+            #    现在交给 lane 自己的档位校验（yz30 那条读 _YZ30_RESOLUTIONS，只 720P/1080P）：名单外 0 分本地拒。
+            log(f"=== 提交走网关 video.generate/wan3-prime（account=local · resolution={eff_resolution} · "
+                f"按秒计费 ⇒ 单价现读 gateway.prices，段长就是价格的一部分）===")
             result = await asyncio.to_thread(
                 wan3_client.run_one_segment_prime,
                 prompt=prompt,
@@ -3798,9 +4603,10 @@ async def step2_wan3_execute(
         try:
             from backend import skill_contract as _skc3
             _m_real = str(result.get("model") or "").strip() or "没记"
+            _prov_real = str(result.get("provider") or "").strip() or "没记"
             _r3 = _skc3.tick("super-clone", str(output_dir), "submit-package",
                              evidence=str(Path(output_dir) / "wan3_job.json"),
-                             model="%s@tianyue · 网关账本内" % _m_real,
+                             model="%s@%s · 网关账本内" % (_m_real, _prov_real),
                              impl="gateway:invoke:video.generate/wan3-prime")
             if not _r3.get("ok"):
                 log("⚠️ 回执 submit-package 没改成现读模型名：%s" % _r3.get("error"))
@@ -3967,6 +4773,45 @@ def delivery_problems(step2: dict) -> list:
     return problems
 
 
+_IMAGE_REF_RE = re.compile(r"图\s*(\d+)")
+
+
+def prompt_preflight_problems(prompt: Any, media_manifest: Any = None) -> List[str]:
+    """花钱【之前】的两道本地拒（纯函数，0 分 0 请求）。编译稿与人工稿同一把尺。
+
+    1) 最后一行必须逐字等于后端那份负向锁定 —— 它就是"不许出字幕/花字/水印/原片烧录文字"
+       这条合同的落点（SKILL.md 的 `negative-lock` 那格钉的是同一句）。缺了不是"上游大概会忽略"，
+       是这条要求被悄悄丢掉，而出片后只能靠抽帧才发现。
+    2) 正文引用的 `图N` 必须落在本次素材编号范围内 —— 越界同样是"出片后才知道"的错，
+       而那一发已经扣过分了。
+    """
+    text = str(prompt or "").strip()
+    if not text:
+        return ["提示词是空的"]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    problems: List[str] = []
+    if lines[-1] != STEP1_5_GLOBAL_CONSTRAINT.strip():
+        problems.append("最后一行不是后端那份负向锁定（要求逐字相等）⇒ 不许提交")
+    manifest = [m for m in (media_manifest or []) if str((m or {}).get("image_id") or "").strip()]
+    total = len(manifest)
+    bad = sorted({int(n) for n in _IMAGE_REF_RE.findall(text) if int(n) < 1 or int(n) > total})
+    if bad and total:
+        problems.append("正文引用了 %s，但本次素材只有 %d 张图（合法编号 1..%d）⇒ 不许提交"
+                        % ("、".join("图%d" % i for i in bad), total, total))
+    return problems
+
+
+def raise_prompt_preflight(prompt: Any, media_manifest: Any, log=None) -> None:
+    """把上面那道判据变成【提交前的一刀】：有问题就大声停，0 分、不建 hold、不发请求。"""
+    problems = prompt_preflight_problems(prompt, media_manifest)
+    if not problems:
+        return
+    msg = "提示词没过提交前本地校验（0 分未扣、任务未发起）：" + "；".join(problems)
+    if log:
+        log("✗ " + msg)
+    raise RuntimeError(msg)
+
+
 # ─────────────────────────────────────────────────────────────────
 # 顶层编排：Step1 → Step2
 # ─────────────────────────────────────────────────────────────────
@@ -3991,7 +4836,7 @@ MATERIAL_ANALYZE_CREDIT_CAP = int(os.environ.get("SUPER_CLONE_ANALYZE_CAP") or "
 # 指纹覆盖【所有会影响 storyboard / prompt 的输入】：命中 = 输入一字没变 = 重编译也是同样结果 ⇒ 零语义损失。
 _COMPILE_FP_KEYS = ("trim_start", "trim_end", "target_duration", "resolution", "aspect_ratio",
                     "voice_mode", "voice_script", "extra_note", "customer_request", "product_name",
-                    "media_manifest", "source_sha8")
+                    "media_manifest", "source_sha8", "prompt_rev", "frame_facts")
 
 
 def compile_fingerprint(facts: Dict[str, Any]) -> str:
@@ -4748,10 +5593,49 @@ async def run_pipeline(
     #    为什么必须在这儿：`--stage submit` 原来一律从头跑一遍，同一条输入今晚被编译了 4 遍，
     #    其中两遍纯白烧（提交被身份问题拒一次、MiMo 截断后整条重跑一次）。
     _cc_dir = Path(output_dir) / "step2_wan3"
+    # ── Step 1 的第二只眼：抽帧补充腿（2026-10-30 用户定"改成这样的流程"）──────────────
+    #    放在【编译指纹之前】：它的产出会影响 prompt，就必须进指纹；放在 Step1 之后跑的话，
+    #    第一次运行会拿"没有抽帧事实"算出 fp、把事实写进 prompt.txt，第二次复用时 fp 对不上 ⇒ 复用永久失效。
+    #    `--reuse-compile` 那一档不重跑这一腿（免批不免账，8 帧一次实测 173 分 / 54.5s），只读盘上那份。
+    #    ⚠️ 这一整段必须待在 `from backend import skill_contract as _skc` **之前**：
+    #       反向对照闸 CP11b 拿"那两句相邻"当锚点，插进中间就会让它空转（2026-10-30 我自己踩的）。
+    if reuse_compile:
+        _frame_report = read_frame_facts(output_dir)
+        _frame_facts = frame_fact_block(_frame_report)
+        if _frame_facts:
+            log("· 抽帧补充：复用档 ⇒ 不重跑这一腿，读盘上那份事实（实物 %d 行 / 叠加层 %d 行）"
+                % (len((_frame_report or {}).get("object_facts") or []),
+                   len((_frame_report or {}).get("overlay_text") or [])))
+    else:
+        _frame_report = frame_facts_pass(
+            trimmed_path, output_dir, target_duration, on_log=log,
+            # 🔴 身份用【裁之前的原片】+ 这一刀的窗口：裁出来的那份是重编码、每次字节都不同，
+            #    拿它的哈希当键 ⇒ 每次 `--stage compile` 都判"新片"、白烧 173 分（这一腿免批不免账）。
+            source_sha8=hashlib.sha256(open(video_path, "rb").read()).hexdigest()[:8]
+            if video_path and os.path.isfile(video_path) else "",
+            window=[float(trim_start or 0.0), float(trim_end or 0.0)])
+        _frame_facts = frame_fact_block(_frame_report)
+    if _frame_facts:
+        # 🔴 "本次实扣"还是"累计实扣"要分开说：缓存命中时那份报告里的 charged 是【上一次】花的，
+        #    写成"本次实扣 178 分"就和上一行"复用盘上事实（0 分）"自相矛盾 —— 报价的人照哪行念都会错。
+        _is_cache = str(_frame_report.get("note") or "").startswith("命中缓存")
+        log("  抽帧补充进编译：实物 %d 行 / 叠加层 %d 行（腿=%s，%s %s 分）"
+            % (len(_frame_report.get("object_facts") or []),
+               len(_frame_report.get("overlay_text") or []), _frame_report.get("lane"),
+               "累计实扣（本次命中缓存，0 新支出）" if _is_cache else "本次实扣",
+               (_frame_report.get("credits") or {}).get("charged")))
+    else:
+        log("  ⚠ 抽帧补充【没有事实进编译】：%s（成片就按分镜腿那一份事实出，不假装补过）"
+            % str((_frame_report or {}).get("note") or (_frame_report or {}).get("error")
+                  or "这一腿没跑或开关是空的"))
     # 🔴 `_skc` 在这个模块里【没有模块层导入】（都是各函数内延迟 import）。这一段是我 10-14 深夜加的
     #    指纹缓存，当时漏了这句 import ⇒ `NameError: name '_skc' is not defined` 直接打死每一段，
     #    10-15 09:05 那次【批准即点火】起的提交腿就是这么死的（submit.log 尾部三行同名错），
     #    后果是"人点了批准、系统没投，agent 醒来自己重跑" —— 同一个文件为这件事崩过三次（os、json、这次）。
+    # 🔴 prompt_rev：两条模型腿（分镜腿 + 编译腿）当场要发出去的系统提示词的指纹，0 模型 0 分。
+    #    为什么必须进指纹：2026-10-23 现网给系统提示词加了粗档覆盖节后重编译，日志打的是"复用编译产物"、
+    #    prompt.txt 被原样回写（sha8 一字未变）—— 换了提示词而指纹没换 = 新提示词根本没进模型，
+    #    而【批准即点火】那条软复用腿会拿旧粒度的那份直接花 60 分。加字段是因为"影响产出的输入"多了一样。
     from backend import skill_contract as _skc
     _cc_facts = {
         "trim_start": float(trim_start or 0.0), "trim_end": float(trim_end or 0.0),
@@ -4762,6 +5646,9 @@ async def run_pipeline(
         "media_manifest": [{"image_id": m.get("image_id"), "path": m.get("path"),
                             "sha8": _skc.sha8(str(m.get("path")))} for m in media_manifest],
         "source_sha8": _skc.sha8(str(trimmed_path)),
+        "prompt_rev": prompt_revision(float(target_duration), _cfg()["mimo_split_mode"]),
+        # 🔴 抽帧补充事实进指纹（上面那段的第二条理由）：换了这份事实 = 换了编译输入 = 不许复用旧 prompt。
+        "frame_facts": str(_frame_facts or ""),
     }
     _cc_hit, _cc_why = compile_cache_state(_cc_dir, _cc_facts)
     if reuse_compile and not _cc_hit:
@@ -4775,7 +5662,14 @@ async def run_pipeline(
         #    时拒掉 = 一张已生效的批准花不出去、也没人重新报价 = 卡死。日志必须出声，别让人以为复用了。
         log("⚠ 编译缓存不命中（%s）⇒ 不复用，照常从 Step1 全量重编译后再投（软复用档，服务端点火用的就是这条）"
             % _cc_why)
-    if _cc_hit:
+    # 🔴 缓存命中 ≠ 要复用。`--stage compile` 的语义就是"把编译走一遍"（改完 extra-note / 改了系统提示词
+    #    之后必须能重编），而这两处原来只看 `_cc_hit`、不看 `reuse_compile` ⇒ 2026-10-23 现网：
+    #    给编译器系统提示词加了 COARSE 覆盖节后重编译，日志却打"【复用编译产物】跳过逐镜编译"、
+    #    prompt.txt 被原样回写（sha8 一字未变）—— 新写的粒度指令根本没进模型。
+    _cc_use = bool(_cc_hit and reuse_compile)
+    if _cc_hit and not _cc_use:
+        log("· 编译缓存是命中的（%s），但这一档【不复用】—— 要重跑一遍编译器（--stage compile 的语义）" % _cc_why)
+    if _cc_use:
         log("=== Step 1/4: 【复用编译产物】%s ⇒ 跳过 MiMo 视频解析与 FunASR 写回（0 token、0 分）===" % _cc_why)
         storyboard = json.loads((_cc_dir / "storyboard.json").read_text(encoding="utf-8"))
     else:
@@ -4867,12 +5761,13 @@ async def run_pipeline(
             scene_image_path=scene_image_path,
             product_name=product_name,
             product_facts=product_facts,
+            frame_facts=_frame_facts,          # 抽帧补充腿的实物事实（没跑成 ⇒ 空串，编译器只看分镜）
             extra_compile_note=extra_compile_note,
             extra_model_image_paths=extra_model_image_paths,
             background_override=background_override,
             on_log=log,
         )
-        if _cc_hit:
+        if _cc_use:
             prompt = (_cc_dir / "prompt.txt").read_text(encoding="utf-8")
             _meta = json.loads((_cc_dir / "prompt_meta.json").read_text(encoding="utf-8"))
             compiled = {"prompt": prompt,
@@ -4892,7 +5787,9 @@ async def run_pipeline(
                 )
                 shot_prompts.append(compiled_one["prompt"])
                 shot_stamps.append(compiled_one)
-            prompt = merge_compiled_shot_prompts(shot_prompts)
+            prompt = merge_compiled_shot_prompts(
+                shot_prompts,
+                compact_global=compact_global_block(product_name, media_manifest))
             # 🔴 合并这条路的信封原来被整个丢掉、只重新盖一个 source ⇒ 逐镜用的哪个模型查不回来。
             #    现在把各镜的 stamp 归并（同名就一个值，不同名就都列出来，不做"看起来一致"的美化）。
             def _merge_key(k: str) -> str:
@@ -4903,7 +5800,12 @@ async def run_pipeline(
                         "ledger": _merge_key("ledger")}
         else:
             compiled = await step1_5_compile_prompt(**compile_kwargs)
-            prompt = compiled["prompt"]
+            # 单镜也走同一个装配口："全局声明由后端补一份"这条规则不能只在多镜路径成立
+            # （否则 1 镜的片子整条稿子里没有全局替换声明 —— 而提示词已明令模型自己别写）。
+            prompt = merge_compiled_shot_prompts(
+                [compiled["prompt"]],
+                compact_global=compact_global_block(product_name, media_manifest))
+            compiled["prompt"] = prompt
         prompt = force_verbatim_speech(prompt, storyboard)
         compiled["prompt"] = prompt
         try:
@@ -4930,6 +5832,34 @@ async def run_pipeline(
                 raise RuntimeError(
                     f"Step 1.5 Compiler 两次均在不可见 Shot {bad_shots} 引用产品图，停止交付"
                 )
+        # 🔴 逐镜行里自己写了"字幕/花字/水印/屏幕上写着"这类画面文字描述 ⇒ 只重发那几镜。
+        #    为什么必须重发而不是记一笔：那等于把原片要清掉的那行字**又喂回模型**（2026-10-14 成片 8/8 帧
+        #    仍带字幕，其中就有编译器把字幕内容抄进稿子的成分）。台词位引号内的内容先剥掉再判 ⇒ 口播永远不误伤。
+        _bt = burned_text_lines(prompt)
+        if _bt:
+            log("⚠ 逐镜行写了画面文字（Shot %s）⇒ 只重发这几镜（不得描述任何屏幕文字，成片要全画面干净）" % _bt)
+            for _n in _bt:
+                _shot = next((s for s in storyboard if int(s.get("shot") or 0) == _n), None)
+                if _shot is None:
+                    continue
+                _one = await step1_5_compile_prompt(
+                    **{**compile_kwargs, "storyboard": [_shot],
+                       "extra_compile_note": "本镜严禁出现任何关于画面文字的描述：不得写字幕、花字、水印、"
+                                             "台标、贴纸、屏幕上写着、标题字样；只写谁在做什么 + 台词位。"})
+                _new = next((l for l in (_one.get("prompt") or "").splitlines()
+                             if l.strip().startswith("Shot 1")), "")
+                _old = next((l for l in prompt.splitlines() if l.strip().startswith("Shot %d " % _n)), "")
+                _m = re.match(r"^(Shot\s+\d+\s+\[[^\]]+\])", _old.strip())
+                _body = re.sub(r"^Shot\s+\d+(\s*\[[^\]]*\])?\s*[:：]?\s*", "", _new.strip(), count=1)
+                if _m and _body and not burned_text_lines(_body):
+                    prompt = replace_shot_line(prompt, _n, "%s: %s" % (_m.group(1), _body))
+            prompt = force_verbatim_speech(prompt, storyboard)
+            compiled["prompt"] = prompt
+            _bt2 = burned_text_lines(prompt)
+            if _bt2:
+                raise RuntimeError(
+                    "Step 1.5 两次仍在逐镜行写画面文字（Shot %s）⇒ 停。成片要求全画面干净，"
+                    "把字幕内容抄进 prompt 等于把它喂回模型，这一格不能靠记一笔放行。" % _bt2)
         log(f"✓ Step 1.5 完成：Grok 编译出 prompt {len(prompt)} 字（来源: {compiled['source']}），时间字段与 storyboard 一致")
 
         if on_phase:
@@ -5091,6 +6021,11 @@ async def run_pipeline(
                 group["shots"], float(group["start"]), float(group["end"])
             )
             log(f"段 {index}/{len(segments)} 编译 Grok prompt（{len(seg_board)} 镜，{seg_duration:.2f}s）")
+            # 🔴 抽帧补充【一整条方案只跑一次】（在编译指纹之前那一档跑的 `_frame_facts`）：
+            #    实测一次 8 帧 = 17324 tok = 173 分（免批不免账），按段各跑一次 = 40s 的片白烧 519 分，
+            #    而同一条片每段是【同一个产品】—— 这一腿补的是"产品长什么样"，不是"这一段发生了什么"。
+            #    所以这里直接复用它，并在块里明写"帧取自整片，不许用它推断本段有什么物体"。
+            #    熔断那把闸因此是"每条方案一次"的量级，默认 200 分足够；超出说明有人在重复烧。
             compiled_seg = await step1_5_compile_prompt(
                 storyboard=seg_board,
                 target_duration=seg_duration,
@@ -5101,6 +6036,7 @@ async def run_pipeline(
                 scene_image_path=scene_image_path,
                 product_name=product_name,
                 product_facts=product_facts,
+                frame_facts=_frame_facts,
                 extra_compile_note=extra_compile_note,
                 extra_model_image_paths=extra_model_image_paths,
                 background_override=background_override,
@@ -5128,6 +6064,8 @@ async def run_pipeline(
                     item["path"] for item in seg_manifest if item.get("type") == "product"
                 ]
             # ── 🔴 物证 + 回执 + 花钱前核验：单段与多段共用同一个写者（见 _contract_evidence）──
+            # 编号是否越界按【整单 manifest】判：分段只改"这一段有没有产品"，不改 图N 的归属编号。
+            raise_prompt_preflight(seg_prompt, media_manifest, log=log)
             _contract_evidence(
                 seg_dir, seg_board=seg_board, seg_prompt=seg_prompt, compiled_seg=compiled_seg,
                 seg_duration=seg_duration, ref_video=ref_video,
@@ -5217,6 +6155,7 @@ async def run_pipeline(
                 log(f"⚠ 盘上成片结果不可用（{_s2e}），重新生成")
                 step2 = None
         if step2 is None:
+            raise_prompt_preflight(prompt, media_manifest, log=log)
             _contract_evidence(_whole_dir, seg_board=storyboard, seg_prompt=prompt,
                                compiled_seg=compiled, seg_duration=float(target_duration),
                                ref_video=trimmed_path, seg_product_paths=list(product_image_paths),

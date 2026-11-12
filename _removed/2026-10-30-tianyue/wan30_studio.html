@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wan3.0 直出工作台 · 参考视频 / 音频 / 图片 + 提示词</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d0d1a; color: #e8e8f0; font-family: "Microsoft YaHei", sans-serif; min-height: 100vh; }
+.header { background: linear-gradient(135deg, #1a1a3e, #3a1a3e); padding: 18px 28px; border-bottom: 1px solid #2a2a5c; display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+.header h1 { font-size: 20px; font-weight: 600; }
+.header .sub { color: #8888aa; font-size: 12px; margin-top: 4px; line-height: 1.6; }
+.header a { color: #9b8bff; font-size: 12px; text-decoration: none; margin-left: 14px; }
+.chip { display: inline-block; background: #22224a; border: 1px solid #33335c; border-radius: 999px; padding: 3px 10px; font-size: 11px; color: #aab; margin-right: 6px; }
+.main { max-width: 1300px; margin: 0 auto; padding: 20px; }
+.step { background: #15152a; border: 1px solid #2a2a5c; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.step-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.step-num { background: #b53d7a; color: #fff; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; }
+.step-note { font-size: 11.5px; color: #8888aa; margin-bottom: 12px; line-height: 1.7; }
+label { display: block; font-size: 12px; color: #9999bb; margin: 10px 0 4px; }
+input[type=text], input[type=number], textarea, select { width: 100%; background: #0d0d1a; border: 1px solid #2a2a5c; color: #e8e8f0; border-radius: 8px; padding: 9px 12px; font-size: 13px; outline: none; }
+input:focus, textarea:focus, select:focus { border-color: #b53d7a; }
+textarea { resize: vertical; min-height: 120px; font-family: inherit; line-height: 1.7; }
+input[readonly] { background: #1a1a30; color: #9a9ac0; border-style: dashed; }
+.btn { background: #b53d7a; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; font-size: 13px; cursor: pointer; transition: .15s; }
+.btn:hover { background: #d24d90; }
+.btn:disabled { background: #333355; color: #777; cursor: not-allowed; }
+.btn-blue { background: #5b3df5; } .btn-blue:hover { background: #6d52ff; }
+.btn-ghost { background: transparent; border: 1px solid #2a2a5c; color: #bbb; }
+.btn-ghost:hover { border-color: #b53d7a; background: #2a1a3e; }
+.row { display: flex; gap: 14px; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 220px; }
+.drop { border: 1px dashed #3a3a6c; border-radius: 10px; padding: 14px 12px; text-align: center; color: #8888aa; font-size: 12px; cursor: pointer; background: #101024; line-height: 1.7; }
+.drop:hover, .drop.over { border-color: #b53d7a; color: #cfa; background: #1a1230; }
+.drop b { color: #ccd; font-size: 12.5px; }
+.drop input { display: none; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.asset { background: #10102a; border: 1px solid #2a2a5c; border-radius: 8px; padding: 8px 10px; font-size: 11px; color: #99a; max-width: 100%; line-height: 1.6; }
+.asset.ok { border-color: #2e6b46; }
+.asset.bad { border-color: #6b2e38; }
+.asset .t { color: #ff9ab8; font-weight: 600; margin-right: 6px; }
+.asset a { color: #7ab4ff; text-decoration: none; word-break: break-all; }
+.asset .x { color: #e08a9a; cursor: pointer; margin-left: 8px; }
+.asset img { max-height: 46px; border-radius: 4px; vertical-align: middle; margin-right: 6px; }
+.tip { background: #1a1a3e; border-left: 3px solid #b53d7a; padding: 10px 12px; border-radius: 6px; font-size: 12px; color: #aab; margin: 10px 0; line-height: 1.8; }
+.tip ul { margin-left: 18px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-right: 4px; }
+.badge.gray { background: #2a2a4c; color: #99a; }
+.badge.green { background: #14432c; color: #4fd68e; }
+.badge.red { background: #4c1e24; color: #ff8896; }
+.badge.yellow { background: #4c3c14; color: #ffd266; }
+.badge.blue { background: #1e3a6e; color: #7ab4ff; }
+.log-box { background: #0a0a16; border: 1px solid #22224a; border-radius: 8px; padding: 12px; max-height: 260px; overflow-y: auto; font-family: Consolas, monospace; font-size: 11.5px; line-height: 1.75; color: #99a; margin-top: 12px; white-space: pre-wrap; word-break: break-all; }
+table.exec { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 11.5px; }
+table.exec th, table.exec td { border: 1px solid #22224a; padding: 6px 8px; text-align: left; vertical-align: top; word-break: break-all; }
+table.exec th { background: #16162e; color: #9b8bff; font-weight: 600; width: 120px; }
+video { width: 100%; max-height: 520px; border-radius: 8px; background: #000; margin-top: 10px; }
+.ghost { color: #667; font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>wan3.0 直出工作台</h1>
+    <div class="sub">参考视频 / 参考音频 / 参考图 + 提示词 → 一条成片 · 素材自动换公网直链 · 点提交就出片（免审批，账照记：预扣→结算/回滚）</div>
+    <div style="margin-top:8px" id="chips"><span class="chip">腿：video.generate/wan30-studio</span></div>
+  </div>
+  <div style="white-space:nowrap">
+    <a href="/">首页</a>
+    <a href="http://127.0.0.1:8100/approval" target="_blank">批准页 8100</a>
+    <a href="http://127.0.0.1:8100/" target="_blank">模型网关</a>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- 1 素材 -->
+  <div class="step">
+    <div class="step-title"><span class="step-num">1</span>参考素材（视频 / 音频 / 图片，可多个）</div>
+    <div class="step-note">上游只吃公网 http/https 外链（它自己去下载素材）。这里传本地文件，落地后自动换成直链；换不成直链会当场说清是 key 坏还是网络坏，不留"看起来传好了"的假状态。</div>
+    <div class="row">
+      <div><div class="drop" id="drop-video"><b>参考视频</b><br>mp4 / mov / webm<br>点选或拖进来<input type="file" id="file-video" accept="video/*" multiple></div></div>
+      <div><div class="drop" id="drop-audio"><b>参考音频</b><br>wav / mp3 / m4a / flac<br>点选或拖进来<input type="file" id="file-audio" accept="audio/*" multiple></div></div>
+      <div><div class="drop" id="drop-image"><b>参考图</b><br>jpg / png / webp<br>点选或拖进来<input type="file" id="file-image" accept="image/*" multiple></div></div>
+    </div>
+    <div class="chips" id="assets"><span class="ghost">还没传素材</span></div>
+    <div class="tip" id="mediaNotes"></div>
+  </div>
+
+  <!-- 2 提示词与参数 -->
+  <div class="step">
+    <div class="step-title"><span class="step-num">2</span>提示词与参数</div>
+    <label>提示词（prompt，上游必填）</label>
+    <textarea id="prompt" placeholder="写清楚：主体 / 动作 / 场景 / 镜头 / 光线 / 质感。有参考素材时，指明哪条视频定动作、哪张图定产品或人。"></textarea>
+    <div class="row">
+      <div>
+        <label>输出时长（秒）</label>
+        <input type="number" id="duration" value="12" min="1" step="1">
+        <div class="ghost" id="durHint"></div>
+      </div>
+      <div>
+        <label>画幅 aspect_ratio</label>
+        <select id="ratio"></select>
+      </div>
+      <div>
+        <label>分辨率（跟着模型档走，不单独选）</label>
+        <input type="text" id="resolution" value="1080P" readonly>
+      </div>
+      <div>
+        <label>模型（同一条渠道、同一把 key，两条档都真生效）</label>
+        <select id="model"></select>
+        <div class="ghost" id="modelHint"></div>
+      </div>
+    </div>
+    <div class="tip" id="modelNotes"></div>
+    <div class="tip" id="limits"></div>
+  </div>
+
+  <!-- 3 提交 -->
+  <div class="step">
+    <div class="step-title"><span class="step-num">3</span>提交生成</div>
+    <div class="step-note">点一下就出片，不再弹批准窗（2026-10-21 定：video-skill 的生视频不要审批）。账照记：网关预扣 → 提交 → 轮询 → 落盘 → 结算/回滚，一段一条，失败自动退回。</div>
+    <button class="btn" id="btnSubmit">提交生成</button>
+    <button class="btn btn-ghost" id="btnStop">停止看状态</button>
+    <span class="ghost" id="runState"></span>
+    <div class="log-box" id="runLog">还没提交。</div>
+    <div id="result"></div>
+  </div>
+
+  <!-- 4 自动回传 -->
+  <div class="step">
+    <div class="step-title"><span class="step-num">4</span>自动回传（有号没片的，每 30 秒自己去 GET 一次）</div>
+    <div class="step-note">上游任务号在提交那一刻就被网关写进成片旁边的 <code>wan3_job.json</code> ⇒ 进程重启、页面关掉、轮询超时都不必你贴号：8090 一起来就自己接着捞。这一条腿只发 GET、绝不 POST，所以物理上不可能双花。</div>
+    <div class="chips" id="pendingList"><span class="ghost">正在读盘…</span></div>
+    <span class="ghost" id="pendingMeta"></span>
+  </div>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = { media: [], opts: null, polling: null, task_id: '', running: false };
+const KIND_T = { video: '视频', audio: '音频', image: '图' };
+
+function log(el, msg) {
+  const t = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+  el.textContent = el.textContent.replace(/^还没提交。\n?/, '') + '[' + t + '] ' + msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ── 选项：页面所有档位来自网关唯一源 ──
+async function loadOptions() {
+  const r = await fetch('/api/wan30-studio/options');
+  const o = await r.json();
+  if (o.disabled) {
+    $('#chips').innerHTML = '<span class="chip">腿：' + esc(o.lane) + '（已下架）</span>';
+    const band = document.createElement('div');
+    band.className = 'tip';
+    band.style.borderLeftColor = '#ff8896';
+    band.innerHTML = '<b style="color:#ff9ab8">这条腿已下架，提交已禁用</b>：' + esc(o.disabled);
+    document.querySelector('.main').prepend(band);
+    $('#btnSubmit').disabled = true;
+    $('#model').innerHTML = '<option>（腿已下架）</option>';
+    return;
+  }
+  state.opts = o;
+  $('#chips').innerHTML = [
+    '<span class="chip">腿：' + esc(o.lane) + '</span>',
+    '<span class="chip">上游：' + esc(o.provider) + ' · ' + esc(o.base_url) + '</span>',
+    '<span class="chip">主模型：' + esc(o.model) + '</span>',
+    '<span class="chip">兜底：' + esc(o.fallback_model || '无') + '</span>',
+    '<span class="chip">key：' + (o.key_ready ? '已配（值不回显）' : '未配') + '</span>',
+    '<span class="chip">出网代理：' + esc(o.proxy || '直连') + '</span>',
+    '<span class="chip">单价：' + o.unit_price + ' 分/段【占位·未实测】</span>',
+    '<span class="chip">duration 口径：' + esc(o.duration_mode) + '</span>',
+    '<span class="chip">审批：' + (o.needs_approval ? '要（点提交前先得有条子）' : '免 · 账照记') + '</span>'
+  ].join('');
+  $('#ratio').innerHTML = o.ratios.map(x => '<option value="' + x + '"' + (x === 'adaptive' ? ' selected' : '') + '>' + x + '</option>').join('');
+  $('#durHint').textContent = 'duration 口径：' + o.duration_mode + '（duration 与 video_duration 都按这个口径发出去）。';
+  $('#limits').innerHTML = '<b>这条腿说清的边界（照实测与参数表，不粉饰）</b><ul>'
+    + o.known_limits.map(x => '<li>' + esc(x) + '</li>').join('')
+    + '<li>没有的东西：' + Object.entries(o.not_supported).map(([k, v]) => k + '（' + v + '）').join('；') + '</li></ul>';
+  $('#mediaNotes').innerHTML = '<b>三类素材各自的真实口径</b><ul>'
+    + Object.entries(o.media_notes).map(([k, v]) => '<li>' + esc(KIND_T[k] || k) + '：' + esc(v) + '</li>').join('') + '</ul>';
+  // 部署一致判据（不是兼容垫片）：跑着的 8090 若是【旧版模块】，`options` 就不给 models。
+  // 那时页面其余格照常，但模型/档位无从校验 ⇒ 禁提交并大声说"后端还没重载"，不许让人对着旧行为点。
+  if (!Array.isArray(o.models) || !o.models.length) {
+    const band = document.createElement('div');
+    band.className = 'tip';
+    band.style.borderLeftColor = '#ff8896';
+    band.innerHTML = '<b style="color:#ff9ab8">后端进程还是旧版</b>：跑着的 8090 没重载这一页的后端'
+      + '（模型表 / 自动回传 都没实现）⇒ <b>提交已禁用</b>，等重载后再用，别拿它试。';
+    document.querySelector('.main').prepend(band);
+    $('#btnSubmit').disabled = true;
+    $('#model').innerHTML = '<option>（后端没给模型表）</option>';
+    return;
+  }
+  $('#model').innerHTML = o.models.map((m, i) => '<option value="' + esc(m.id) + '"' + (i === 0 ? ' selected' : '') + '>'
+    + esc(m.id) + ' · ' + esc(m.resolution) + (m.proven ? ' · 实测过' : ' · 未跑过') + '</option>').join('');
+  $('#model').onchange = renderModel;
+  renderModel();
+}
+
+function renderModel() {
+  const o = state.opts; if (!o || !o.models.length) return;
+  const m = o.models.find(x => x.id === $('#model').value) || o.models[0];
+  $('#resolution').value = m.resolution;
+  const cap = m.duration_max_with_ref_video;
+  $('#modelHint').textContent = '这一档 = ' + m.resolution + '（分辨率不单独选）· 时长下限 ' + m.duration_min + ' 秒'
+    + (cap ? '；带参考视频只能 5-' + cap + ' 秒' : '；时长上限未实测')
+    + (m.proven ? ' · 实测口径：' + ((m.proven_shape || {}).shape || '') : ' · 这条我们还没跑过')
+    + ' · ' + m.fallback;
+  $('#modelNotes').innerHTML = '<b>' + esc(m.id) + ' 的入参事实（来源逐条标注，没跑过的就写没跑过）</b>'
+    + '<div class="ghost" style="margin:5px 0 8px">' + esc(m.loose) + '</div><ul>'
+    + Object.entries(m.media).map(([k, v]) => '<li>' + esc(KIND_T[k] || k) + '：' + esc(v) + '</li>').join('')
+    + (m.price_seen ? '<li>价格证据：' + esc(m.price_seen) + '</li>' : '')
+    + '<li>这条在网关档位里吗：' + (m.in_lane ? '在（' + esc(m.lane_chain.join(' → ')) + '）'
+        : '<b style="color:#ff9ab8">不在了 ⇒ 提交会被拒，先核对档位表</b>') + '</li>'
+    + '<li>媒体能力卡这件事：' + esc(o.media_capability) + '</li></ul>';
+  $('#duration').min = m.duration_min;
+}
+
+// ── 素材上传 ──
+function bindDrop(kind) {
+  const box = $('#drop-' + kind), inp = $('#file-' + kind);
+  box.addEventListener('click', () => inp.click());
+  ['dragover','dragleave','drop'].forEach(ev => box.addEventListener(ev, e => {
+    e.preventDefault();
+    box.classList.toggle('over', ev === 'dragover');
+    if (ev === 'drop' && e.dataTransfer.files.length) uploadFiles(kind, e.dataTransfer.files);
+  }));
+  inp.addEventListener('change', () => { uploadFiles(kind, inp.files); inp.value = ''; });
+}
+async function uploadFiles(kind, files) {
+  for (const f of files) {
+    const fd = new FormData(); fd.append('file', f); fd.append('kind', kind);
+    const holder = { id: 'up_' + Math.random().toString(36).slice(2, 8), kind: kind, name: f.name };
+    state.media.push(holder); renderAssets();
+    let r;
+    try {
+      r = await fetch('/api/wan30-studio/media', { method: 'POST', body: fd });
+    } catch (e) {
+      holder.bad = '请求没发出去：' + e; renderAssets(); continue;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { holder.bad = (j.detail || JSON.stringify(j)).slice(0, 300); }
+    else { Object.assign(holder, j, { size: j.size }); }
+    renderAssets();
+  }
+}
+function renderAssets() {
+  const box = $('#assets');
+  if (!state.media.length) { box.innerHTML = '<span class="ghost">还没传素材</span>'; return; }
+  box.innerHTML = state.media.map((m, i) => {
+    if (m.bad) return '<div class="asset bad"><span class="t">' + esc(KIND_T[m.kind]) + '</span>'
+      + esc(m.name) + '<br>没换成公网直链：' + esc(m.bad) + '<span class="x" data-i="' + i + '">✕ 移除</span></div>';
+    if (!m.public_url) return '<div class="asset"><span class="t">' + esc(KIND_T[m.kind]) + '</span>'
+      + esc(m.name) + '（' + (m.size / 1048576).toFixed(1) + 'MB）上传中…</div>';
+    const thumb = m.kind === 'image' ? '<img src="' + esc(m.public_url) + '">' : '';
+    return '<div class="asset ok">' + thumb + '<span class="t">' + esc(KIND_T[m.kind]) + '</span>'
+      + esc(m.filename) + '（' + (m.size / 1048576).toFixed(1) + 'MB）<br>'
+      + '<a href="' + esc(m.public_url) + '" target="_blank">' + esc(m.public_url.slice(0, 62)) + '…</a>'
+      + '<span class="x" data-i="' + i + '">✕ 移除</span></div>';
+  }).join('');
+  box.querySelectorAll('.x').forEach(x => x.onclick = () => { state.media.splice(+x.dataset.i, 1); renderAssets(); });
+}
+function urlsOf(kind) { return state.media.filter(m => m.kind === kind && m.public_url).map(m => m.public_url); }
+function payload() {
+  return {
+    prompt: $('#prompt').value.trim(),
+    duration: +$('#duration').value,
+    resolution: $('#resolution').value,
+    ratio: $('#ratio').value,
+    model: $('#model').value,
+    image_urls: urlsOf('image'), video_urls: urlsOf('video'), audio_urls: urlsOf('audio')
+  };
+}
+
+// ── 提交与轮询 ──
+async function submit() {
+  const el = $('#runLog'); $('#result').innerHTML = '';
+  if (state.running) { log(el, '上一条还没结 ⇒ 不再提交（同一条重投 = 双花，这条渠道没有对账口）。它的成片由第 4 格自动回传兜住。'); return; }
+  log(el, 'POST /api/wan30-studio/submit …');
+  const r = await fetch('/api/wan30-studio/submit', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload()) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { log(el, '【没提交】' + (j.detail || JSON.stringify(j))); $('#runState').innerHTML = '<span class="badge red">被拒</span>'; return; }
+  state.task_id = j.task_id; state.running = true; $('#btnSubmit').disabled = true;
+  log(el, '已点火 task_id=' + j.task_id + ' · 预计 ' + j.credits_estimate + ' 分（免批、账照记）· 这条锁的模型 '
+      + j.model_will_use + (j.model_pinned ? '（显式点名 ⇒ 不换兜底）' : '（未点名 = 主 + 自动兜底）') + ' · 落盘 ' + j.out_dir);
+  (j.warnings || []).forEach(w => log(el, '⚠ ' + w));
+  $('#runState').innerHTML = '<span class="badge blue">' + esc(j.task_id) + '</span>';
+  poll();
+}
+function poll() {
+  clearInterval(state.polling);
+  state.polling = setInterval(async () => {
+    try {
+      const r = await fetch('/api/wan30-studio/status/' + state.task_id);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { log($('#runLog'), '【状态读不到】' + (j.detail || '')); clearInterval(state.polling); return; }
+      const line = '阶段 ' + (j.stage || '?') + (j.job_id ? ' · 上游任务号 ' + j.job_id : '')
+        + (j.seconds != null ? ' · 已 ' + j.seconds + 's' : '');
+      if ($('#runLog').dataset.last !== line) { log($('#runLog'), line); $('#runLog').dataset.last = line; }
+      if (j.stage === 'done' || j.stage === 'failed') {
+        clearInterval(state.polling);
+        state.running = false; $('#btnSubmit').disabled = false;
+        renderResult(j);
+      }
+    } catch (e) { log($('#runLog'), '状态请求炸了：' + e); }
+  }, 5000);
+}
+function renderResult(t) {
+  const el = $('#runLog');
+  if (t.ok) log(el, '成功：' + t.local_path + '（' + ((t.bytes || 0) / 1048576).toFixed(1) + 'MB）');
+  else log(el, '失败：' + (t.error || '没给原因') + (t.approval ? ' 批准态：' + JSON.stringify(t.approval) : ''));
+  if (t.fallback_from) log(el, '换了兜底模型：从 ' + t.fallback_from + ' 换成 ' + t.model_used + '（' + (t.fallback_why || '') + '）');
+  const credits = t.credits || {};
+  $('#result').innerHTML =
+     '<label>成片</label>'
+   + (t.ok ? '<video src="' + esc(t.out_url || '') + '" controls></video>' : '<div class="ghost">没出片。</div>')
+   + '<table class="exec"><tr><th>腿 / 上游</th><td>' + esc(t.lane || '') + ' · tianyue</td></tr>'
+   + '<tr><th>模型（署名）</th><td>' + esc(t.model_used || '没记') + (t.fallback_from ? '（由 ' + esc(t.fallback_from) + ' 换过来）' : '') + '</td></tr>'
+   + '<tr><th>上游任务号</th><td>' + esc(t.job_id || '没拿到') + '</td></tr>'
+   + '<tr><th>本机落盘</th><td>' + esc(t.local_path || '') + '</td></tr>'
+   + '<tr><th>直链</th><td>' + (t.ok ? '<a href="' + esc(t.out_url) + '" style="color:#7ab4ff">' + esc(t.out_url) + '</a>' : '—')
+   + ' <span class="ghost">（上游那条签名直链会过期，页面上给的是本机地址）</span></td></tr>'
+   + '<tr><th>字节 / 大小</th><td>' + (t.bytes || 0) + ' B</td></tr>'
+   + '<tr><th>积分</th><td>预计 ' + (credits.estimated == null ? '没记' : credits.estimated)
+   + ' · 实扣 ' + (credits.charged == null ? '没记' : credits.charged)
+   + ' · 余额 ' + (credits.balance_after == null ? '没记' : credits.balance_after) + '</td></tr>'
+   + '<tr><th>上游直链</th><td>' + esc(t.upstream_url || '信封里没给') + '</td></tr>'
+   + '<tr><th>备注</th><td>' + esc(t.note || '') + '</td></tr>'
+   + '<tr><th>拒因（若失败）</th><td>' + esc(t.error || '') + '</td></tr></table>';
+}
+async function loadPending() {
+  try {
+    const r = await fetch('/api/wan30-studio/pending'); const j = await r.json();
+    const box = $('#pendingList');
+    if (!j.tasks.length) {
+      box.innerHTML = '<span class="ghost">盘上还没有任务 —— 提交一次就有了，上游号一拿到就落盘。</span>';
+    } else {
+      box.innerHTML = j.tasks.map(t => {
+        const badge = t.have_file ? '<span class="badge green">已回传</span>'
+          : (t.status === 'abandoned' ? '<span class="badge red">追了 ' + t.attempts + ' 次放弃</span>'
+          : (t.watching ? '<span class="badge blue">正在 GET</span>'
+          : '<span class="badge yellow">' + esc(t.stage || '待自动回传')
+            + (t.attempts ? ' · 已试 ' + t.attempts + ' 次' : '') + '</span>'));
+        const size = t.bytes ? (t.bytes / 1048576).toFixed(1) + 'MB' : '还没落盘';
+        return '<div class="asset' + (t.have_file ? ' ok' : '') + '">' + badge
+          + '<b style="color:#ccd">' + esc(t.task_id) + '</b><br>号 ' + esc(t.job_id || '没拿到')
+          + ' · ' + size + '<br><a href="' + esc(t.out_url) + '" target="_blank">' + esc(t.task_id)
+          + '/wan30.mp4</a>' + (t.model ? ' · ' + esc(t.model) : '')
+          + (t.error ? '<br><span style="color:#ff9ab8">' + esc(String(t.error).slice(0, 140)) + '</span>' : '')
+          + '</div>';
+      }).join('');
+    }
+    const rc = j.reconcile || {};
+    $('#pendingMeta').textContent = '自愈每 ' + j.interval_seconds + ' 秒一轮 · 上轮扫 ' + (rc.scanned || 0)
+      + ' 条、起腿 ' + (rc.pulled || 0) + ' 条 · ' + j.rule;
+  } catch (e) { $('#pendingMeta').textContent = '盘上状态读不到：' + e; }
+}
+setInterval(loadPending, 10000); loadPending();
+
+['video','audio','image'].forEach(bindDrop);
+$('#btnSubmit').onclick = submit;
+$('#btnStop').onclick = () => { clearInterval(state.polling); state.running = false; $('#btnSubmit').disabled = false; log($('#runLog'), '已停止读状态。上游那条还在跑，成片会由第 4 格【自动回传】自己 GET 回来，不用你贴号。'); };
+loadOptions().catch(e => { $('#chips').innerHTML = '<span class="chip" style="color:#ff8896">选项读不到：' + esc(e) + '</span>'; });
+</script>
+</body>
+</html>

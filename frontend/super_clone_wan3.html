@@ -259,6 +259,11 @@
         .gen-cost { font-weight: 500; opacity: .85; margin-left: 6px; }
         .gen-hint { font-size: .8em; color: #888; }
         .gen-hint.err { color: #f87171; }
+        .gen-choice {
+            display: flex; align-items: flex-start; gap: 8px; margin: 4px 0 2px;
+            font-size: .8em; color: #9aa0b5; line-height: 1.5; cursor: pointer;
+        }
+        .gen-choice input { margin-top: 2px; accent-color: #6c3ce0; }
 
         /* 状态面板 */
         .status-panel { margin-bottom: 16px; }
@@ -278,6 +283,8 @@
         .badge-completed { background: rgba(52, 211, 153, .15); color: #34d399; }
         .badge-failed { background: rgba(248, 113, 113, .15); color: #f87171; }
         .badge-interrupted { background: rgba(249, 115, 22, .15); color: #fb923c; }
+        /* 已编译·未提交：既不是成功也不是失败，别蹭绿色（绿色=片子已经在了） */
+        .badge-compiled { background: rgba(96, 165, 250, .16); color: #60a5fa; }
 
         /* 步骤条（4 步） */
         .steps-bar {
@@ -484,6 +491,11 @@
                 <div class="section-title"><span class="dot"></span> 客户需求说明（可选）</div>
                 <textarea class="text-field" id="customerRequest" placeholder="可选，如：户外露营场景背景、突出三个塑料杯的不同图案特征、要展示产品韧性、三杯并列展示时三个图案都要出现..."></textarea>
             </div>
+
+            <label class="gen-choice" for="chkDirectGen">
+                <input type="checkbox" id="chkDirectGen">
+                <span>编译完直接生成视频（不勾 = 停在提示词那一步，你点「生成视频」才花钱）</span>
+            </label>
 
             <button class="run-btn" id="btnRun" onclick="startPipeline()" disabled>🚀 开始超级复刻</button>
 
@@ -1049,6 +1061,8 @@ async function startPipeline() {
         product_image_paths: productPaths,
         customer_request: customerRequest,
         engine: 'wan3',
+        // 默认停在提示词：花钱那一刀由「生成视频」那一下发起（勾了才一步到底）
+        compile_only: !document.getElementById('chkDirectGen').checked,
         // 分辨率不在这里写死：写死 = 第二份真相（这里曾是 '480P'，而 wan3-prime 那条 lane 根本没有 480p 档，
         // 以前被后端"警告一句然后硬改成 1080P"糊过去了）。档位唯一源 = gateway._WAN30_RES_MODEL，
         // 不传就走服务端默认档；要给客户选档是另一件事，得从网关读档位列表，别再抄一份字面量。
@@ -1181,6 +1195,21 @@ async function pollStatus() {
                 links.style.display = 'flex';
             }
             loadHistory();
+        } else if (data.status === 'COMPILED') {
+            // 编译完就停在这一格：没建预扣、没提交、0 分。花钱那一刀是提示词下面那颗按钮。
+            clearInterval(pollTimer);
+            pollTimer = null;
+            setStatus('compiled', '已编译 · 等你点生成');
+            document.getElementById('btnRun').disabled = false;
+            document.getElementById('btnRun').textContent = '🚀 开始超级复刻';
+            const box = document.getElementById('logBox');
+            const line = document.createElement('div');
+            line.className = 'log-line success';
+            line.innerHTML = '<span class="ts">✓</span>提示词已编译并自检通过（0 分未扣、任务未发起）'
+                + '⇒ 审完点提示词下面那颗「生成视频」才提交。';
+            box.appendChild(line);
+            box.scrollTop = box.scrollHeight;
+            loadHistory();
         } else if (data.status === 'FAILED') {
             clearInterval(pollTimer);
             pollTimer = null;
@@ -1252,6 +1281,11 @@ function updateSteps(phase, status) {
         s2.className = 'step-item done'; l2.className = 'done';
         s3.className = 'step-item done'; l3.className = 'done';
         s4.className = 'step-item active'; l4.className = 'active';
+    } else if (phase === 'compiled') {
+        // 前三步做完了，第四步【等人点】⇒ 第四格留空，不许画成 active（那看着像在跑）
+        s1.className = 'step-item done'; l1.className = 'done';
+        s2.className = 'step-item done'; l2.className = 'done';
+        s3.className = 'step-item done'; l3.className = 'done';
     }
 }
 
@@ -1283,20 +1317,26 @@ function escapeHtml(s) {
 const STATUS_TEXT = {
     SUCCESS: '完成', FAILED: '失败', RUNNING: '运行中',
     PENDING: '排队中', INTERRUPTED: '已中断',
+    COMPILED: '已编译 · 等你点生成',
 };
 const PHASE_TEXT = {
     step0_trim: '裁剪', step1_mimo: '分镜解析', step1_5_gpt_compile: '提示词编译',
     step2_gpt_lint: '提示词校验', step3_wan3: '视频生成', step2_wan3: '视频生成',
-    completed: '完成',
+    compiled: '已编译（未提交）', completed: '完成',
 };
 
 // 断点继续：从磁盘快照恢复，已完成步骤复用、缺失才重跑
 // ask=false ⇒ 一步就开（提示词下面那颗「生成视频」用的就是这条，不再弹二次确认）
-async function resumeTask(taskId, btn, ask) {
+// spend=true 只由「生成视频」那一击带：人才有"提交到底"的意图；不带就守 compile_only，编译完停住等审
+async function resumeTask(taskId, btn, ask, spend) {
     if (ask !== false && !confirm(`从断点继续任务 ${taskId}？\n已完成的步骤会复用磁盘产物，不会重复消耗 token / 积分。`)) return false;
     if (btn) btn.disabled = true;
     try {
-        const resp = await fetch(`/api/super-clone-wan3/resume/${taskId}`, { method: 'POST' });
+        const resp = await fetch(`/api/super-clone-wan3/resume/${taskId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ spend: !!spend }),
+        });
         const data = await resp.json();
         if (!resp.ok || !data.success) {
             throw new Error(data.detail || '续跑失败');
@@ -1354,7 +1394,7 @@ function renderGenerateOffer(data) {
 
 async function generateVideo() {
     if (!currentTaskId) return;
-    await resumeTask(currentTaskId, null, false);
+    await resumeTask(currentTaskId, null, false, true);
 }
 
 async function loadHistory() {
@@ -1372,6 +1412,7 @@ async function loadHistory() {
             div.className = 'history-item';
             const statusClass = t.status === 'SUCCESS' ? 'badge-completed'
                 : t.status === 'FAILED' ? 'badge-failed'
+                : t.status === 'COMPILED' ? 'badge-compiled'
                 : t.status === 'INTERRUPTED' ? 'badge-interrupted'
                 : t.status === 'RUNNING' ? 'badge-running' : 'badge-pending';
             const statusText = STATUS_TEXT[t.status] || t.status;

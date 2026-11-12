@@ -631,7 +631,7 @@ button.no:hover{border-color:var(--bad);color:var(--bad)}
   <div class=slogan>专注电商AI落地</div>
 </header>
 <div id=list></div>
-<p class=foot>本页只听 127.0.0.1 · 每 3 秒自动刷新 · 15 分钟不点自动作废</p>
+<p class=foot>本页只听 127.0.0.1 · 每 3 秒自动刷新 · 【待批】15 分钟没人点自动作废；批过的条子按卡上写的期限（现网 24 小时）</p>
 </div>
 <script>
 const E=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -673,19 +673,27 @@ async function act(d,url,id,word){
     d.querySelector('.msg').className='err';d.querySelector('.msg').textContent='8100 没回话：'+e;}
 }
 async function load(){
-  let rows=[];
-  try{rows=(await (await fetch('/api/spend/pending')).json()).pending||[];}
+  let rows=[],st=null;
+  try{const j=await (await fetch('/api/spend/pending'+(MYSID?'?session='+encodeURIComponent(MYSID):''))).json();
+      rows=j.pending||[]; st=j.session_state||null;}
   catch(e){document.getElementById('list').innerHTML='<div class=card><div class=err>判定口 8100 没回话（不是"没有待批"）：'+E(e)+'</div></div>';return;}
   const box=document.getElementById('list');
   if(MYSID){
     const mine=rows.filter(p=>(p.session||'')===MYSID);
     if(!mine.length){
-      if(box.dataset.last==='none-mine'&&box.children.length)return;
-      box.innerHTML='<div class=empty><b>这条会话（会话 '+E(tail(MYSID))+'）没有待批条子</b>'
-        +'Agent 还没跑 <code>gateway.py approve</code> ⇒ 这里没有任何属于这条会话的可批项。'
-        '<br>不要点别的会话的卡：那一下点的是【别的方案】的额度。'
-        '<br><span style=color:var(--mut)>让它先建条子（建完会自动弹批准窗），再回来看这一页。</span></div>';
-      box.dataset.last='none-mine';return;}
+      // 🔴 状态与措辞都在服务端那一份（gateway.approval_session_state）：这里只渲染。
+      //    以前页面对【任何】空 pending 都印"Agent 还没跑 approve"，把"客户已经批过了、
+      //    条子还没被消费"也说成那句 —— 2026-10-14 现网就是这样把人推去"再建一张"（=批两遍）。
+      const key='st:'+((st&&st.state)||'fallback');
+      if(box.dataset.last===key&&box.children.length)return;
+      const head=(st&&st.head)||('这条会话（会话 '+E(tail(MYSID))+'）没有待批条子');
+      const body=(st&&st.text)||('Agent 还没跑 <code>gateway.py approve</code> ⇒ 这里没有任何属于这条会话的可批项。');
+      // 补充话也来自服务端那一份（foot）：以前这两行写死在页面里，对"已批准待消费"的会话
+      // 前一句催人去再建一张（=批两遍）、后一句把【待批】的 15 分钟 TTL 说成了这张条子的。
+      const foot=((st&&Array.isArray(st.foot))?st.foot:['不要点别的会话的卡：那一下点的是【别的方案】的额度。'])
+        .map(x=>'<br>'+E(x)).join('');
+      box.innerHTML='<div class=empty><b>'+E(head)+'</b>'+E(body)+foot+'</div>';
+      box.dataset.last=key;return;}
     rows=mine;}
   if(!rows.length){
     if(box.dataset.last==='empty'&&box.children.length)return;   // 空态不重绘，免得闪
@@ -807,8 +815,52 @@ def parse_skill_form(text: str) -> list:
                 want = [x.strip() for x in fv.split(",") if x.strip()]
                 if fk.strip() and want:
                     rec["show_if"] = {"key": fk.strip(), "values": want}
+        if rec.get("key") == "engine_lock":
+            # 🔒 引擎行的值/说明【现读网关】，不照抄字段表里的字面量（判据见下面这个函数）
+            # 🔴 覆盖之前先把【字段表原文那一串】留在 value_raw 里：闸 M5 要判的是"字段表有没有写死模型名"，
+            #    读覆盖后的值就变成"现读回来的名字"——2026-10-22 用户把候选收成一条后，单模型分支
+            #    会把真名放进 value（这正是 engine_lock_view 该做的事），于是 M5 把【自己的正确行为】判成红。
+            #    留这一份不是为了显示，是为了让"第二份真相"仍然看得见。
+            rec["value_raw"] = rec.get("value")
+            rec["value"], _note = engine_lock_view(rec.get("value"), rec.get("note"))
+            if _note:
+                rec["note"] = _note
         out.append(rec)
     return out
+
+
+def engine_lock_view(value, note=None):
+    """超级复刻那条 🔒 引擎行的显示值：现读 `gateway` 那条 lane 自己的模型与单价，回落到字段表字面量。
+
+    🔴 为什么不能照抄字段表（2026-10-22 现网"方案和表单显示的不一致"）：2026-10-21 用户把 1080P 改成
+    【按段长二选一】（唯一源 = `gateway.wan30_pick_1080p_by_duration` + `.env` 的主/短两键），
+    而 `SKILL.md` 的 `engine_lock` 行还写死着一条改名前的 `ME-wan30-1080p-1055` ⇒ 客户在表单上看到的
+    引擎和真提交用的引擎不是同一份。一条规则写两处必漂，所以这里只【读】。
+    🔴 2026-10-30 换芯后改成【按路由的 provider 分流】：原来这里直接调 `wan30_accepted_models()`
+       （那是 tianyue 那一条的名单），换芯后表单会显示 "yz30 / ME-WAN3-prime-1080p-1055" ——
+       前一半是新的、后一半是别家的模型名，正是"回执写 A、实跑 B"的展示形状。
+       现在模型名一律从 `gateway.resolve()` 现读（渠道无关），单价从 `gateway.unit_price()` 现读。
+    读不到网关 / 没配 ⇒ 原样回落到字段表那串，绝不自己编一个模型名（宁可旧，不可假）。
+    """
+    try:
+        route = gateway.ROUTES.get(("video.generate", "wan3-prime")) or {}
+        prov = str(route.get("provider") or "").strip()
+        head = (prov + " / ")
+        if prov == "yz30":
+            # 现读【这条路由自己的】模型与单价 —— 不碰 tianyue 那份候选表（那是别家的名单）。
+            mdl = str(gateway.resolve("video.generate", "wan3-prime").get("model") or "").strip()
+            if not mdl:
+                return value, note
+            up = int(gateway.unit_price("video.generate", "wan3-prime") or 0)
+            _n = ("按秒计费 %d 分/秒（15 秒一段 = %d 分）· 模型名与单价都是现读网关，不是这里写死；"
+                  "上游单位是 ⚡/秒（prime 1080P 实测 0.20），⚡→分 的比例【未校准】⇒ 报价必须带『占位』"
+                  % (up, up * 15))
+            return head + mdl, (_n + ("｜" + str(note) if note else ""))
+        # ── prov 不是 yz30（2026-10-30『tianyue lane 移除』后 wan3-prime 只会指 yz30）⇒ 回落字段表，
+        #    绝不自己编模型名（宁可旧，不可假）。
+        return value, note
+    except Exception as e:                              # noqa: BLE001 —— 展示层读不到不许拖垮整张表
+        return value, note
 
 
 def _field_hidden(fd: dict, values: dict) -> bool:
@@ -1102,22 +1154,24 @@ def form_gate_view(sid: str) -> dict:
     #    unfilled_required = 到现在还没值的必填格；loose_materials = 素材根里躺着、却没被引用的文件；
     #    prefill_gap = 两者的【合成判据】（必填素材格缺值 + 根里有闲料）。
     #    runner 与 intent.py 都只读结论，不许自己再解析字段表 ⇒ 判据只在这一份。
-    #    🔴 算的是【生效值】：交过表就以载荷为准，否则以回填为准。2026-10-11 现网发现只对着回填算 ⇒
-    #       一条已经交齐的会话恒报"必填没填"，那是判据自己算错，会把合格对象判红（比漏判更坏）。
-    _def = dict((pre.get("defaults") or {}) if not same else {})
-    _med = dict((pre.get("media") or {}) if not same else {})
-    if same:
-        for k, v in ((payload.get("params") or {}) if same else {}).items():
-            fd = next((f for f in hit["fields"] if f["key"] == k or f.get("param") == k), None)
-            if v is None or v == "":
-                continue
-            if fd is not None and fd["type"] in _FORM_MEDIA:
-                lst = v if isinstance(v, list) else [v]
-                _med[k] = lst
-                if fd.get("param"):
-                    _med[fd["param"]] = lst
-            else:
-                _def[k] = v
+    #    🔴 算的是【生效值】：客户自己填过的格以载荷为准（载荷更权威），载荷里【没有】的格允许回填顶上。
+    #       2026-10-11 现网发现只对着回填算 ⇒ 一条已经交齐的会话恒报"必填没填"（把合格对象判红）。
+    #       2026-10-14 现网发现另一个方向也错：交过表就把回填整格丢掉 ⇒ 字段表后来新增的必填格
+    #       （`voice_audio` 是 10-14 才加的）对一条 10-13 交表的会话【永远填不上】⇒ approve 被报价
+    #       前置恒拒，在途单卡死。"客户没见过这一格"不等于"客户拒绝了这一格"。
+    _def = dict(pre_raw.get("defaults") or {})
+    _med = dict(pre_raw.get("media") or {})
+    for k, v in ((payload.get("params") or {}) if same else {}).items():
+        fd = next((f for f in hit["fields"] if f["key"] == k or f.get("param") == k), None)
+        if v is None or v == "":
+            continue
+        if fd is not None and fd["type"] in _FORM_MEDIA:
+            lst = v if isinstance(v, list) else [v]
+            _med[k] = lst
+            if fd.get("param"):
+                _med[fd["param"]] = lst
+        else:
+            _def[k] = v
     # 素材根 = inputs/（回填唯一认的根）+ src/（agent 自己下载/派生的地方）。
     # 加上 src/ 是为了抓"原片已下载却留在 src、表上原片永远空"那一次事故；
     # outputs/、frames/ 故意不扫 —— 派生物当客户素材判会天天误拦。
@@ -1303,8 +1357,14 @@ def _form_store_files(sid, fields, files):
             if item.get("path") and not item.get("data"):
                 p = os.path.realpath(str(item.get("path") or ""))
                 allow = set(ext_map.values())
-                if not p.startswith(root_real + os.sep) or not os.path.isfile(p):
+                # 🔴 两件事分开报（2026-10-14 现网 15:35）：合成一句"不在表单上传目录里"时，
+                #    "回填记录里的名字已过期（盘上没这个文件）"会被读成"安全闸误伤"，排查方向整个带偏。
+                if not p.startswith(root_real + os.sep):
                     return {}, "%s 第 %d 个文件不在表单上传目录里（不接任意路径）" % (fd["label"], i + 1)
+                if not os.path.isfile(p):
+                    return {}, ("%s 第 %d 个文件在盘上找不到 —— 回填记录里的名字与实际落盘的对不上（不是路径越界）："
+                                "%s ⇒ 让 agent 重新回填这一格，或请客户在这一格重选一次"
+                                % (fd["label"], i + 1, os.path.basename(p)[:56]))
                 if os.path.splitext(p)[1].lstrip(".").lower() not in allow:
                     return {}, "%s 第 %d 个的扩展名不被这个槽接受" % (fd["label"], i + 1)
                 if os.path.getsize(p) > cap_bytes:
@@ -1426,15 +1486,25 @@ def form_submit(body: dict) -> dict:
 #    路径自己拼、无 shell；外部没有任何办法借它跑别的程序。
 KICKOFF_RUNNERS = {"super-clone": os.path.join(".dsh", "skills", "super-clone", "runner", "run.py")}
 KICKOFF_STAGE = "compile"          # 🔴 写死。改成别的值 = 让服务端自己花钱，闸 K2 会红
+# 🔴 2026-10-14 用户裁定翻案：人点上【批准，开始跑】那一下，服务端【直接】起提交腿，不再绕 agent。
+#    原话："审批条子的时候就是提交wan3.0直接触发，别通过agent，太慢了"。慢的真相不是几十秒，是
+#    `form-wake 等着没叫: 原因=agent-not-live` —— 会话不在前台就永不叫醒，条子 16:14 批完 67 分钟
+#    后账本连一笔 preauth 都没有（现网 session-cb4687fe）。
+#    为什么这一刀可以让服务端花：批准那一下【已经是完整授权】—— 条子写死了
+#    capability/purpose/account/段数/分数上限/会话/提交计划指纹/24h，服务端手里已经拿着"该提交什么"。
+#    护栏（闸 K11–K15 钉；`kickoff_submit` 里逐条五道，每条不起都要出声说清为什么）：
+#    ① stage 常量写死，只许 submit；② 必须有一条【人已核销】
+#    （attest.method=dsh-card-click）、未过期、还有剩余段的条子，缺任何一条就不起。
+KICKOFF_SUBMIT_STAGE = "submit"
 COMPILE_WAKE_PATH = os.path.join(WORKSPACE_DIR, ".dsh", "compile_wake.json")
 
 
 def _proc_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    """判活只有一份：读网关的 `pid_alive()`。
+    🔴 原因（2026-10-14 实测）：8100 是用 Popen 起 runner 的父进程，句柄握在自己手里 ——
+       Windows 上 `os.kill(pid, 0)` 对【已退出但句柄还开着】的子进程照样返回成功。
+       拿它判活 ⇒ "编译/提交明明跑完了，牌子却读成还在跑" ⇒ 客户改参数重交被拒、右栏谎报"在跑"。"""
+    return gateway.pid_alive(pid)
 
 
 def kickoff_compile(sid: str, skill: str, rec: dict) -> dict:
@@ -1463,24 +1533,134 @@ def kickoff_compile(sid: str, skill: str, rec: dict) -> dict:
     except OSError:
         fh = subprocess.DEVNULL
         logp = "（日志不可开 ⇒ 丢弃，但照常起）"
-    cmd = [sys.executable, runner, "--from-form", "--session", sid, "--stage", KICKOFF_STAGE]
-    # 🔴 子进程的输出编码必须钉成 utf-8：日志文件是我们以 utf-8 开的，而子进程默认按**系统 ANSI(cp936)**
-    #    往这个句柄里写字节 ⇒ compile.log 半文件是 GBK 乱码（2026-10-12 现网 agent 第一反应就是
-    #    "输出是 GBK 乱码，让我换个方式读"，白烧几步）。人自己在控制台跑照旧走本地编码，不受影响。
+    return _spawn_kickoff(sid, runner, KICKOFF_STAGE, tdir, ".compile.pid", "compile.log")
+
+
+def _spawn_kickoff(sid: str, runner: str, stage: str, tdir: str, pidname: str, logname: str) -> dict:
+    """点火那台子进程的唯一开法（compile 与 submit 共用一份，免得两处漂）。
+
+    命令**永远不来自请求体**：只有白名单里的 runner + 四个固定参数 + 无 shell + cwd 锁工作区。
+    """
+    import subprocess
+    pidf = os.path.join(tdir, pidname)
+    logp = os.path.join(tdir, logname)
+    try:                                  # 🔴 日志打不开不许挡住点火（今天 8100 就是死在这形状上）
+        fh = open(logp, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        fh = subprocess.DEVNULL
+        logp = "（日志不可开 ⇒ 丢弃，但照常起）"
+    cmd = [sys.executable, runner, "--from-form", "--session", sid, "--stage", stage]
+    # 🔴 提交那一档多带一个【固定常量】参数：命中编译缓存就跳过分镜+编译，直接投 wan3.0
+    #    （2026-10-23 现网：人批完点链接，服务端那台却从 Step0 重跑分镜+编译 —— "提交就提交，
+    #     怎么又重写编译了"）。软档语义：不命中就照常重编（不许照 agent 那档硬拒，
+    #     否则一张已生效的批准会花不出去 = 卡死）。仍然不来自请求体 ⇒ 白名单+固定参数那条禁令不变。
+    if stage == KICKOFF_SUBMIT_STAGE:
+        cmd.append("--reuse-compile-if-hit")
+
+    # 🔴 解释器要换成【控制台那一个】（2026-10-22 现网"很多 cmd 窗口闪"）：8100 自己是 pythonw，
+    #    `sys.executable` 就是 pythonw.exe = GUI 子系统 ⇒ 这个进程【根本没有控制台】。而 runner 里
+    #    每起一个控制台子程序（ffmpeg / ffprobe / python / cmd 管道 —— 引擎里 96 个 spawn 点只有 2 个
+    #    自己带了隐藏标志），Windows 必须替那个子进程现开一个控制台 = 桌面上一个新黑框。
+    #    实测两种起法的分别：pythonw+CREATE_NO_WINDOW ⇒ 子孙 GetConsoleWindow() 全是 0（没控制台）；
+    #    python.exe+CREATE_NEW_CONSOLE+STARTUPINFO(SW_HIDE) ⇒ 一个 hwnd（如 40963414）、IsWindowVisible=False，
+    #    而且子孙拿到的是【同一个 hwnd】= 继承 ⇒ 整棵进程树一个窗口都不出。
+    _exe = sys.executable
+    if os.name == "nt" and _exe.lower().endswith("pythonw.exe"):
+        _alt = _exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.isfile(_alt):
+            cmd[0] = _alt
+    # 🔴 子进程输出编码钉 utf-8：日志是我们以 utf-8 开的，子进程默认按系统 ANSI(cp936) 往里写字节
+    #    ⇒ compile.log 半文件 GBK 乱码（2026-10-12 现网 agent 白烧几步去"换个方式读"）。
     _env = dict(os.environ)
     _env["PYTHONIOENCODING"] = "utf-8"
     try:
-        p = subprocess.Popen(cmd, cwd=WORKSPACE_DIR, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
-                             env=_env,
-                             creationflags=(0x00000008 | 0x00000200) if os.name == "nt" else 0)
+        _si = None
+        if os.name == "nt":
+            import subprocess as _sp
+            _si = _sp.STARTUPINFO()
+            _si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0                                  # SW_HIDE：控制台开出来就是隐藏的
+        pr = subprocess.Popen(cmd, cwd=WORKSPACE_DIR, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+                              env=_env, startupinfo=_si,
+                              # 🔴 CREATE_NEW_CONSOLE + 隐藏窗口，不是 CREATE_NO_WINDOW（2026-10-22 现网"很多 cmd 窗口闪"）：
+                              #    8100 是 pythonw（GUI 无控制台），CREATE_NO_WINDOW 让 runner 也【一个控制台都没有】⇒
+                              #    它每起一个控制台子程序（ffmpeg / ffprobe / python / cmd 管道 —— 引擎里 96 个 spawn 点
+                              #    只有 2 个自己带了隐藏标志），Windows 就替那个子进程【现开一个新控制台 = 一个新黑框】
+                              #    ⇒ 一次编译闪几十个窗口。上一版（0x08000000）治好的是"runner 自己那一个框"，
+                              #    留下的正是"N 个框"这个形状。给 runner 一个建好即隐藏的控制台，子孙全部继承它：
+                              #    窗口一个不出，而且 os.system / C 层起的进程一起覆盖到（那是 96 个调用点改不出来的）。
+                              #    0x08000000(CREATE_NO_WINDOW) 与 0x00000010(CREATE_NEW_CONSOLE) 互斥，只能留一个。
+                              creationflags=(0x00000010 | 0x00000200) if os.name == "nt" else 0)
     except OSError as e:
         return {"started": False, "why": "起进程失败：%s: %s" % (type(e).__name__, str(e)[:120])}
     try:
         with open(pidf, "w", encoding="utf-8") as f:
-            f.write(str(p.pid))
+            f.write(str(pr.pid))
     except OSError:
         pass
-    return {"started": True, "pid": p.pid, "log": logp, "cmd": " ".join(cmd[-4:])}
+    return {"started": True, "pid": pr.pid, "log": logp, "stage": stage, "cmd": " ".join(cmd[-4:])}
+
+
+def kickoff_submit(sid: str, grant: dict) -> dict:
+    """人点上【批准，开始跑】那一下：服务端直接起这条已批方案的提交腿，不等 agent 醒。
+
+    🔴 五道护栏，缺一条就不起（每条都要说人话，不许静默 —— 起不来时人要知道为什么）：
+      ① 条子必须【人生点过】：attest.method=dsh-card-click（agent 单方面签不出这一格）；
+      ② 未过期；③ 还有剩余段（used<count）—— 花完的条子再起一次就是替别人重复消费授权；
+      ④ 这条线在白名单 KICKOFF_RUNNERS 里（没配的线仍由 agent 发起，不猜命令）；
+      ⑤ 同一个任务目录不许两台（.submit.pid 牌子活着 ⇒ 复用；防"服务端起了、agent 醒来又起一台"
+         互相覆盖同名产物 —— 2026-10-12 那个现网形状）。
+    """
+    import time as _t
+    g = grant or {}
+    gid = str(g.get("id") or "")
+    sid = str(sid or g.get("session") or "")
+    if not sid:
+        return {"started": False, "why": "条子没有会话号 ⇒ 不起（不猜该往哪条会话跑）"}
+    att = g.get("attest") or {}
+    if str(att.get("method") or "") != "dsh-card-click":
+        return {"started": False, "why": "这张条子没有【人点击】的人证（attest=%s）⇒ 服务端不起"
+                                         % (att.get("method") or "无")}
+    if float(g.get("expires") or 0) <= _t.time():
+        return {"started": False, "why": "条子 %s 已过期 ⇒ 不起（过期不补，要重新报价）" % gid}
+    if int(g.get("count") or 0) - int(g.get("used") or 0) <= 0:
+        return {"started": False, "why": "条子 %s 段数已用满（%s/%s）⇒ 不起，起了就是重复消费授权"
+                                         % (gid, g.get("used"), g.get("count"))}
+    lane = "%s/%s" % (g.get("capability"), g.get("purpose"))
+    # 反查走 gateway 那一份现成口子（它内部懒导入 skill_contract 并吞异常 ⇒ 不在这里新开一条
+    # import 路径，gateway 自己是懒导入的，说明顶层 import 有循环导入风险）。
+    skill = gateway.skill_contract_lane_or_empty(str(g.get("capability") or ""),
+                                                 str(g.get("purpose") or ""))
+    if not skill:
+        return {"started": False, "why": "%s 没有被任何合同的 spend 认领 ⇒ 不知道该跑哪条流程，不起" % lane}
+    rel = KICKOFF_RUNNERS.get(skill)
+    if not rel:
+        return {"started": False, "why": "%s 这条线没登记可点火的 runner ⇒ 仍由 agent 决定怎么跑（不猜命令）" % skill}
+    runner = os.path.join(WORKSPACE_DIR, rel)
+    if not os.path.isfile(runner):
+        return {"started": False, "why": "runner 不在盘上（%s）⇒ 不起" % runner}
+    tdir = _form_task_dir(sid)
+    if not tdir or not os.path.isdir(tdir):
+        return {"started": False, "why": "这条会话的意图里没有任务目录 ⇒ 不起（不猜往哪写）"}
+    # 🔴 牌子活着就不起第二台。判据【不在这里】—— 读网关那一份 `submit_card_state()`：
+    #    网关那边要靠同一张牌拒"agent 再 call 一次"，两边各算一份迟早漂（漂成"服务端拦、网关放"就是双花）。
+    st = gateway.submit_card_state(os.path.join(tdir, ".submit.pid"))
+    if st.get("alive"):
+        return {"started": False, "reused": True, "pid": int(st.get("pid") or 0),
+                "why": "这条任务已经有一台提交在跑（%s）—— 不起第二台，同名产物会互相覆盖" % st.get("why")}
+    r = _spawn_kickoff(sid, runner, KICKOFF_SUBMIT_STAGE, tdir, ".submit.pid", "submit.log")
+    if r.get("started"):
+        r["grant_id"] = gid
+        r["lane"] = lane
+        # 🔴 这条 print 排在【点火之后】，而点火已经把人批的段数花掉了：日志一句编码问题
+        #    （8100 的 stdout 可能是 cp936，⇒/✓ 会 UnicodeEncodeError）就把异常抛回批准口，
+        #    结果是"任务真在跑、批准窗报错、agent 也没挂上号"。所以：文案不用箭头，且包一层吞掉。
+        try:
+            print("[kickoff] 批准即点火：%s 条子 %s，起 %s --stage submit（pid %s，日志 %s）"
+                  % (sid[-8:], gid, skill, r.get("pid"), r.get("log")))
+        except Exception:
+            pass
+    return r
 
 
 def compiled_report(body: dict) -> dict:
@@ -1570,6 +1750,9 @@ def _is_loopback(host) -> bool:
 
 
 COMPILE_DIED_QUIET_SEC = 30       # 牌子刚落下的这 30 秒不判死：点火那一下可能正好被读到
+# 提交那一刀比编译慢得多（一条 wan3-prime 实测 5–17 分钟），静默期给到 90 秒：
+# 太短会把「刚点火、进程还在起」那一瞬报成死亡，太长等于没人报丧。
+SUBMIT_DIED_QUIET_SEC = 90
 
 
 def compile_died_items(records: list, now: float, alive) -> list:
@@ -1607,6 +1790,12 @@ def compile_died_items(records: list, now: float, alive) -> list:
     return out
 
 
+def submit_died_ack(body: dict) -> dict:
+    """{kind:submit_died, session, pid|at} ⇒ 销掉那张【死掉的】提交牌子。
+    与 compile 共用一份判据：pid 或牌子 mtime 认不出来就【不删】，免得把刚点火的新一台的牌子摘了。"""
+    return compile_died_ack(body, board=".submit.pid")
+
+
 def compile_died_queue(now: float = None) -> list:
     """从意图簿整出【配了点火的那几档】，交给上面那份判据（枚举与判据分开，判据只有一份）。"""
     recs = []
@@ -1619,8 +1808,77 @@ def compile_died_queue(now: float = None) -> list:
     return compile_died_items(recs, time.time() if now is None else now, _proc_alive)
 
 
-def compile_died_ack(body: dict) -> dict:
+def submit_progress_since(tdir: str, since: float) -> str:
+    """这条任务在 `since`（= 牌子写入那一刻）之后【有没有真的往前走】：
+    先看任务号（投出去那一秒就落盘），再看成片。找到就说得出名字，找不到回空串。
+    🔴 为什么必须有这一道：`.submit.pid` 跑成功也没人摘（网关那边按"pid 死了/牌子超 6h"放行），
+       只看"牌子 + 没进程"会把每一次成功都报成死亡。"""
+    newest = 0.0
+    for root, _dirs, files in os.walk(os.path.join(tdir, "outputs")):
+        for fn in files:
+            if fn in ("wan3_job.json", "_wan3_job.json") or fn.endswith(".mp4"):
+                try:
+                    m = os.path.getmtime(os.path.join(root, fn))
+                except OSError:
+                    continue
+                if m > newest:
+                    newest = m
+    return "任务号/成片" if newest >= since else ""
+
+
+def submit_died_items(records: list, now: float, alive, progress=None) -> list:
+    """纯判据：服务端替人点的那台提交腿【半路死了、而且什么都没投出去】（唤醒队列第五份来源）。
+
+    🔴 为什么要有这一份（2026-10-15 09:05 现网 session-cb4687fe）：人点了【批准，开始跑】，
+       8100 在同一次请求里起了提交腿，那条腿三段全死在 `NameError: _skc` ——
+       盘上零条红、没人被叫醒、agent 醒来只看到"没人提交"，于是自己重跑并回头问客户"批了吗"。
+       批准即点火把"人点一次"变成了真提交，就必须同时负责"那一次没成"的回读，
+       否则省下的那一次点击，全变成客户来问我。
+    规则（每条对应一条断言）：
+      1. 牌子读得出纯数字 pid；2. 牌子距今 >= SUBMIT_DIED_QUIET_SEC（刚点火不判）；
+      3. 牌子没老过意图 TTL；4. 进程确实没了；
+      5. 🔴 且【牌子之后没有任何号/成片落盘】—— 有就说明它投出去了，那是 wait/交付那条线的事。
+    """
+    out = []
+    look = progress if progress is not None else submit_progress_since
+    for sid, skill, task, tdir in records:
+        if not tdir or not os.path.isdir(tdir):
+            continue
+        path = os.path.join(tdir, ".submit.pid")
+        try:
+            raw = (io.open(path, encoding="utf-8").read() or "").strip()
+            pid = int(raw.splitlines()[0]) if raw else 0
+            born = os.path.getmtime(path)
+            age = now - born
+        except (OSError, ValueError, IndexError):
+            continue
+        if not pid or age < SUBMIT_DIED_QUIET_SEC or age > hypit_bridge.INTENT_TTL_SEC:
+            continue
+        if alive(pid):
+            continue
+        if look(tdir, born):                       # 投出去了/已经落盘 ⇒ 不叫（不重复报丧）
+            continue
+        out.append({"kind": "submit_died", "session": sid, "skill": skill, "task": task,
+                    "at": round(born, 3), "pid": pid, "log": os.path.join(tdir, "submit.log")})
+    return out
+
+
+def submit_died_queue(now: float = None) -> list:
+    """从意图簿整出【配了点火的那几档】交给上面的判据（枚举与判据分开，和 compile 那一套同形）。"""
+    recs = []
+    for sid, rec in (hypit_bridge.intent_map() or {}).items():
+        skill = str((rec or {}).get("skill") or "")
+        if skill not in KICKOFF_RUNNERS:
+            continue
+        recs.append((sid, skill, str((rec or {}).get("task") or ""),
+                     str((rec or {}).get("task_dir") or "").strip()))
+    return submit_died_items(recs, time.time() if now is None else now, _proc_alive)
+
+
+def compile_died_ack(body: dict, board: str = ".compile.pid") -> dict:
     """POST /api/skills/form/wake/ack {kind:compile_died, session, pid|at}：销账 = 删掉那份死牌子。
+    🔴 `board` 只改文件名 —— 编译那张 `.compile.pid` 与提交那张 `.submit.pid` 是同一套身份规则
+       （必须认出是哪一台才删）。复制第二份判据迟早漂，所以共用这一份。
 
     🔴 必须认出【是哪一台】才删：这一秒可能又点火起了一台新的（牌子已被覆盖成新 pid），
        拿旧的那台销账会把【新那台】的牌子摘掉 ⇒ 它又变回"盘上不存在的编译"，正是这次要堵的形状。
@@ -1640,7 +1898,7 @@ def compile_died_ack(body: dict) -> dict:
     tdir = str((rec or {}).get("task_dir") or "").strip()
     if not sid or not tdir:
         return {"ok": False, "error": "没有这条会话或它没有任务目录 ⇒ 不销账"}
-    path = os.path.join(tdir, ".compile.pid")
+    path = os.path.join(tdir, board)
     if not os.path.isfile(path):
         return {"ok": True, "already": True}
     try:
@@ -1674,7 +1932,8 @@ def wake_view() -> dict:
        风险大于名字带来的好处，所以留着，函数名与判据都按真实形状叫。
     """
     items = (form_wake_queue(_form_payloads()) + approval_wake_queue(_approval_wake_load())
-             + compile_wake_queue(_compile_wake_load()) + compile_died_queue())
+             + compile_wake_queue(_compile_wake_load()) + compile_died_queue()
+             + submit_died_queue())
     return {"ok": True, "pending": sorted(items, key=lambda x: x["at"])}
 
 
@@ -1745,8 +2004,10 @@ def wake_ack(body: dict) -> dict:
         return compile_wake_ack(body)
     if kind == "compile_died":
         return compile_died_ack(body)
+    if kind == "submit_died":
+        return submit_died_ack(body)
     return {"ok": False,
-            "error": "ack 必须带 kind=form|approval|compiled|compile_died（不猜是哪份队列）"}
+            "error": "ack 必须带 kind=form|approval|compiled|compile_died|submit_died（不猜是哪份队列）"}
 
 
 def form_wake_ack(body: dict) -> dict:
@@ -1793,7 +2054,7 @@ def _approval_wake_load() -> dict:
         return {}
 
 
-def approval_wake_note(grant: dict) -> dict:
+def approval_wake_note(grant: dict, kickoff: dict | None = None) -> dict:
     """人在批准窗/批准页点上【批准，开始跑】⇒ 给那条会话挂一格待醒（按条子 id 为键，一条一格）。
 
     🔴 只在核销成功之后调用：被拒的点击不挂号（拒了就没有任何该动的活），
@@ -1808,6 +2069,11 @@ def approval_wake_note(grant: dict) -> dict:
            "purpose": str(g.get("purpose") or ""), "account": str(g.get("account") or ""),
            "count": g.get("count"), "credits": g.get("credits"),
            "scope": str(g.get("scope") or ""), "expires": g.get("expires"), "ts": ts,
+           # 服务端有没有已经把这台起起来 —— 唤醒文案靠它分流（起了就说"别再自己起 runner"，
+           # 没起（这条线没配点火 runner 等）才照旧让 agent 自己发起）
+           "kicked_off": bool((kickoff or {}).get("started")),
+           "kickoff_pid": (kickoff or {}).get("pid") or "",
+           "kickoff_why": "" if (kickoff or {}).get("started") else str((kickoff or {}).get("why") or ""),
            "wake": {"pending": True, "at": ts}}
     return _form_write(APPROVAL_WAKE_PATH, gid, rec, "批准待醒")
 
@@ -1833,6 +2099,10 @@ def approval_wake_queue(data: dict) -> list:
             continue
         out.append({"kind": "approval", "session": str(rec.get("session") or ""),
                     "grant_id": str(gid), "at": float(w.get("at") or ts),
+                    # 服务端点火的結果跟着队列走：插件据此决定叫 agent 去做【交付】还是去做【提交】
+                    "kicked_off": bool(rec.get("kicked_off")),
+                    "kickoff_pid": str(rec.get("kickoff_pid") or ""),
+                    "kickoff_why": str(rec.get("kickoff_why") or ""),
                     "capability": str(rec.get("capability") or ""),
                     "purpose": str(rec.get("purpose") or ""),
                     "count": rec.get("count"), "credits": rec.get("credits"),
@@ -2057,8 +2327,12 @@ def _form_prefill_paths(sid, fields, files):
             return {}, ("这张表有多个文件槽，每个回填项要写明 field"
                         if not fk else "文件槽不在字段表里：%s" % fk[:40])
         p = os.path.realpath(str(it.get("path") or ""))
-        if not p.startswith(root + os.sep) or not os.path.isfile(p):
+        if not p.startswith(root + os.sep):
             return {}, "回填的文件不在表单上传目录里：%s" % os.path.basename(p)[:48]
+        if not os.path.isfile(p):
+            # 同 form_submit 那处：越界与"盘上没这个文件"是两件事，混成一句就会把人带偏（15:35 现网）
+            return {}, ("回填的文件在盘上找不到（名字与落盘产物对不上，不是路径越界）：%s"
+                        % os.path.basename(p)[:48])
         ext = os.path.splitext(p)[1].lstrip(".").lower()
         allow = set(_form_ext_map(fd["type"]).values())
         if ext not in allow:
@@ -2286,6 +2560,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/spend/pending":
             # 给批准页渲染用：只读、无副作用、【不含核销码】（核销走 consume_by_click，码由服务端自取）。
             # path/count_raw 是诊断字段：查"批准页看不到待批"用 —— 两个进程读的不是同一份 json 时一眼可见。
+            _qs = ((parse_qs(u.query or "").get("session") or [""])[0] or "").strip()
             rows = [{"id": p["id"], "capability": p["capability"], "purpose": p["purpose"],
                      "account": p["account"], "count": p["count"], "credits": p["credits"],
                      "scope": p.get("scope", ""), "session": p.get("session", ""),
@@ -2294,10 +2569,16 @@ class H(BaseHTTPRequestHandler):
                      "notice": gateway.approval_notice(p),
                      "left_seconds": max(0, round(float(p["expires"]) - time.time()))}
                     for p in gateway.spend_pending()]
-            self._send(200, json.dumps({"pending": rows,
-                                        "path": gateway.SPEND_APPROVALS_PATH,
-                                        "count_raw": len(gateway._approvals_load().get("pending") or [])},
-                                       ensure_ascii=False), cors=True)
+            self._send(200, json.dumps(dict(
+                {"pending": rows,
+                 "path": gateway.SPEND_APPROVALS_PATH,
+                 "count_raw": len(gateway._approvals_load().get("pending") or [])},
+                # 🔴 带 session 时把"这条会话该看到哪一句"一起回：判据只在
+                #    gateway.approval_session_state() 那一份，页面不许自己再分类
+                #    （2026-10-14 现网：客户 16:14 就批过了、条子 0/1 段待消费，
+                #     而页面对所有空 pending 一律印"Agent 还没跑 approve"——那句是错的）。
+                **({"session_state": gateway.approval_session_state(_qs)} if _qs else {})),
+                ensure_ascii=False), cors=True)
         elif u.path.startswith("/ui/"):
             # 技能表单页：【一个模板】服务所有 skill —— 字段表由页面自己问 /api/skills/form 要。
             # 同源相对路径是这条设计的根据：页面出自 8100，接口也在 8100 ⇒ 右栏 iframe 不需要跨口。
@@ -2612,11 +2893,18 @@ class H(BaseHTTPRequestHandler):
                 # 🔴 人点掉批准 = 一个必然发生的事件 ⇒ 当场给那条会话挂号待醒（宿主插件 5 秒内领走、开新一轮）。
                 #    缺这一格就是 2026-10-10 那句"我点了审批不执行，还得回一句点了条子"：
                 #    agent 只在轮到自己说话时才动，没人叫醒它，它就只能等下一句人话。
-                #    置顶批准窗（approval_popup.py）走的也是这个口 ⇒ 两个壳共用同一次挂号，不各写一份。
+                #    这一口现在只有【批准页】一个壳（置顶批准窗 2026-10-22 按用户指令整条摘掉：
+                #    "审批不要弹窗，就是一个审批链接"）。它当年走的也是这里 ⇒ 挂号逻辑不许有第二份 ——
+                #    将来谁再加壳（桌面窗、卡片、快捷键），也必须调这同一个口。
                 #    ⚠️ 点【这次不跑】(deny) 故意【不】挂号：那一下的语义是"停"，叫醒 agent 没有活可派，
                 #       只会多烧一轮 token；agent 那边照旧靠 approvals/过期判据自己收口。
                 if r.get("ok"):
-                    r["wake"] = approval_wake_note(r.get("grant") or {})
+                    # 🔴 批准即点火（2026-10-14 用户裁定："审批条子的时候就是提交wan3.0直接触发，
+                    #    别通过agent，太慢了"）。顺序是死的：**先起提交腿，再挂号**——
+                    #    反过来就是 agent 醒来时盘上"没人提交"，它自己去 call 一次 = 双提交。
+                    _g = r.get("grant") or {}
+                    r["kickoff"] = kickoff_submit(str(_g.get("session") or ""), _g)
+                    r["wake"] = approval_wake_note(_g, r["kickoff"])
             self._send(200 if r.get("ok") else 409, json.dumps(r, ensure_ascii=False))
         elif u.path == "/api/model/call":
             try:

@@ -196,19 +196,24 @@ def _wan3_submit_guard(count: int = 1, account: str = "local") -> None:
 
 
 def _prime_resolution(resolution) -> str:
-    """wan3-prime 的分辨率档：判据【不抄第二份】，读网关唯一源 `gateway._WAN30_RES_MODEL`。
+    """wan3-prime 的分辨率档：判据【不抄第二份】，现读网关那条 lane 自己的名单
+    `gateway.lane_resolution_choices("video.generate","wan3-prime")`。
 
-    以前这里是硬编码 `!= "1080P"` 就拒 ⇒ 网关那侧其实有 720p 的模型档（ME-wan30-720p-1055），
-    但没人能把它送进来；而网关白名单一旦加档，这里不改就变成第二份真相、永远比网关窄。
-    取不到网关那份（导入顺序/网关没起来）按【拒】处理，不退回一份自造的字面量名单。
+    以前这里是硬编码 `!= "1080P"` 就拒 ⇒ 网关那侧其实有 720p 的模型档，但没人能把它送进来；
+    而网关白名单一旦加档，这里不改就变成第二份真相、永远比网关窄。
+    🔴 2026-10-30 换芯后再补一层：原来直接读 `gateway._WAN30_RESOLUTIONS` —— 那是 **tianyue 那一家**的名单，
+       而 wan3-prime 现在指 yz30。名字里带 prime、判据守别家 = 换芯那天就没人能送 720P、
+       而且以后 tianyue 加档会悄悄放过 yz30 不认的参数 ⇒ 改成按【路由的 provider】取那一份。
+       取不到网关那份（导入顺序/网关没起来）按【拒】处理，不退回一份自造的字面量名单。
     """
     from backend import gateway as gw
     res = str(resolution or "1080P").strip().upper().replace(" ", "")
-    allowed = tuple(getattr(gw, "_WAN30_RESOLUTIONS", ()) or ())
+    allowed = tuple(getattr(gw, "lane_resolution_choices", lambda *a: ())("video.generate", "wan3-prime") or ())
     if not allowed:
-        raise WanParamError("读不到 gateway._WAN30_RESOLUTIONS ⇒ 按拒处理（自检失败不许被当成『闸没拦』）")
+        raise WanParamError("读不到 gateway.lane_resolution_choices('video.generate','wan3-prime') ⇒ 按拒处理"
+                            "（自检失败不许被当成『闸没拦』）")
     if res not in allowed:
-        raise WanParamError("wan3-prime 分辨率只认 %s（收到 %r）⇒ 档位唯一源在 gateway._WAN30_RES_MODEL，"
+        raise WanParamError("wan3-prime 分辨率只认 %s（收到 %r）⇒ 档位唯一源在网关那条 lane 自己的名单，"
                             "要别的分辨率是换档名单，不是改这条校验" % ("/".join(allowed), resolution))
     return res
 
@@ -517,7 +522,7 @@ def run_one_segment_prime(
     account: str = "local",
     on_progress: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """超级复刻 wan3.0 的提交腿：走【网关 lane video.generate/wan3-prime】(provider tianyue，2026-10-16 换芯)。
+    """超级复刻 wan3.0 的提交腿：走【网关 lane video.generate/wan3-prime】(provider 现读 ROUTES，2026-10-30 起=yz30/youzan666)。
 
     为什么换这条（2026-10-10 排查定案）：
       - 2026-10-09 用户禁令"视频严格杜绝走 RunningHub" ⇒ config.WAN3_RH_ENABLED=False，走入口提交不出去；
@@ -542,10 +547,16 @@ def run_one_segment_prime(
     if not str(prompt or "").strip():
         raise WanParamError("wan3-prime 要给 prompt（编译器写出的那一段）")
     _res = _prime_resolution(resolution)
-    # 2026-10-20 修：yz-prime 那个适配器 10-16 连常量一起删了（换成 tianyue 的 _WAN30_RATIOS），
-    # 这里还留着一句 gw._PRIME_YZ_RATIOS ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。
-    # 现读网关那份唯一源，取不到才退回同一组字面量（不许改判据、只换名字）。
-    _ratios = tuple(getattr(gw, "_WAN30_RATIOS", ()) or ("adaptive", "16:9", "4:3", "1:1", "3:4", "9:16"))
+    # 🔴 画幅名单【只从网关那条 lane 自己取】，取不到就按拒处理：
+    #    2026-10-20 那次留的"退回同一组字面量"兜底，在 2026-10-30 换芯后变成了第二份真相
+    #    （yz30 认七档含 21:9、tianyue 认六档）—— 一份自造名单要么比网关宽（放行上游会拒的参数），
+    #    要么比网关窄（客户点名的画幅永远进不来），两种都是"回执写 A、实跑 B"那一类。
+    #    历史：更早这里还写死 `gw._PRIME_YZ_RATIOS`（那个常量 10-16 连适配器一起删了）
+    #    ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。名字要有主人。
+    _ratios = tuple(getattr(gw, "lane_ratio_choices", lambda *a: ())("video.generate", "wan3-prime") or ())
+    if not _ratios:
+        raise WanParamError("读不到 gateway.lane_ratio_choices('video.generate','wan3-prime') ⇒ 按拒处理"
+                            "（自检失败不许被当成『闸没拦』，更不许退回一份自造的字面量名单）")
     ratio = str(aspect_ratio or "adaptive").strip()
     if ratio not in _ratios:
         raise WanParamError("wan3-prime ratio 只认 %s（收到 %r）" % ("/".join(_ratios), ratio))
@@ -597,11 +608,14 @@ def run_one_segment_prime(
     local = res.get("path") or out
     if not os.path.isfile(local):
         raise WanTimeoutError("wan3-prime 信封说成功但盘上没有 %s（job_id=%s ⇒ 先捞回再判）" % (local, jid))
-    return {"segment_index": segment_index, "task_id": jid, "provider": "tianyue",
+    # 🔴 provider 现读 ROUTES（2026-10-30 换芯 yz30 后这里写死 "tianyue" 就是回执撒谎）；
+    #    模型名只许现读信封（`_yz30_video_run` 带的就是真发出去那条）；以前这里写死一个
+    #    "wan3.0-video-prime" 兜底 ⇒ 上游没回 model 字段时台账会印一个【不存在的模型名】冒充出处。
+    #    拿不到就留空，由回执那一格写"没记"，不猜。
+    from backend import gateway as _gwprov
+    _prov = str(((_gwprov.ROUTES.get(("video.generate", "wan3-prime")) or {}).get("provider")) or "没记")
+    return {"segment_index": segment_index, "task_id": jid, "provider": _prov,
             "lane": "video.generate/wan3-prime",
-            # 🔴 模型名只许现读信封（`_tianyue_deliver` 带的就是真发出去那条）；以前这里写死一个
-            #    "wan3.0-video-prime" 兜底 ⇒ 上游没回 model 字段时台账会印一个【不存在的模型名】冒充出处。
-            #    拿不到就留空，由回执那一格写"没记"，不猜。
             "model": str(res.get("model") or res.get("model_used") or ""),
             "reference_video_url": ref_url, "result_url": res.get("url") or "",
             "local_path": str(local), "duration": dur, "seed_used": None, "attempts": 1,
@@ -635,10 +649,16 @@ def run_prompt_only_prime(
     if not str(prompt or "").strip():
         raise WanParamError("wan3-prime 要给 prompt（编译器拼出的 Wan3.0 文本）")
     _res = _prime_resolution(resolution)
-    # 2026-10-20 修：yz-prime 那个适配器 10-16 连常量一起删了（换成 tianyue 的 _WAN30_RATIOS），
-    # 这里还留着一句 gw._PRIME_YZ_RATIOS ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。
-    # 现读网关那份唯一源，取不到才退回同一组字面量（不许改判据、只换名字）。
-    _ratios = tuple(getattr(gw, "_WAN30_RATIOS", ()) or ("adaptive", "16:9", "4:3", "1:1", "3:4", "9:16"))
+    # 🔴 画幅名单【只从网关那条 lane 自己取】，取不到就按拒处理：
+    #    2026-10-20 那次留的"退回同一组字面量"兜底，在 2026-10-30 换芯后变成了第二份真相
+    #    （yz30 认七档含 21:9、tianyue 认六档）—— 一份自造名单要么比网关宽（放行上游会拒的参数），
+    #    要么比网关窄（客户点名的画幅永远进不来），两种都是"回执写 A、实跑 B"那一类。
+    #    历史：更早这里还写死 `gw._PRIME_YZ_RATIOS`（那个常量 10-16 连适配器一起删了）
+    #    ⇒ 每次提交都在本地抛 AttributeError（0 分、一个请求都不发）。名字要有主人。
+    _ratios = tuple(getattr(gw, "lane_ratio_choices", lambda *a: ())("video.generate", "wan3-prime") or ())
+    if not _ratios:
+        raise WanParamError("读不到 gateway.lane_ratio_choices('video.generate','wan3-prime') ⇒ 按拒处理"
+                            "（自检失败不许被当成『闸没拦』，更不许退回一份自造的字面量名单）")
     ratio = str(aspect_ratio or "adaptive").strip()
     if ratio not in _ratios:
         raise WanParamError("wan3-prime ratio 只认 %s（收到 %r）" % ("/".join(_ratios), ratio))
@@ -676,7 +696,9 @@ def run_prompt_only_prime(
     local = res.get("path") or out
     if not os.path.isfile(local):
         raise WanTimeoutError("wan3-prime 信封说成功但盘上没有 %s（job_id=%s ⇒ 先捞回再判）" % (local, jid))
-    return {"task_id": jid, "provider": "tianyue", "lane": "video.generate/wan3-prime",
+    from backend import gateway as _gwprov
+    _prov = str(((_gwprov.ROUTES.get(("video.generate", "wan3-prime")) or {}).get("provider")) or "没记")
+    return {"task_id": jid, "provider": _prov, "lane": "video.generate/wan3-prime",
             "model": str(res.get("model") or res.get("model_used") or ""),
             "result_url": res.get("url") or "", "local_path": str(local), "duration": dur,
             "attempts": res.get("prime_attempts") or 1,

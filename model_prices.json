@@ -1,50 +1,50 @@
 {
- "_说明": "统一模型网关配置。prices=每条路由的预估分(capability/purpose)；token_rate=按实际 token 结算的能力费率(分/1k token)，只对文本/看图生效，生图生视频仍按条计；defaults=不指定 purpose 时走哪条；disabled=已屏蔽路由(键=cap/pur，值=原因)。改这里=改配置，gateway 按 mtime 懒加载、不用重启；文件缺失或损坏则回落 gateway.py 内置表。",
- "prices": {
-  "text.complete/agnes": 1,
-  "text.complete/mimo": 1,
-  "video.analyze/default": 6,
-  "video.analyze/mimo": 6,
-  "image.generate/default": 4,
-  "image.generate/detail": 8,
-  "image.generate/generic": 4,
-  "image.generate/nano": 4,
-  "image.edit/faceswap": 20,
-  "video.generate/omni-t2v": 40,
-  "video.generate/agnes-v": 30,
-  "video.generate/clone-r2v": 50,
-  "video.generate/seedance-2.5": 60,
-  "video.generate/seedance-2.0": 50,
-  "video.generate/h3": 60,
-  "video.generate/motion": 50,
-  "lipsync/default": 20,
-  "lipsync/vo": 24,
-  "transcribe/asr": 0,
-  "text.complete/gpt61": 1,
-  "text.complete/claude48": 2,
-  "text.complete/mimo_pro": 3,
-  "text.complete/gemini38": 6,
-  "text.complete/deepseekv4": 7
- },
- "token_rate": {
-  "text.complete": 10.0,
-  "video.analyze": 10.0
- },
- "defaults": {
-  "text.complete": "mimo",
-  "image.generate": "default",
-  "image.edit": "faceswap",
-  "video.generate": "omni-t2v",
-  "video.analyze": "mimo",
-  "lipsync": "default",
-  "transcribe": "asr"
- },
- "disabled": {
-  "video.analyze/default": "2026-10-22 用户指令『agnes 隐藏』：超级复刻的分镜腿改 .env REPLICA_WAN3_STORYBOARD_ENGINE=mimo + STORYBOARD_MODEL=mimo-v2.6-flash（真发请求的是 pipeline/step1_mimo_parse 直连厂商，本来就不经这条路由），看图腿用 REPLICA_WAN3_ANALYZE_PURPOSE=mimo_pro；不点名 video.analyze 的调用（gateway analyze / _lane_cell）已把 defaults 指到 mimo，所以不会因为这条屏蔽而挂。恢复=删这一行并把 defaults 改回 default。⚠️ 风险：小米那把 key 今天上午还是 429 quota exhausted（下午才恢复），而 magpie/qoder 那几个 id 实测丢 video_url part ⇒ 吃视频的腿现在只有小米一家，没有备胎。",
-  "text.complete/agnes": "2026-10-22 与 video.analyze/default 一起下架（同一条『agnes 隐藏』指令）：text.complete 的 defaults 已改指 mimo（=TEXT_MODEL_MIMO flash，实测今天可用）。⚠️ 只管得到『经网关的文本腿』和 8100 面板；超级复刻的编译/审查腿在 8090 进程里按 engine 直连厂商（ledger=off），由 config 的 REPLICA_WAN3_LLM_ENGINE 管，不归这条屏蔽管。",
-  "video.generate/clone-r2v": "2026-10-09 用户指令断开 RunningHub wan3.0（真咽喉闸在 wan3_client._wan3_submit_guard）",
-  "video.generate/wan3-dashscope": "2026-10-09 用户指令删除：client 是 TODO(无适配器)、model 还误写着 wan3.0-video-prime ⇒ 假选项。要接 DashScope 的 Wan3 就照协议新写适配器再重新登记，别复用这个空名",
-  "text.complete/gpt56": "2026-10-13 用户指令隐藏（『网关把 gpt5.6 隐藏或禁止调用』）：这条 gpt-5.6-sol 腿在网关里没有任何调用点（全仓只有 ROUTES 自己那一行），留着只是给面板一个看起来能选、实际没人用的选项。推理脑改用 text.complete/grok46。恢复=删这一行即可（路由定义、模型名、适配器、单价全都还在）。",
-  "text.complete/gpt-compile": "2026-10-13 与 gpt56 一起隐藏：同一个 model=gpt-5.6-sol、同一把 GPT55_API_KEY，同样零调用点。⚠️ 超级复刻 Step1.5 的编译腿本来就不走这条（它在 8090 进程里用 OPENAI_* 直连、不进网关账本），所以屏蔽它不影响复刻流水线——这条屏蔽管的是『面板和 gateway call』，管不到直连腿。"
- }
+  "_说明": "统一模型网关配置。prices=每条路由的预估分(capability/purpose)；token_rate=按实际 token 结算的能力费率(分/1k token)，只对文本/看图生效，生图生视频仍按条计；defaults=不指定 purpose 时走哪条；disabled=已屏蔽路由(键=cap/pur，值=原因)。改这里=改配置，gateway 按 mtime 懒加载、不用重启；文件缺失或损坏则回落 gateway.py 内置表。 ｜ 2026-11-05 分镜腿换道：video.analyze/default(agnes) 解除屏蔽，依据=当天 Δ 判别 agnes-3.0-flash 带整条 6.78s 视频 pt 100→1536（Δ1436）且内容读对，而 lant.top 中转实测只收 ≤4s video_url（4s 过 / 5s 起 422 RELAY_005）。备份 model_prices.json.bak-20261105-094148-storyboard-agnes ｜ 2026-11-05 defaults[video.analyze] mimo→default：超级复刻分镜腿(_storyboard_lane 的 gateway 分支)现读这一行，lant.top 中转实测只收 ≤4s video_url 故换到 agnes-3.0-flash；看图腿显式点名 REPLICA_WAN3_ANALYZE_PURPOSE 那条链，不受此改动影响。",
+  "prices": {
+    "text.complete/agnes": 1,
+    "text.complete/mimo": 1,
+    "video.analyze/default": 6,
+    "video.analyze/mimo": 6,
+    "image.generate/default": 4,
+    "image.generate/detail": 8,
+    "image.generate/generic": 4,
+    "image.generate/nano": 4,
+    "image.edit/faceswap": 20,
+    "video.generate/omni-t2v": 40,
+    "video.generate/agnes-v": 30,
+    "video.generate/clone-r2v": 50,
+    "video.generate/seedance-2.5": 60,
+    "video.generate/seedance-2.0": 50,
+    "video.generate/h3": 60,
+    "video.generate/motion": 50,
+    "lipsync/default": 20,
+    "lipsync/vo": 24,
+    "transcribe/asr": 0,
+    "text.complete/gpt61": 1,
+    "text.complete/claude48": 2,
+    "text.complete/mimo_pro": 3,
+    "text.complete/gemini38": 6,
+    "text.complete/deepseekv4": 7
+  },
+  "token_rate": {
+    "text.complete": 10.0,
+    "video.analyze": 10.0
+  },
+  "defaults": {
+    "text.complete": "mimo",
+    "image.generate": "default",
+    "image.edit": "faceswap",
+    "video.generate": "omni-t2v",
+    "video.analyze": "default",
+    "lipsync": "default",
+    "transcribe": "asr"
+  },
+  "disabled": {
+    "video.generate/wan30-studio": "2026-10-30 用户指令『tianyue 那条 lane 移除』：先软下架、随后同日物理拆除（gateway 路由/适配器/价目、直出工作台服务与页面、TIANYUE_* 配置全清，代码移 _removed/2026-10-30-tianyue/）。这行留着当墓碑：没有它 resolve 会回『无 purpose』这种没出处的拒因。wan3.0 现役唯一腿 = video.generate/wan3-prime（youzan666/yz30，按秒）。",
+    "text.complete/agnes": "2026-10-22 与 video.analyze/default 一起下架（同一条『agnes 隐藏』指令）：text.complete 的 defaults 已改指 mimo（=TEXT_MODEL_MIMO flash，实测今天可用）。⚠️ 只管得到『经网关的文本腿』和 8100 面板；超级复刻的编译/审查腿在 8090 进程里按 engine 直连厂商（ledger=off），由 config 的 REPLICA_WAN3_LLM_ENGINE 管，不归这条屏蔽管。",
+    "video.generate/clone-r2v": "2026-10-09 用户指令断开 RunningHub wan3.0（真咽喉闸在 wan3_client._wan3_submit_guard）",
+    "video.generate/wan3-dashscope": "2026-10-09 用户指令删除：client 是 TODO(无适配器)、model 还误写着 wan3.0-video-prime ⇒ 假选项。要接 DashScope 的 Wan3 就照协议新写适配器再重新登记，别复用这个空名",
+    "text.complete/gpt56": "2026-10-13 用户指令隐藏（『网关把 gpt5.6 隐藏或禁止调用』）：这条 gpt-5.6-sol 腿在网关里没有任何调用点（全仓只有 ROUTES 自己那一行），留着只是给面板一个看起来能选、实际没人用的选项。推理脑改用 text.complete/grok46。恢复=删这一行即可（路由定义、模型名、适配器、单价全都还在）。",
+    "text.complete/gpt-compile": "2026-10-13 与 gpt56 一起隐藏：同一个 model=gpt-5.6-sol、同一把 GPT55_API_KEY，同样零调用点。⚠️ 超级复刻 Step1.5 的编译腿本来就不走这条（它在 8090 进程里用 OPENAI_* 直连、不进网关账本），所以屏蔽它不影响复刻流水线——这条屏蔽管的是『面板和 gateway call』，管不到直连腿。"
+  }
 }

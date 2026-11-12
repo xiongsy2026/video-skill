@@ -421,3 +421,59 @@ def test_approval_rejection_does_not_burn_a_generation_attempt():
             reason_keys |= {k.value for k in node.keys if isinstance(k, ast.Constant)
                             and str(k.value).startswith("Wan")}
     assert not (permanent - reason_keys), "这些 Wan 错误类没有对应拒因文案：%s" % sorted(permanent - reason_keys)
+
+
+def test_prompt_preflight_truth_table_and_reverse_controls():
+    from backend.services.super_clone_wan3 import (STEP1_5_GLOBAL_CONSTRAINT,
+                                                   prompt_preflight_problems)
+    manifest = [{"image_id": "图1"}, {"image_id": "图2"}]
+    good = "Shot 1 [0.00-2.00]: 中景, 展示产品 图1 与模特 图2;\n" + STEP1_5_GLOBAL_CONSTRAINT
+    assert prompt_preflight_problems(good, manifest) == []
+    assert prompt_preflight_problems("Shot 1: 图1 与 图 2;\n" + STEP1_5_GLOBAL_CONSTRAINT,
+                                     manifest) == []      # 「图 2」带空格也算同一编号
+    assert prompt_preflight_problems("   ", manifest)      # 空稿
+    assert prompt_preflight_problems("Shot 1 [0.00-2.00]: 中景, 展示产品;", manifest)   # 缺尾行
+    # 尾行钉的是【逐字】，不是关键词：只抄前 60 字必须红（当年就是被"看起来一样"糊过去的）
+    assert prompt_preflight_problems("Shot 1: x;\n" + STEP1_5_GLOBAL_CONSTRAINT[:60], manifest)
+    over = prompt_preflight_problems("Shot 1: 参考 图3;\n" + STEP1_5_GLOBAL_CONSTRAINT, manifest)
+    assert len(over) == 1 and "图3" in over[0] and "只有 2 张" in over[0]
+    assert prompt_preflight_problems("Shot 1: 参考 图0;\n" + STEP1_5_GLOBAL_CONSTRAINT, manifest)
+
+
+def test_prompt_preflight_bites_the_stale_real_prompt():
+    """真产物双向对照：今天编译的那份必须过；昨晚那份（旧尾行）必须被【尾行】这一条拦下。"""
+    import json
+    from pathlib import Path
+    import pytest
+    from backend.services.super_clone_wan3 import prompt_preflight_problems
+
+    fresh = Path("outputs/super_clone_wan3_28ba351f/step2_wan3/prompt.txt")
+    stale = Path("outputs/super_clone_wan3_b51de56b/step2_wan3/prompt.txt")
+    if not fresh.is_file() or not stale.is_file():
+        pytest.skip("两份真稿有一份不在盘上 ⇒ 这条对照没在守任何东西（跳过，不算过）")
+    manifest = [{"image_id": "图1"}, {"image_id": "图2"}]
+    assert prompt_preflight_problems(fresh.read_text(encoding="utf-8"), manifest) == []
+    problems = prompt_preflight_problems(stale.read_text(encoding="utf-8"), manifest)
+    assert len(problems) == 1 and "负向锁定" in problems[0], \
+        "旧尾行没被这一条拦住（或拦错了理由）：%s" % problems
+
+
+def test_human_contract_stays_out_of_the_compiled_one():
+    """两份合同各管各的。实测过一种真事故形状：解析停行的字符类少了 `-` ⇒
+    `contract-human:` 不被当成边界，默认合同吞进人工稿那 5 格（13→18、version 被盖），
+    于是【编译档】的回执由【人工稿的形状】核验 = 该拦的拦不住。这条就是钉它不再发生。"""
+    import pytest
+    from backend import skill_contract as sc
+
+    human = sc.contract_for("super-clone", variant="human")
+    if not human.get("steps"):
+        pytest.skip("SKILL.md 里没有 contract-human: 段（合同在另一套系统的目录里）⇒ 跳过，不算过")
+    compiled = sc.contract_for("super-clone")
+    ids_compiled = [s["id"] for s in compiled["steps"]]
+    assert "human-prompt" not in ids_compiled
+    assert "human-prompt" in [s["id"] for s in human["steps"]]
+    assert "human" not in compiled.get("version", ""), "默认合同的 version 被人工稿段盖掉了"
+    required = {s["id"] for s in compiled["steps"] if s["required"]}
+    assert {"storyboard", "compile-bound", "negative-lock"} <= required, \
+        "编译档的硬格被降级了（人工稿另立一份，不许动这份）"
+    assert not sc.contract_shape_problems(compiled) and not sc.contract_shape_problems(human)

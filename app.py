@@ -128,14 +128,9 @@ async def lifespan(app: FastAPI):
             print(f"恢复 {recovered_vt} 个视频翻译中断任务，可从成功步骤继续")
     except Exception as e:
         print(f"视频翻译任务恢复失败: {e}")
-    # wan3.0 直出工作台的自动回传：扫 outputs/wan30_studio/*/wan3_job.json，
-    # 凡是【有上游任务号、盘上没成片】的自己 GET 回来（只 GET，绝不 POST ⇒ 不可能双花）。
-    # 放在启动这一格是故意的：任务号是提交那一刻就落盘的，人不需要记得也没法贴第二次。
-    try:
-        from backend.services import wan30_studio as _w30s
-        _w30s.start_reconciler()
-    except Exception as e:
-        print(f"wan30-studio 自动回传启动失败: {type(e).__name__}: {e}")
+    # （2026-10-30『tianyue lane 移除』：wan3.0 直出工作台整条拆除 —— 它唯一的出片腿
+    #   video.generate/wan30-studio（tianyue）已从网关拆掉，服务/页面/自动回传一起删。
+    #   同一需求的现役入口 = 超级复刻页的可编辑提示词 + 「生成视频」按钮（wan3-prime/yz30）。）
     print("=" * 60)
     yield
 
@@ -165,10 +160,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 from backend.services.hypit_workspace import router as hypit_router
 app.include_router(hypit_router)
 
-# wan3.0 直出工作台（/wan30-studio + /api/wan30-studio/*）：花钱那一刀仍走 gateway.invoke，
-# 本模块只做页面、素材换直链、报价与批准窗，不另造第二套判据（见该文件头注）。
-from backend.services.wan30_studio import router as wan30_studio_router
-app.include_router(wan30_studio_router)
+# （2026-10-30『tianyue lane 移除』：/wan30-studio 路由随腿一起拆，见 lifespan 里那段说明。）
 
 # 统一模型网关的 HTTP 入口不在这里：它由常驻的 backend/model_admin.py(:8100) 提供
 # （管理面 + 调用面同源）。8090 只做流水线任务服务器。
@@ -188,11 +180,15 @@ async def health_check_models():
     import httpx
     import time as _time
 
-    async def _check_openai_compat(name: str, kind: str, base_url: str, api_key: str, model: str = "") -> dict:
-        """检测 OpenAI 兼容接口（GET /models）"""
+    async def _check_openai_compat(name: str, kind: str, base_url: str, api_key: str, model: str = "",
+                                   proxy: str = "") -> dict:
+        """检测 OpenAI 兼容接口（GET /models）
+        ⚠️ proxy：这台机器对 image1.vibelearning.top【直连被 reset】(WinError 10054)，出图那条腿走
+           `IMAGE2_PROXY_URL` 才通 —— 健康检查不带同一个代理就会把活渠道报成 down（探针必须走实际那条路）。"""
         t0 = _time.time()
         try:
-            async with httpx.AsyncClient(timeout=5.0) as c:
+            px = {"http://": proxy, "https://": proxy} if str(proxy or "").strip() else {}
+            async with httpx.AsyncClient(timeout=5.0, proxies=px) as c:
                 resp = await c.get(
                     f"{base_url.rstrip('/')}/models",
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -384,7 +380,8 @@ async def health_check_models():
         _check_openai_compat("MiMo", "llm", settings.MIMO_BASE_URL, settings.MIMO_API_KEY, settings.TEXT_MODEL_MIMO),
         _check_openai_compat("GPT", "llm", settings.OPENAI_BASE_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL),
         _check_openai_compat("Grok", "llm", settings.SR_GROK_BASE_URL, settings.SR_GROK_API_KEY, settings.SR_GROK_MODEL),
-        _check_openai_compat("Image2", "image", settings.IMAGE2_BASE_URL, settings.IMAGE2_API_KEY, "image2"),
+        _check_openai_compat("Image2", "image", settings.IMAGE2_BASE_URL, settings.IMAGE2_API_KEY,
+                             "gpt-image-2.5-sunburst", str(getattr(settings, "IMAGE2_PROXY_URL", "") or "")),
         _check_openai_compat("H3", "video", settings.MANXUE_H3_BASE_URL, settings.MANXUE_H3_API_KEY, settings.MANXUE_H3_MODEL),
         _check_vinted_models(),
         _check_runninghub("RunningHub"),
@@ -10358,8 +10355,13 @@ def _list_disk_super_clone_tasks() -> List[dict]:
     return items
 
 
-async def _super_clone_runner(task_id: str, resume: bool = False) -> None:
-    """执行/续跑超级复刻任务。所有入参都从 task['request'] 读，保证重启后也能重建同一条任务。"""
+async def _super_clone_runner(task_id: str, resume: bool = False,
+                              stop_after: Optional[str] = None) -> None:
+    """执行/续跑超级复刻任务。所有入参都从 task['request'] 读，保证重启后也能重建同一条任务。
+
+    `stop_after="compile"` = 只走到提示词编译+自检就返回（0 分、不建预扣），等人在界面上点
+    「生成视频」。花钱那一刀由那一击发起，不由这一条协程顺手做完。
+    """
     from backend.services.super_clone_wan3 import run_pipeline
 
     t = super_clone_wan3_tasks[task_id]
@@ -10432,7 +10434,20 @@ async def _super_clone_runner(task_id: str, resume: bool = False) -> None:
             background_override=(r.get("scene_text") or "").strip() if r.get("swap_scene") else None,
             voice_audio_paths=r.get("voice_audio_paths") or [],
             resume=resume,
+            stop_after=stop_after,
         )
+        if result.get("compiled_only"):
+            # 只编译档跑完了：提示词落盘、回执与合同核验都过了，但【一分钱没扣】。
+            # 这一档不许写 SUCCESS —— 成功=有片子，没片子就不是成功（同一条判据见 delivery_problems）。
+            t["prompt"] = result.get("prompt")
+            t["storyboard"] = result.get("storyboard")
+            t["trimmed_path"] = result.get("trimmed_path")
+            t["status"] = "COMPILED"
+            t["phase"] = "compiled"
+            t["error"] = None
+            t["finished_at"] = datetime.now().isoformat()
+            _persist_super_clone_task(t, force=True)
+            return
         t["prompt"] = result.get("prompt")
         t["storyboard"] = result.get("storyboard")
         t["result_url"] = result.get("result_url")
@@ -10480,6 +10495,9 @@ class SuperCloneWan3SubmitRequest(BaseModel):
     audio: Optional[bool] = None               # 是否保留原音频（默认 True）
     voice_audio_paths: List[str] = []          # 音色参考音频本地路径（≤5 段，单段 1-15s，总时长 ≤15s）
     engine: str = "wan3"                       # 执行器：wan3 或 h3（临时测试）
+    # 🔴 默认【编译完就停】：提示词先给人审，花钱那一刀只由他点「生成视频」那一下发起。
+    #    勾了 compile_only=False 才是一步到底（旧行为）。
+    compile_only: bool = True
 
 
 @app.get("/api/super-clone-wan3/probe-duration")
@@ -10577,6 +10595,7 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
         "engine": req.engine,
         "swap_person": swap_person,
         "swap_scene": swap_scene,
+        "compile_only": bool(req.compile_only),
     }
     super_clone_wan3_tasks[task_id] = {
         "task_id": task_id,
@@ -10622,9 +10641,15 @@ async def super_clone_wan3_submit(req: SuperCloneWan3SubmitRequest):
             "要换" if swap_scene else "不换", swap_why,
             "" if swap_scene else "；「换背景」栏那段文字已并进客户需求说明，合同不丢"),
     })
+    _stop = "compile" if request_snapshot["compile_only"] else None
+    super_clone_wan3_tasks[task_id]["logs"].append({
+        "ts": datetime.now().isoformat(),
+        "msg": "档位=%s" % ("编译完停住，等你点「生成视频」才花钱（0 分）" if _stop
+                            else "一步到底：编译完直接提交（60 分/段）"),
+    })
     _persist_super_clone_task(super_clone_wan3_tasks[task_id], force=True)
 
-    asyncio.create_task(_super_clone_runner(task_id))
+    asyncio.create_task(_super_clone_runner(task_id, stop_after=_stop))
     return {
         "success": True,
         "task_id": task_id,
@@ -10645,15 +10670,26 @@ def _super_clone_generate_offer(t: dict) -> dict:
     local = str(t.get("local_path") or "")
     delivered = bool(local) and Path(local).is_file()
     segments = 1
+    seconds = 0.0
     try:
         plan = Path(str(t.get("output_dir") or "")) / "_submit_plan.json"
         if plan.is_file():
-            segments = max(1, int(json.loads(plan.read_text(encoding="utf-8")).get("count") or 1))
+            pj = json.loads(plan.read_text(encoding="utf-8"))
+            segments = max(1, int(pj.get("count") or 1))
+            seconds = float(pj.get("target_duration") or 0.0)
     except Exception as e:                                     # noqa: BLE001
         print(f"[!] super_clone 提交计划读不到（按钮按 1 段显示）：{e}", flush=True)
+    if seconds <= 0:
+        seconds = float(t.get("duration") or 0.0)
     try:
-        # 分数只认网关那一份估法（`meter` 与预扣同源；在这里再乘一遍时长档就是第二套判据）
-        m = gw.meter("video.generate", "wan3-prime", {"count": segments})
+        # 分数只认网关那一份估法（`meter` 与预扣同源；在这里再乘一遍时长档就是第二套判据）。
+        # 🔴 2026-10-30 换芯 yz30 后单价是【分/秒】，实扣预扣每段都带真实秒数（wan3_client params.duration）
+        #    ⇒ 报价 = Σ秒 × 分/秒；拿不到秒数才退回 meter 的"每段 30 秒上限估"（宁可高报）。
+        if seconds > 0:
+            _sec = int(seconds) + (1 if seconds > int(seconds) else 0)   # ceil：小数秒按整秒高报
+            m = gw.meter("video.generate", "wan3-prime", {"count": 1, "duration": _sec})
+        else:
+            m = gw.meter("video.generate", "wan3-prime", {"count": segments})
         unit, total = int(m["unit_price"]), int(m["credits_estimate"])
     except Exception as e:                                     # noqa: BLE001
         print(f"[!] super_clone 报价读不到（按钮显示『价格待查』）：{e}", flush=True)
@@ -10709,10 +10745,14 @@ async def super_clone_wan3_status(task_id: str):
 
 
 @app.post("/api/super-clone-wan3/resume/{task_id}")
-async def super_clone_wan3_resume(task_id: str):
+async def super_clone_wan3_resume(task_id: str, body: Optional[dict] = None):
     """断点继续任务：从最后成功步骤续跑（已落盘的产物自动复用，缺失才重跑）。
 
     覆盖：任务 FAILED，或后端重启/进程中断导致盘上状态停在 RUNNING/PENDING（显示为 INTERRUPTED）。
+
+    `body={"spend": true}` 只由界面上那颗「生成视频」发出 = 人明确要花钱，才提交到底；
+    没带 spend（历史记录里的「断点继续」）⇒ 仍然守这一单的 compile_only：编译完就停住等审，
+    有钱没钱都先把提示词跑出来 —— 花钱那一刀只属于人点的那一下。
     """
     from backend.services.super_clone_wan3 import engine_lock_error, validate_input
 
@@ -10747,12 +10787,23 @@ async def super_clone_wan3_resume(task_id: str):
     if req.get("swap_person") and req.get("model_image_path") and not Path(req["model_image_path"]).exists():
         raise HTTPException(400, f"模特图已不存在，无法继续：{req['model_image_path']}")
 
+    # 🔴 档位由【谁发起】定：人点「生成视频」才提交到底；「断点继续」守 compile_only，
+    #    编译完就停住等审（提示词能不能审与上游有没有钱无关，别拿渠道余额挡住人看稿子）。
+    #    算档位必须在【状态改 RUNNING 之前】：这一段抛错都不许把任务留成僵尸 RUNNING
+    #    （2026-10-26 就撞过一次：NameError 落在 create_task 之前 ⇒ 任务卡 RUNNING 卡了 20 分钟）。
+    _spend = bool((body or {}).get("spend"))
+    _stop = None if _spend else ("compile" if (req.get("compile_only", True)) else None)
     t["status"] = "RUNNING"
     t["error"] = None
     t["finished_at"] = None
     t["resumable"] = False
     _persist_super_clone_task(t, force=True)
-    asyncio.create_task(_super_clone_runner(task_id, resume=True))
+    if _stop:
+        super_clone_wan3_tasks[task_id]["logs"].append({
+            "ts": datetime.now().isoformat(),
+            "msg": "档位=编译完停住，等你点「生成视频」才花钱（0 分）",
+        })
+    asyncio.create_task(_super_clone_runner(task_id, resume=True, stop_after=_stop))
     return {
         "success": True,
         "task_id": task_id,

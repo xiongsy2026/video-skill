@@ -38,6 +38,22 @@ BASE = "http://127.0.0.1:%d" % PORT
 #    不是"是不是 200"：404/500 都说明进程在答话，而 WEDGED 那种死法是根本不应答（超时/拒）。
 #    拿 200 当"活"会造出一个更坏的形状：路由一改名，看门狗就每分钟杀一次健康服务。
 HEALTH_URL = BASE + "/api/model/caps"
+
+
+def _safe(s):
+    """按【输出流自己的编码】把话说完，坏字符换成 ?。
+    🔴 为什么这条必须存在（2026-10-14 现网）：`restart` 已经真换人了（pid 52580→56676），
+       最后那行带 ⇒ 的结论在 GBK 控制台上崩了 ⇒ 调用方只看到 traceback、看不到"生效没有"，
+       只能自己 netstat。这个守卫是 8100【出事才走】的那条路，它不许因为半句中文把自己绊倒 ——
+       也绝不 reconfigure 成 utf-8（那会造"零输出 + exit 0"的静默假绿，见 AGENTS.md）。
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    t = str(s)
+    try:
+        t.encode(enc)
+        return t
+    except (UnicodeEncodeError, LookupError):
+        return t.encode(enc, "replace").decode(enc, "replace")
 TRIES = 3                  # 连续几次不应答才判死（一次超时可能是正在处理长请求）
 TIMEOUT = 3.0
 GAP = 1.0
@@ -173,7 +189,10 @@ def _spawn_direct() -> str:
         err, where = _log_sink()
         kwargs = {}
         if os.name == "nt":
-            kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+            # 🔴 CREATE_NO_WINDOW(0x08000000) 而不是 DETACHED_PROCESS(0x08)：后者只是"不继承父控制台"，
+            #    控制台子系统的解释器照样新建一个控制台 ⇒ 看门狗每 1 分钟那一跳，服务真被拉起时
+            #    客户桌面上闪一个黑框。守卫是"没人看着也在跑"的那一层，更不该弹窗。
+            kwargs["creationflags"] = 0x08000000 | 0x00000200   # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
         subprocess.Popen([sys.executable, os.path.join(HERE, "backend", "model_admin.py")],
                          cwd=HERE, stdout=err, stderr=err, stdin=subprocess.DEVNULL, **kwargs)
     except Exception as e:                                  # noqa: BLE001 —— 起服务这一刀不许把守卫带走
@@ -263,7 +282,7 @@ def ensure() -> int:
     if st == "HEALTHY":
         return 0
     if st == "WEDGED-REFUSED-KILL":
-        print(st)
+        print(_safe(st))
         return 1
     if listener_pid():
         print("BUSY-TRYING-LATER")
@@ -272,7 +291,7 @@ def ensure() -> int:
     ok = _wait_healthy()
     _log("ensure（%s）：%s" % (st, "起好了" if ok else "起了但仍不应答（下一跳再来）"))
     if _sp.startswith("direct-spawn-failed"):
-        print("SPAWN-FAILED %s" % _sp)          # 🔴 起都没起来 ≠ 起了没应答，两件事别混成一条
+        print(_safe("SPAWN-FAILED %s" % _sp))          # 🔴 起都没起来 ≠ 起了没应答，两件事别混成一条
         return 1
     print("STARTED-OK" if ok else "STARTED-STILL-DEAD")
     return 0 if ok else 1
@@ -286,7 +305,7 @@ if __name__ == "__main__":
                           "port": PORT}, ensure_ascii=False))
         sys.exit({"HEALTHY": 0, "WEDGED": 1}.get(s["state"], 2))
     elif cmd == "sweep":
-        print(sweep_wedged())          # .cmd 每一跳走这条：只掐死的，不起服务
+        print(_safe(sweep_wedged()))          # .cmd 每一跳走这条：只掐死的，不起服务
         sys.exit(0)
     elif cmd == "ensure":
         sys.exit(ensure())
@@ -295,7 +314,7 @@ if __name__ == "__main__":
         ok = probe(tries=1) and not how.startswith("schtasks-SAME-PID")
         # 🔴 "答话"不等于"换人"：旧进程还在答话时这里必须红着报，否则调用方（和我）会把
         #    "RESTARTED-OK" 当成新代码已生效 —— 2026-10-13 就是这么差点收工的。
-        print(("RESTARTED-OK " if ok else "RESTARTED-NOT-EFFECTIVE ") + how)
+        print(_safe(("RESTARTED-OK " if ok else "RESTARTED-NOT-EFFECTIVE ") + how))
         sys.exit(0 if ok else 1)
     else:
         print("用法: python svc_8100_guard.py [status|sweep|ensure|restart]")
